@@ -37,10 +37,15 @@ export function webAgentsRoot(): string {
 	return path.join(os.homedir(), ".gemini", "config", "agents");
 }
 
-/** Remove leftover pi-bridge-web-* agent dirs: dead-pid markers always, and
- *  marker-less dirs only after a grace period (a live sibling process may be
- *  between mkdir and its pid write). Never touches foreign agent dirs. */
-export function sweepStaleWebAgents(root: string = webAgentsRoot(), now = Date.now()): void {
+/** Remove leftover pi-bridge agent dirs matching `prefix`: dead-pid markers
+ *  always, and marker-less dirs only after a grace period (a live sibling
+ *  process may be between mkdir and its pid write). Never touches foreign
+ *  agent dirs. The ask-tool reuses this for its reviewer agents. */
+export function sweepStaleWebAgents(
+	root: string = webAgentsRoot(),
+	now = Date.now(),
+	prefix: string = WEB_AGENT_PREFIX,
+): void {
 	let entries: string[];
 	try {
 		entries = readdirSync(root);
@@ -48,7 +53,7 @@ export function sweepStaleWebAgents(root: string = webAgentsRoot(), now = Date.n
 		return; // no agents dir yet: nothing to sweep
 	}
 	for (const entry of entries) {
-		if (!entry.startsWith(WEB_AGENT_PREFIX)) continue;
+		if (!entry.startsWith(prefix)) continue;
 		try {
 			if (isStaleWebAgentDir(path.join(root, entry), now)) {
 				rmSync(path.join(root, entry), { recursive: true, force: true });

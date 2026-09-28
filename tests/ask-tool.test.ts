@@ -7,9 +7,17 @@
 // Run: npm test
 
 import assert from "node:assert/strict";
-import { test } from "vitest";
-import { buildFinalPrompt, resolveModel, toolModelsFromRaw } from "../src/ask-tool.js";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { test, vi } from "vitest";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { buildFinalPrompt, resolveModel, reviewerAgentMd, stageReviewerAgent, toolModelsFromRaw } from "../src/ask-tool.js";
 import { toAgyEffort } from "../src/models.js";
+
+vi.mock("../src/mcp-registration.js", () => ({
+	acquireBridgeSuppression: () => () => {},
+}));
 
 // The REAL `agy models` stdout shape (verified live via `ct agy models`).
 const RAW = [
@@ -176,3 +184,173 @@ test("buildFinalPrompt: accept-edits never carries the guard", () => {
 		"(Use compact digests, not full file contents.)\ndo the edit",
 	);
 });
+
+// --- Plan-mode reviewer agent (enforced edit denial) -----------------------
+// Probed 2026-09-28 on agy 1.2.12: a per-call agent whose tools list carries
+// no file-editing tool reports "none" for edits (hard block, with or without
+// the skip flag); commandExecutionPolicy auto lets read commands run headless
+// with no user allow rules; plan discipline blocks a redirect-write. The
+// prompt guard alone was observed failing once (a sub-agent edited files),
+// so the toolset restriction is the real enforcement layer.
+
+test("buildFinalPrompt: agent-enforced plan run forbids file mutation, not commands", () => {
+	const out = buildFinalPrompt("review this", "plan", false, true);
+	assert.match(out, /Do not create, modify, or delete any files/);
+	// Commands are the analysis capability under the agent; the old guard
+	// forbidding them outright must NOT apply.
+	assert.doesNotMatch(out, /Do not run shell commands/);
+	assert.match(out, /Read-only commands \(git log, git diff/);
+});
+
+test("buildFinalPrompt: agent-enforced accept-edits run is unchanged", () => {
+	assert.equal(buildFinalPrompt("do the edit", "accept-edits", false, true), "do the edit");
+});
+
+test("reviewerAgentMd: toolset must never contain a file-editing tool", () => {
+	const md = reviewerAgentMd("pi-bridge-ask-x");
+	assert.match(md, /^name: pi-bridge-ask-x$/m);
+	assert.match(md, /commandExecutionPolicy: auto/);
+	assert.match(md, /mainAgent: true/);
+	// The hard edit block is tool ABSENCE: these must never appear.
+	assert.doesNotMatch(md, /create_file/);
+	assert.doesNotMatch(md, /edit_file/);
+	assert.doesNotMatch(md, /write_file/);
+	assert.match(md, /- view_file/);
+	assert.match(md, /- run_command/);
+});
+
+test("stageReviewerAgent: creates a unique pid-marked agent dir under root", () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "ask-agents-"));
+	const a = stageReviewerAgent(root);
+	const b = stageReviewerAgent(root);
+	assert.notEqual(a.name, b.name);
+	assert.match(a.name, /^pi-bridge-ask-/);
+	assert.ok(fs.existsSync(path.join(a.dir, "agent.md")));
+	assert.equal(fs.readFileSync(path.join(a.dir, ".pid"), "utf8").trim(), String(process.pid));
+	fs.rmSync(root, { recursive: true, force: true });
+});
+
+// --- Execute wiring (argv captured through the fake-binary seam) -----------
+
+type RegisteredTool = {
+	name: string;
+	execute: (
+		id: string,
+		params: Record<string, unknown>,
+		signal?: unknown,
+		onUpdate?: unknown,
+		ctx?: Record<string, unknown>,
+	) => Promise<{ content: Array<{ type: string; text: string }> }>;
+};
+
+// The binary resolves at SPAWN time, so AGY_BIN must stay pointed at the
+// fake through execute - registration does not spawn (the repo hit this
+// exact bug before; see the ask-tool-empty-output header note).
+async function registerTool(): Promise<RegisteredTool> {
+	const tools: RegisteredTool[] = [];
+	const fakePi = {
+		registerTool: (tool: RegisteredTool) => tools.push(tool),
+	} as unknown as ExtensionAPI;
+	const { registerAskAntigravityTool } = await import("../src/ask-tool.js");
+	await registerAskAntigravityTool(fakePi, []);
+	assert.equal(tools.length, 1);
+	return tools[0];
+}
+
+/** Fake agy that records its argv (NUL-delimited) and exits 0 with a stub answer. */
+function makeArgvCapturingAgyBin(argvFile: string): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-bin-argv-"));
+	const bin = path.join(dir, "agy");
+	const script = [
+		"#!/usr/bin/env bash",
+		`printf '%s\\0' "$@" > ${JSON.stringify(argvFile)}`,
+		"echo ok",
+		"exit 0",
+		"",
+	].join("\n");
+	fs.writeFileSync(bin, script, { mode: 0o755 });
+	return bin;
+}
+
+function withEnvs(
+	values: Record<string, string | undefined>,
+	fn: () => Promise<void>,
+): Promise<void> {
+	const prevs = Object.entries(values).map(([k]) => [k, process.env[k]] as const);
+	return (async () => {
+		for (const [k, v] of Object.entries(values)) {
+			if (v === undefined) delete process.env[k];
+			else process.env[k] = v;
+		}
+		try {
+			await fn();
+		} finally {
+			for (const [k, prev] of prevs) {
+				if (prev === undefined) delete process.env[k];
+				else process.env[k] = prev;
+			}
+		}
+	})();
+}
+
+test("execute: plan run passes --agent and the skip flag, prompt carries the review guard, agent dir cleaned up", () =>
+	withEnvs(
+		{ AGY_SKIP_PERMISSIONS: "true" },
+		async () => {
+			const agentsRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ask-agents-root-"));
+			const argvFile = path.join(agentsRoot, "argv.txt");
+			const tool = await registerTool();
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "ask-cwd-"));
+			await withEnvs(
+				{ AGY_AGENTS_ROOT: agentsRoot, AGY_BIN: makeArgvCapturingAgyBin(argvFile) },
+				async () => {
+					const result = await tool.execute("t1", { prompt: "review this", mode: "plan", cwd }, undefined, undefined, { cwd });
+					// Surface an execute failure instead of a confusing argv ENOENT.
+					assert.equal(result.content[0].text, "ok");
+					const argv = fs.readFileSync(argvFile, "utf8").split("\0");
+					const agentIdx = argv.indexOf("--agent");
+					assert.ok(agentIdx !== -1, "plan run must pass --agent");
+					const agentName = argv[agentIdx + 1] ?? "";
+					assert.match(agentName, /^pi-bridge-ask-/);
+					// Knob on + agent staged: the flag is safe again - the agent has no
+					// file-editing tools, so the write vector it used to open is gone.
+					assert.ok(argv.includes("--dangerously-skip-permissions"));
+					const prompt = argv[argv.indexOf("-p") + 1] ?? "";
+					assert.match(prompt, /Do not create, modify, or delete any files/);
+					assert.doesNotMatch(prompt, /Do not run shell commands/);
+					assert.ok(!fs.existsSync(path.join(agentsRoot, agentName)), "agent dir must be removed after the run");
+					fs.rmSync(cwd, { recursive: true, force: true });
+					fs.rmSync(agentsRoot, { recursive: true, force: true });
+				},
+			);
+		},
+	));
+
+test("execute: plan run with agent staging failed falls back to no agent, no skip flag, command forbidding guard", () =>
+	withEnvs(
+		{ AGY_SKIP_PERMISSIONS: "true" },
+		async () => {
+			// An agents root under a regular file makes mkdir fail -> staging throws.
+			const blocker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "ask-blocker-")), "not-a-dir");
+			fs.writeFileSync(blocker, "x");
+			const argvFile = path.join(path.dirname(blocker), "argv.txt");
+			const tool = await registerTool();
+			const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "ask-cwd-"));
+			await withEnvs(
+				{ AGY_AGENTS_ROOT: path.join(blocker, "sub"), AGY_BIN: makeArgvCapturingAgyBin(argvFile) },
+				async () => {
+					const result = await tool.execute("t1", { prompt: "review this", mode: "plan", cwd }, undefined, undefined, { cwd });
+					assert.equal(result.content[0].text, "ok");
+					const argv = fs.readFileSync(argvFile, "utf8").split("\0");
+					assert.ok(!argv.includes("--agent"), "staging failure must not pass --agent");
+					assert.ok(
+						!argv.includes("--dangerously-skip-permissions"),
+						"fallback plan run must keep the no-skip rule (guard-only)",
+					);
+					const prompt = argv[argv.indexOf("-p") + 1] ?? "";
+					assert.match(prompt, /Do not run shell commands/);
+					fs.rmSync(path.dirname(blocker), { recursive: true, force: true });
+				},
+			);
+		},
+	));
