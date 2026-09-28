@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.6] - 2026-09-28
+
+### Fixed
+
+- **Plan-mode delegations enforce read-only instead of promising it.** The old design withheld the skip flag and relied on a prompt asking nicely; the field disagreed once — a plan delegation with the flag re-injected through the environment still edited files, because a prompt guard is a request, not a wall. Plan-mode runs now stage a temporary agy agent under `~/.gemini/config/agents/pi-bridge-ask-*` whose `tools:` list carries only `view_file` and `run_command`: with no file-editing tool in the toolset the model cannot emit an edit call at all (probed on agy 1.2.12 with and without `--dangerously-skip-permissions` — the restricted toolset reports "none" for edits both ways). The staged agent's `commandExecutionPolicy: auto` is what keeps reviews useful: analysis commands (git, rg, test runners) run headless for every user, with no `permissions.allow` edits — the per-user-config approach was rejected as unshippable for a product. With the agent staged, the skip flag returns under the same `skipPermissions` knob (default on): its only real danger was auto-approving edit calls, and none exist to approve. The prompt guard switches to a mutation-forbidding text (read-only commands allowed), and the tool description now states the true residual plainly: file-editing tools are hard-blocked, arbitrary shell execution under the flag stays prompt-guarded alone. Staging failure degrades fail-closed — no agent, no flag, the stricter all-commands-forbidden guard, with an env-injected skip flag stripped from `AGY_EXTRA_ARGS` on that path only. Agent dirs are nonce-named, pid-marked, removed in the run's finally, and orphans swept at registration (the web-delegate sweep gained a prefix parameter so both doctrines share one implementation).
+- **Headless plan prompts say what they cannot do.** `agy -p` cannot answer permission prompts, and in plan mode a shell-command attempt is soft-denied: the run ends cleanly with nothing on stdout and the reason only on stderr. Plan prompts now append an explicit constraint — no shell commands, answer from the material in the prompt, state exactly what is missing — converting the silent death into a visible missing-content request (probed: the previously-fatal prompt shape now answers "Missing information: ..." in about ten seconds). With the staged reviewer agent above, this guard yields to the mutation-forbidding variant; it remains the rule on the staging-failure fallback path.
+
 ## [1.7.5] - 2026-09-25
 
 ### Fixed
