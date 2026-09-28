@@ -78,7 +78,7 @@ TWO MODES (you choose):
 - **Continued conversation**: pass the conversationId returned in the PREVIOUS call's details (details.conversationId). agy resumes that conversation with full context intact.
 
 EXECUTION MODES (param: mode):
-- **plan**: agy reviews and plans without writing. Use for cross-review and read-only tasks. Enforced: plan runs never receive the skip-permissions flag, so a write or command attempt ends the run quickly with a "confirm plan" message instead of executing.
+- **plan**: agy reviews and plans without writing. Use for cross-review and read-only tasks. Enforced: plan runs never receive the skip-permissions flag, so a write or command attempt ends the run quickly with a "confirm plan" message instead of executing. Headless plan prompts carry a no-commands constraint automatically; inline the material to review - a plan run cannot fetch it.
 - **accept-edits** (default): agy applies edits directly inside the workspace.
 
 COMPACT OUTPUT (param: digest): when true, the prompt is prefixed to request compact digests instead of full file contents. Defaults on for plan, off for accept-edits.
@@ -268,6 +268,34 @@ export async function discoverToolModels(binary: string): Promise<ModelEntry[]> 
 function extraArgs(): string[] {
 	const raw = process.env.AGY_EXTRA_ARGS;
 	return raw ? raw.split(/\s+/).filter((s) => s.length > 0) : [];
+}
+
+// --- Prompt assembly -------------------------------------------------------
+
+/** Appended to every headless plan-mode prompt. `agy -p` cannot answer
+ *  permission prompts: in plan mode a run_command attempt is soft-denied and
+ *  the turn ends AT the denial (exit 0, empty stdout, notice only on stderr -
+ *  the empty-output branch in execute). Probed 2026-09-28 on agy 1.2.12:
+ *  allow rules ARE consulted (a verbatim allow-listed `git log` runs), but
+ *  --sandbox does NOT relax the command gate, so the only input every user
+ *  is guaranteed is the prompt itself. The guard steers the model to answer
+ *  from that material. accept-edits runs keep their tools and never get it. */
+export const PLAN_HEADLESS_GUARD = [
+	"",
+	"--- Headless session constraints ---",
+	"- Do not run shell commands. Command execution is denied in this session, and any attempt ends the session immediately with no answer.",
+	"- Work only from the material provided in this prompt.",
+	"- If information you need is missing, state exactly what is missing in your answer instead of trying to fetch it.",
+].join("\n");
+
+/** Assemble the prompt sent to agy: digest marker first (existing behavior),
+ *  then the caller's prompt, then the plan-mode guard last - the position
+ *  the model reads with the most recency. No user-config mutation: this is
+ *  the only plan-mode lever the tool itself owns. */
+export function buildFinalPrompt(prompt: string, mode: AgyMode, digest: boolean): string {
+	let out = digest ? `(Use compact digests, not full file contents.)\n${prompt}` : prompt;
+	if (mode === "plan") out += PLAN_HEADLESS_GUARD;
+	return out;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -496,9 +524,7 @@ export async function registerAskAntigravityTool(
 			const mode: AgyMode = (params.mode as AgyMode | undefined) ?? "accept-edits";
 			const useDigest: boolean =
 				typeof params.digest === "boolean" ? params.digest : mode === "plan";
-			const finalPrompt: string = useDigest
-				? `(Use compact digests, not full file contents.)\n${params.prompt}`
-				: params.prompt;
+			const finalPrompt: string = buildFinalPrompt(params.prompt, mode, useDigest);
 
 			// Opt-in full-context export (isolated stays the default).
 			let contextFile: string | null = null;
@@ -775,7 +801,7 @@ export async function registerAskAntigravityTool(
 					const note = [
 						"agy exited cleanly but produced no output.",
 						stderr ? `stderr: ${stderr}` : null,
-						"Common cause: a tool call needed a permission that headless mode cannot prompt for (typically the command gate in plan mode), so it was auto-denied. Allow-list it under permissions.allow in ~/.gemini/antigravity-cli/settings.json, or rerun outside plan mode with skipPermissions.",
+						"Common cause: a tool call needed a permission that headless mode cannot prompt for (typically the command gate in plan mode), so it was auto-denied and the turn ended with no answer. Recovery: retry in plan mode with all needed content inlined in the prompt - plan runs cannot fetch it, commands are denied. Or rerun outside plan mode with skipPermissions, or add your own permissions.allow rules in ~/.gemini/antigravity-cli/settings.json.",
 					]
 						.filter(Boolean)
 						.join(" ");

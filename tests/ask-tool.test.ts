@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { resolveModel, toolModelsFromRaw } from "../src/ask-tool.js";
+import { buildFinalPrompt, resolveModel, toolModelsFromRaw } from "../src/ask-tool.js";
 import { toAgyEffort } from "../src/models.js";
 
 // The REAL `agy models` stdout shape (verified live via `ct agy models`).
@@ -140,4 +140,39 @@ test("resolveModel: short aliases still resolve when agy omits them (static over
 	assert.deepEqual(resolveModel("gpt-oss", geminiOnly, DEFAULT_THINKING), {
 		model: "gpt-oss-120b-medium",
 	});
+});
+
+// --- Prompt assembly (headless plan-mode hardening) ------------------------
+// Root cause probed 2026-09-28: `agy -p --mode plan` soft-denies run_command
+// and the turn ends AT the denial (exit 0, empty stdout, no second model
+// turn), so one unguarded command attempt kills the whole run. The prompt is
+// the only lever the tool owns without touching user config.
+
+test("buildFinalPrompt: plan mode appends the no-commands guard", () => {
+	const out = buildFinalPrompt("Review the diff.\n---\ndiff body", "plan", false);
+	assert.ok(out.startsWith("Review the diff."));
+	// The guard must forbid shell commands outright and point the model back
+	// at the prompt material - the only reliably available input.
+	assert.match(out, /Do not run shell commands/);
+	assert.match(out, /ends the session immediately/);
+	assert.ok(
+		out.endsWith("state exactly what is missing in your answer instead of trying to fetch it."),
+	);
+});
+
+test("buildFinalPrompt: plan + digest keeps digest prefix first, guard last", () => {
+	const out = buildFinalPrompt("body", "plan", true);
+	assert.ok(out.startsWith("(Use compact digests, not full file contents.)\n"));
+	assert.ok(out.includes("(Use compact digests, not full file contents.)\nbody\n"));
+	assert.ok(out.endsWith("instead of trying to fetch it."));
+});
+
+test("buildFinalPrompt: accept-edits never carries the guard", () => {
+	// Edit runs keep their tools under skip-permissions; appending the guard
+	// would break delegated edits and command use.
+	assert.equal(buildFinalPrompt("do the edit", "accept-edits", false), "do the edit");
+	assert.equal(
+		buildFinalPrompt("do the edit", "accept-edits", true),
+		"(Use compact digests, not full file contents.)\ndo the edit",
+	);
 });
