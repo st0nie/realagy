@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.7] - 2026-09-30
+
+### Fixed
+
+- **A recreated agy conversation no longer starves the context digest.** When `session/load` failed, the ACP engine silently fell back to a fresh conversation (`session-load-failed-creating-fresh`), but the end-of-turn write-back kept advancing the stored watermark, so the new conversation never received the backlog: the digest delivered only the current prompt for the rest of the session, and the G10 system-prompt gate stayed closed too, because the surviving record always carried a conversation id. The write-back now compares the outcome's conversation id against the one stored before the turn and drops the record on a mismatch: the next turn re-delivers the full digest backlog and re-arms the system prompt, on both engines, with no protocol change. `SessionStore` gained a per-key `delete()` whose removal persists exactly once (the removal set prunes after a durable write, so a later persist can never destroy a record another process wrote in the meantime), preserving the multi-process merge invariant.
+- **Failed and aborted turns no longer advance the digest watermark.** The write-back recorded `lastMessageCount` on any turn that reported a conversation id, ERROR and aborts included. Whether the prompt actually landed in the conversation's history is not observable from the provider, and advancing on that ambiguity starves the digest of the missed turn (the same failure class as the recreation bug above). The watermark now advances only on a clean, non-aborted turn; failed, aborted, and unknown outcomes leave the pre-turn record untouched, so the next digest re-delivers the missed turn bounded by the existing `maxChars` cap (default 8000) instead of losing it. With the digest off (the default) neither fix changes observable behavior.
+- **Regression coverage pins both behaviors at the provider layer.** Eight new tests: record drop, backlog re-delivery, and system-prompt re-arm across the id swap; unchanged watermark across failed, aborted, and unknown outcomes on the same conversation; and the session-store delete and multi-process semantics, including a reclaimed key surviving an unrelated persist from another process. 1329 tests, tsc clean.
+
+Thanks @fishfuuu for the report (#1).
+
 ## [1.7.6] - 2026-09-28
 
 ### Fixed
