@@ -18,6 +18,7 @@ import {
 	buildFullPrompt,
 	createStreamSimple,
 } from "../src/provider.js";
+import { resetSyspromptAgentForTests } from "../src/sysprompt-agent.js";
 import { SessionStore } from "../src/sessions.js";
 import type { StreamDriver, DriverTurnRequest } from "../src/driver.js";
 
@@ -67,9 +68,11 @@ test("digest without system prompt keeps digest preamble + prompt", () => {
 
 // --- G10 gating (fresh-vs-bound conversation) --------------------------------
 // buildFullPrompt is pure; the DECISION lives in runTurnDriver
-// (config.systemPrompt && !existing?.conversationId). Drive the real
-// streamSimple with a fake driver whose outcome carries a conversationId and
-// assert on the actual prompt handed to driver.run.
+// (config.systemPrompt && !existing?.conversationId). On stream-json the
+// delivery is a staged agent file via --agent, NOT prompt text: agy's
+// ~25KB single-line cap silently drops over-cap turns and poisons the
+// conversation (issue #2, probed 2026-09-30). Drive the real streamSimple
+// with a fake driver and assert on the actual request handed to driver.run.
 
 const model: Model<Api> = {
 	id: "gemini-flash",
@@ -136,53 +139,95 @@ async function runTurn(h: Harness, prompt: string, systemPrompt?: string): Promi
 	for await (const ev of stream) void ev;
 }
 
-function withSysEnv(value: string, fn: () => Promise<void>): Promise<void> {
-	const prev = process.env.AGY_SYSTEM_PROMPT;
-	process.env.AGY_SYSTEM_PROMPT = value;
+function withEnv(values: Record<string, string | undefined>, fn: () => Promise<void>): Promise<void> {
+	const prev: Record<string, string | undefined> = {};
+	for (const [k, v] of Object.entries(values)) {
+		prev[k] = process.env[k];
+		if (v === undefined) delete process.env[k];
+		else process.env[k] = v;
+	}
 	return fn().finally(() => {
-		if (prev === undefined) delete process.env.AGY_SYSTEM_PROMPT;
-		else process.env.AGY_SYSTEM_PROMPT = prev;
+		for (const [k, v] of Object.entries(prev)) {
+			if (v === undefined) delete process.env[k];
+			else process.env[k] = v;
+		}
 	});
 }
 
-test("gate: first turn of a fresh conversation prepends the system prompt block", async () => {
-	await withSysEnv("on", async () => {
+test("gate: fresh conversation stages the system prompt as an agent, not prompt text", async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-gate-agents-"));
+	await withEnv({ AGY_SYSTEM_PROMPT: "on", AGY_AGENT: undefined, AGY_AGENTS_ROOT: root }, async () => {
+		resetSyspromptAgentForTests();
 		const h = gateHarness();
 		try {
 			await runTurn(h, "hello", SYS);
-			const prompt = h.seen.opts?.prompt ?? "";
-			assert.ok(prompt.startsWith(SYSTEM_PROMPT_PREAMBLE));
-			assert.ok(prompt.includes(SYS));
-			assert.ok(prompt.endsWith(`${SYSTEM_PROMPT_END}\n\n---\n\nhello`));
+			// The prompt line carries ONLY the user message: the block must not
+			// ride it (the cap drop is the bug being fixed).
+			assert.equal(h.seen.opts?.prompt, "hello");
+			const agent = h.seen.opts?.agent ?? "";
+			assert.ok(agent.startsWith("pi-bridge-sys-"), "carrier agent passed via --agent");
+			const md = fs.readFileSync(path.join(root, agent, "agent.md"), "utf8");
+			assert.ok(md.includes(SYS));
+			assert.ok(md.includes(TOOL_PRIORITY_NOTE));
 		} finally {
 			fs.rmSync(h.dir, { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 });
 
-test("gate: bound conversation does not re-send the block", async () => {
-	await withSysEnv("on", async () => {
+test("gate: bound conversation keeps the carrier agent and never re-sends the block", async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-gate-agents-"));
+	await withEnv({ AGY_SYSTEM_PROMPT: "on", AGY_AGENT: undefined, AGY_AGENTS_ROOT: root }, async () => {
+		resetSyspromptAgentForTests();
 		const h = gateHarness();
 		try {
 			await runTurn(h, "hello", SYS);
 			await runTurn(h, "turn two", SYS);
 			// Turn 1 bound conv-g10 via the outcome; turn 2 must ride agy's own
-			// history with the bare user message only.
+			// history with the bare user message only. The agent name stays
+			// stable so the driver profile never drifts on "agent".
 			assert.equal(h.seen.opts?.prompt, "turn two");
+			assert.ok((h.seen.opts?.agent ?? "").startsWith("pi-bridge-sys-"));
 		} finally {
 			fs.rmSync(h.dir, { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 });
 
-test("gate: systemPrompt off suppresses the block even on a fresh conversation", async () => {
-	await withSysEnv("off", async () => {
+test("gate: systemPrompt off suppresses the block and the carrier agent", async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-gate-agents-"));
+	await withEnv({ AGY_SYSTEM_PROMPT: "off", AGY_AGENT: undefined, AGY_AGENTS_ROOT: root }, async () => {
+		resetSyspromptAgentForTests();
 		const h = gateHarness();
 		try {
 			await runTurn(h, "hello", SYS);
 			assert.equal(h.seen.opts?.prompt, "hello");
+			assert.equal(h.seen.opts?.agent, undefined);
 		} finally {
 			fs.rmSync(h.dir, { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+});
+
+test("gate: a user-configured agent wins; the block falls back inline (never clobber)", async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-gate-agents-"));
+	await withEnv({ AGY_SYSTEM_PROMPT: "on", AGY_AGENT: "my-own-agent", AGY_AGENTS_ROOT: root }, async () => {
+		resetSyspromptAgentForTests();
+		const h = gateHarness();
+		try {
+			await runTurn(h, "hello", SYS);
+			assert.equal(h.seen.opts?.agent, "my-own-agent");
+			const prompt = h.seen.opts?.prompt ?? "";
+			assert.ok(prompt.startsWith(SYSTEM_PROMPT_PREAMBLE));
+			assert.ok(prompt.includes(SYS));
+			// Nothing staged: the user's agent directory stays untouched.
+			assert.equal(fs.readdirSync(root).length, 0);
+		} finally {
+			fs.rmSync(h.dir, { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 });

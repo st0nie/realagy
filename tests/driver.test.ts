@@ -163,6 +163,65 @@ describe("stream-json driver zero timeouts disable both caps", () => {
 	});
 });
 
+describe("stream-json driver issue-#2 evidence fields", () => {
+	test("a silent over-cap drop (SUCCESS, no steps, zero usage) reports modelOutputSeen=false", async () => {
+		process.env.PATH = `${FAKE_BIN_DIR}:${process.env.PATH}`;
+		const driver = new StreamDriver();
+		const handle = await driver.run({
+			prompt: "SILENT-DROP",
+			cwd: process.cwd(),
+			model: "gemini-3.8-flash",
+			mode: "accept-edits",
+			skipPermissions: true,
+			timeoutMin: 0.5,
+			inactivityMin: 0.5,
+		});
+		const outcome = await handle.outcome;
+		assert.equal(outcome.status, "OK");
+		assert.equal(outcome.sawResult, true);
+		assert.equal(outcome.modelOutputSeen, false);
+		await driver.close("shutdown");
+	});
+
+	test("a real text turn reports modelOutputSeen=true and sawResult=true", async () => {
+		process.env.PATH = `${FAKE_BIN_DIR}:${process.env.PATH}`;
+		const driver = new StreamDriver();
+		const handle = await driver.run({
+			prompt: "hi",
+			cwd: process.cwd(),
+			model: "gemini-3.8-flash",
+			mode: "accept-edits",
+			skipPermissions: true,
+			timeoutMin: 0.5,
+			inactivityMin: 0.5,
+		});
+		const outcome = await handle.outcome;
+		assert.equal(outcome.status, "OK");
+		assert.equal(outcome.sawResult, true);
+		assert.equal(outcome.modelOutputSeen, true);
+		await driver.close("shutdown");
+	});
+
+	test("a deadline stall with no result frame sets deadline and sawResult=false", async () => {
+		process.env.PATH = `${FAKE_BIN_DIR}:${process.env.PATH}`;
+		const driver = new StreamDriver();
+		const handle = await driver.run({
+			prompt: "please HANG",
+			cwd: process.cwd(),
+			model: "gemini-3.8-flash",
+			mode: "accept-edits",
+			skipPermissions: true,
+			timeoutMin: 10,
+			inactivityMin: 0.05,
+		});
+		const outcome = await handle.outcome;
+		assert.equal(outcome.status, "ERROR");
+		assert.equal(outcome.sawResult, false);
+		assert.equal(outcome.deadline, "stall");
+		await driver.close("shutdown");
+	}, 30_000);
+});
+
 describe("stream-json driver stderr redaction", () => {
 	// Regression (peer review 2026-09): the raw stderr tail rode verbatim into
 	// the turn-failure message (user transcript + daily log). A secret agy

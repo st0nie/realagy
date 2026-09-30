@@ -90,6 +90,20 @@ export interface TurnOutcome {
 	usage?: AgyUsage;
 	finished: boolean;
 	aborted: boolean;
+	/** The model demonstrably produced output this turn: an agent_response
+	 *  or tool step was observed, or the settled response/usage is non-empty.
+	 *  Stream-json sets it on every outcome; ACP leaves it undefined.
+	 *  false + status OK is agy's silent over-cap drop signature (issue #2:
+	 *  prompts past ~25KB are discarded with SUCCESS, no error). */
+	modelOutputSeen?: boolean;
+	/** Stream-json only: a result frame arrived for this turn. Undefined on
+	 *  ACP. A deadline kill or process exit before the result frame means the
+	 *  turn never committed. */
+	sawResult?: boolean;
+	/** Stream-json only: the turn ended via the overall/inactivity deadline
+	 *  guard (not a user abort, not a process crash). With sawResult false on
+	 *  a resumed conversation this marks the conversation as poisoned. */
+	deadline?: "timeout" | "stall";
 }
 
 export interface TurnHandle {

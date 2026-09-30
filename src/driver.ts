@@ -67,6 +67,10 @@ interface ActiveTurn {
 	 *  transcript steps to those written after this. */
 	startedAt: number;
 	sawResult: boolean;
+	/** An agent_response or tool step arrived this turn. Distinguishes a
+	 *  real (if terse) turn from agy's silent over-cap drop, which settles
+	 *  SUCCESS with no model step at all (issue #2). */
+	sawModelStep: boolean;
 	/** Text-dedupe guard state (delta vs cumulative response_text). */
 	cumulativeText: boolean | undefined;
 	/** Open bridge parks. Each one suspends the stdout idle timer: agy is
@@ -118,6 +122,20 @@ function makeHandle(turn: ActiveTurn): TurnHandle {
 
 function nowIso(): string {
 	return new Date().toISOString().slice(11, 19);
+}
+
+/** True when any usage counter carries a real value. The silent over-cap
+ *  drop reports all-zero usage (no model call happened); a turn that burned
+ *  any tokens demonstrably reached the model. */
+function hasTokenEvidence(usage: AgyUsage | undefined): boolean {
+	if (!usage) return false;
+	return (
+		(usage.input_tokens ?? 0) > 0 ||
+		(usage.output_tokens ?? 0) > 0 ||
+		(usage.thinking_tokens ?? 0) > 0 ||
+		(usage.cache_read_tokens ?? 0) > 0 ||
+		(usage.total_tokens ?? 0) > 0
+	);
 }
 
 /** True when `next` is a cumulative resend of `accumulated` (it repeats every
@@ -287,6 +305,7 @@ export class StreamDriver implements TurnDriver {
 			outcome,
 			response: "",
 			sawResult: false,
+			sawModelStep: false,
 			cumulativeText: undefined,
 			parks: 0,
 			startedAt: Date.now(),
@@ -500,6 +519,7 @@ export class StreamDriver implements TurnDriver {
 					emit(turn, { type: "usage", usage: s.usage });
 				}
 				if (s.step_type === "agent_response") {
+					turn.sawModelStep = true;
 					const text =
 						typeof s.text_delta === "string"
 							? s.text_delta
@@ -513,6 +533,7 @@ export class StreamDriver implements TurnDriver {
 					break;
 				}
 				if (s.step_type === "tool") {
+					turn.sawModelStep = true;
 					const name = s.tool_name ?? s.tool_info?.name ?? "tool";
 					const args =
 						s.tool_info?.parameters && typeof s.tool_info.parameters === "object"
@@ -614,9 +635,22 @@ export class StreamDriver implements TurnDriver {
 		this.#state = this.#child ? "ready" : "dead";
 		for (const wake of turn.wake) wake();
 		turn.wake = [];
-		turn.resolve(outcome);
+		// Evidence fields every consumer can rely on. modelOutputSeen separates a
+		// real (if terse) turn from agy's silent over-cap drop, which settles
+		// SUCCESS with NO model step, empty response, and zero usage (issue #2).
+		const usage = outcome.usage ?? turn.usage;
+		const enriched: TurnOutcome = {
+			...outcome,
+			usage,
+			sawResult: turn.sawResult,
+			modelOutputSeen:
+				turn.sawModelStep ||
+				outcome.response.length > 0 ||
+				hasTokenEvidence(usage),
+		};
+		turn.resolve(enriched);
 		try {
-			this.#onTurnEnd?.(outcome);
+			this.#onTurnEnd?.(enriched);
 		} catch {
 			/* listener errors must not break settling */
 		}
@@ -630,7 +664,7 @@ export class StreamDriver implements TurnDriver {
 	 *  One found, the turn settles OK with the withheld answer instead of
 	 *  discarding finished work; either way the next turn respawns into a
 	 *  known state. */
-	async #turnDeadlineGuard(turn: ActiveTurn, label: string, message: string): Promise<void> {
+	async #turnDeadlineGuard(turn: ActiveTurn, label: "timeout" | "stall", message: string): Promise<void> {
 		if (turn.closed) return;
 		this.#log(`${label}:${turn.id}`);
 		this.#killChild();
@@ -650,13 +684,14 @@ export class StreamDriver implements TurnDriver {
 				usage: turn.usage,
 				finished: true,
 				aborted: false,
+				deadline: label,
 			});
 			return;
 		}
-		this.#failTurn(turn, message);
+		this.#failTurn(turn, message, label);
 	}
 
-	#failTurn(turn: ActiveTurn, message: string): void {
+	#failTurn(turn: ActiveTurn, message: string, deadline?: "timeout" | "stall"): void {
 		this.#settle(turn, {
 			conversationId: turn.conversationId,
 			status: "ERROR",
@@ -665,6 +700,7 @@ export class StreamDriver implements TurnDriver {
 			usage: turn.usage,
 			finished: true,
 			aborted: false,
+			deadline,
 		});
 	}
 

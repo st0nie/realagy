@@ -43,8 +43,21 @@ import { GATE_MARKER, mapNativeToShadow, stripMarkerFields } from "./approval-ga
 import type { ApprovalDecision, ApprovalPayload, ApprovalParkApi } from "./mcp-server.js";
 import path from "node:path";
 import { TurnDiffContext, createExecGitOps, formatInlineDiff, parseEditToolInput } from "./diff-render.js";
+import { stageSyspromptAgent } from "./sysprompt-agent.js";
 
 const DEFAULT_TIMEOUT_MIN = 10;
+
+/** Warned once per process: config.agent set while the system prompt needs
+ *  the staged carrier agent (issue #2 inline-block fallback). */
+let warnedUserAgentConflict = false;
+
+/** conversationId -> staged carrier agent name. Gate-closed turns look the
+ *  name up here so a conversation's agent field never flips: a change would
+ *  recycle the agy process mid-conversation (profile drift), and a respawn
+ *  must reload THAT conversation's own staged instructions. Content-addressed
+ *  staging (one dir per body) keeps sibling conversations from overwriting
+ *  each other's files. */
+const stagedAgentByConversation = new Map<string, string>();
 
 /** Zero-usage helper. agy doesn't expose token counts; pi's cost math gets
  *  zeros (we're not billing through this provider). */
@@ -1182,6 +1195,10 @@ async function runTurnDriver(
 	}
 
 	let handle: TurnHandle;
+	// Name of the carrier agent staged for THIS turn's fresh conversation, if
+	// any. Recorded into stagedAgentByConversation once the outcome binds the
+	// conversation id, so later gate-closed turns pass the same agent.
+	let stagedAgentName: string | undefined;
 	if (isContinuation) {
 		const active = deps.driver.reentry();
 		if (!active) {
@@ -1225,12 +1242,44 @@ async function runTurnDriver(
 		// The uri is suffixed per turn so a deduping server cannot serve stale
 		// content on turn 2+.
 		const embeddedDigest = deps.engine === "acp" && digest ? digest : undefined;
-		// Fresh conversation only: agy stores the block in its own history, so
-		// re-sending it every turn would bloat each prompt and bust the cache.
-		const sysPrompt =
-			config.systemPrompt && !existing?.conversationId
-				? getCurrentSystemPrompt(context.messages) || undefined
-				: undefined;
+		// G10, fresh conversations only (bound conversations ride agy's own
+		// history; re-sending would bloat every prompt and bust the cache).
+		// stream-json delivery is a staged agent file, NOT prompt text: agy's
+		// stream-json path silently drops any turn past a ~25KB input cap and
+		// the dropped turn leaves the conversation permanently unresponsive
+		// (issue #2, probed 2026-09-30), and the block routinely crossed it.
+		// ACP keeps the inline block (JSON-RPC transport; --agent is a CLI
+		// feature). A user-configured agent always wins: never clobber it.
+		const gateOpen = config.systemPrompt && !existing?.conversationId;
+		const rawSysPrompt = gateOpen ? getCurrentSystemPrompt(context.messages) || undefined : undefined;
+		let sysPrompt = rawSysPrompt;
+		let agent = config.agent;
+		if (deps.engine !== "acp") {
+			if (rawSysPrompt && !config.agent) {
+				const stagedName = stageSyspromptAgent(
+					[SYSTEM_PROMPT_PREAMBLE, rawSysPrompt, TOOL_PRIORITY_NOTE].join("\n\n"),
+				);
+				if (stagedName) {
+					agent = stagedName;
+					sysPrompt = undefined;
+					stagedAgentName = stagedName;
+				}
+				// Staging failed: inline fallback. The silent-drop guard below
+				// keeps the resulting cap failure visible instead of quiet.
+			} else if (rawSysPrompt && config.agent && !warnedUserAgentConflict) {
+				warnedUserAgentConflict = true;
+				deps.log?.(
+					"sysprompt-agent-conflict",
+					{ agent: config.agent, effect: "system prompt ships inline in the prompt (over-cap drop risk)" },
+					"warn",
+				);
+			} else if (!rawSysPrompt && !config.agent && existing?.conversationId) {
+				// Gate closed (bound conversation): pass the carrier staged for
+				// THIS conversation, if any, so the driver profile never drifts on
+				// "agent" and a respawned process reloads its own instructions.
+				agent = stagedAgentByConversation.get(existing.conversationId);
+			}
+		}
 		const fullPrompt =
 			late.length > 0
 				? buildLateResultPrompt(late, prompt || undefined)
@@ -1242,12 +1291,12 @@ async function runTurnDriver(
 				effort,
 				mode: config.mode,
 				skipPermissions: config.skipPermissions,
-				agent: config.agent,
 				timeoutMin: config.turnTimeoutMin,
 				inactivityMin: config.inactivityTimeoutMin,
 				conversationId: existing?.conversationId ?? null,
 				prompt: fullPrompt,
 				images: images.length > 0 ? images : undefined,
+				agent,
 				contextBlock: embeddedDigest
 					? {
 							uri: `urn:pi-bridge:context-digest/${messageCount}`,
@@ -1282,6 +1331,49 @@ async function runTurnDriver(
 	}
 
 	const outcome = await handle.outcome;
+	// Issue #2 recovery paths. agy's stream-json prompt path silently drops an
+	// over-cap turn (SUCCESS, empty response, zero usage, NO model step) and a
+	// dropped turn leaves the conversation permanently unresponsive, so both
+	// failures clear the binding instead of settling a quiet empty reply —
+	// settling OK here would persist a dead conversation for every later turn
+	// (probe 2026-09-30: resume of a dropped-turn conversation never returns
+	// a result frame). stream-json only: the ACP driver leaves the evidence
+	// fields undefined.
+	const silentDrop = outcome.status === "OK" && outcome.modelOutputSeen === false;
+	const poisonedResume =
+		outcome.status === "ERROR" &&
+		outcome.deadline !== undefined &&
+		outcome.sawResult === false &&
+		Boolean(existing?.conversationId);
+	if (silentDrop || poisonedResume) {
+		if (existing?.conversationId || outcome.conversationId) {
+			store.delete(key);
+			if (outcome.conversationId) stagedAgentByConversation.delete(outcome.conversationId);
+		}
+		deps.log?.(
+			"turn-error",
+			{
+				reason: silentDrop ? "silent-overcap-drop" : "poisoned-conversation",
+				conversation: outcome.conversationId ?? null,
+			},
+			"error",
+		);
+		// A deadline with no model output is a stall/timeout, not the over-cap
+		// signature: label it by its real cause (the deadline guard's recovered-
+		// answer probe can settle OK with an empty response after the kill).
+		const dropCause = outcome.deadline
+			? "the turn hit its time limit and produced no model output"
+			: "the prompt was silently dropped (agy discards prompts past ~25KB with no error)";
+		finalize(
+			stream,
+			blocks,
+			"error",
+			silentDrop
+				? `agy returned success but produced no model output: ${dropCause}. Common cause: a very large pasted prompt. The conversation binding was cleared; retry with a smaller prompt.`
+				: "agy stopped responding on the resumed conversation (no response frame before the deadline; the conversation is dead). The binding was cleared, so the next antigravity turn starts a fresh conversation.",
+		);
+		return;
+	}
 	if (outcome.conversationId) {
 		// A different id than the stored one means the driver recreated the
 		// conversation under us (ACP session-load fallback, stream-json CLI
@@ -1293,12 +1385,14 @@ async function runTurnDriver(
 		// documented residual; recovery starts on the next turn.
 		if (existing?.conversationId && outcome.conversationId !== existing.conversationId) {
 			store.delete(key);
+			stagedAgentByConversation.delete(existing.conversationId);
 		} else if (outcome.status === "OK" && !outcome.aborted) {
 			store.set(key, {
 				conversationId: outcome.conversationId,
 				lastStepIdx: -1,
 				lastMessageCount: messageCount,
 			});
+			if (stagedAgentName) stagedAgentByConversation.set(outcome.conversationId, stagedAgentName);
 		}
 		// A failed or aborted turn on the SAME conversation keeps the pre-turn
 		// record: whether the prompt actually landed in agy's DB is not

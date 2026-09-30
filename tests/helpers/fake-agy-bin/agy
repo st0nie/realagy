@@ -4,6 +4,16 @@
 # simulating a pipe boundary landing mid-line.
 read -r _line
 case "$_line" in
+  *SILENT-DROP*)
+    # Issue #2 signature: agy accepts the line, commits NOTHING (no
+    # agent_response step), and reports SUCCESS with empty response and
+    # all-zero usage. The driver must surface modelOutputSeen=false.
+    printf '%s\n' '{"event":"init","init":{"conversation_id":"conv-drop"}}'
+    sleep 0.1
+    printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"","conversation_id":"conv-drop","usage":{"input_tokens":0,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":0}}}'
+    sleep 0.1
+    exit 0
+    ;;
   *STDERR-LEAK*)
     # Secret-bearing stderr crash (redaction tests): the exit path feeds
     # stderrTail straight into the turn-failure message.

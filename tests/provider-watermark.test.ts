@@ -28,6 +28,7 @@ import {
 	ToolRoundTrips,
 	createStreamSimple,
 } from "../src/provider.js";
+import { resetSyspromptAgentForTests } from "../src/sysprompt-agent.js";
 import { SessionStore } from "../src/sessions.js";
 import type { StreamDriver, DriverTurnRequest } from "../src/driver.js";
 
@@ -191,7 +192,13 @@ test("recreated conversation: stale record is dropped and the backlog is re-deli
 });
 
 test("recreated conversation: system-prompt gate re-arms on the next turn", async () => {
-	await withEnv({ AGY_DIGEST: "1", AGY_SYSTEM_PROMPT: "on" }, async () => {
+	// Staged-agent delivery: re-arm means the fresh conversation's carrier
+	// body is REFRESHED with the current system prompt, and the prompt line
+	// never carries the block.
+	const SYS2 = "You are pi v2. Follow the NEW rules.";
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-wm-agents-"));
+	await withEnv({ AGY_DIGEST: "1", AGY_SYSTEM_PROMPT: "on", AGY_AGENTS_ROOT: root }, async () => {
+		resetSyspromptAgentForTests();
 		const h = harness(["conv-a", "conv-b", "conv-c"]);
 		try {
 			await runTurn(h, ["first task"], SYS);
@@ -199,13 +206,19 @@ test("recreated conversation: system-prompt gate re-arms on the next turn", asyn
 			// Turn 2 (the recreation turn itself) still rides the OLD gate: the
 			// decision happens before the driver can swap the conversation. This
 			// is the documented residual; recovery starts on the next turn.
-			assert.ok(!(h.seen.opts?.prompt ?? "").startsWith(SYSTEM_PROMPT_PREAMBLE));
-			await runTurn(h, ["first task", "second", "continue"], SYS);
-			// Dropped record => existing is null => the gate is open again.
-			assert.ok((h.seen.opts?.prompt ?? "").startsWith(SYSTEM_PROMPT_PREAMBLE));
-			assert.ok((h.seen.opts?.prompt ?? "").includes(SYS));
+			assert.ok(!(h.seen.opts?.prompt ?? "").includes(SYS2));
+			await runTurn(h, ["first task", "second", "continue"], SYS2);
+			// Dropped record => existing is null => the gate is open again: the
+			// carrier body is refreshed with the CURRENT system prompt and the
+			// prompt line stays bare.
+			const agent = h.seen.opts?.agent ?? "";
+			assert.ok(agent.startsWith("pi-bridge-sys-"));
+			const md = fs.readFileSync(path.join(root, agent, "agent.md"), "utf8");
+			assert.ok(md.includes(SYS2), "carrier body refreshed on re-arm");
+			assert.ok(!(h.seen.opts?.prompt ?? "").includes(SYS2));
 		} finally {
 			fs.rmSync(h.dir, { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 });
@@ -215,7 +228,9 @@ test("failed turn on the same conversation: watermark is not advanced (backlog r
 	// record must keep the gate CLOSED (no second system prompt to a still-
 	// bound conversation). Under AGY_SYSTEM_PROMPT=off the gate is
 	// short-circuited at the config level and the assertion would be vacuous.
-	await withEnv({ AGY_DIGEST: "1", AGY_SYSTEM_PROMPT: "on" }, async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "agy-wm-agents-"));
+	await withEnv({ AGY_DIGEST: "1", AGY_SYSTEM_PROMPT: "on", AGY_AGENTS_ROOT: root }, async () => {
+		resetSyspromptAgentForTests();
 		const h = harness([
 			"conv-a",
 			{ conversationId: "conv-a", status: "ERROR", error: "boom" },
@@ -241,10 +256,14 @@ test("failed turn on the same conversation: watermark is not advanced (backlog r
 			assert.ok(prompt.includes("second"), "the missed turn is re-delivered");
 			assert.ok(prompt.endsWith("continue"));
 			// The record survived, so the gate stays closed: the conversation is
-			// still bound and must not receive a second system prompt.
-			assert.ok(!prompt.startsWith(SYSTEM_PROMPT_PREAMBLE));
+			// still bound and must not receive a second system prompt. Staged
+			// delivery: the carrier keeps riding (profile stability) but the
+			// prompt line never carries the block.
+			assert.ok(!(prompt.includes(SYS)), "no inline system prompt");
+			assert.ok((h.seen.opts?.agent ?? "").startsWith("pi-bridge-sys-"));
 		} finally {
 			fs.rmSync(h.dir, { recursive: true, force: true });
+			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
 });
