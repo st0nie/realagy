@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.8] - 2026-09-30
+
+### Fixed
+
+- **The system prompt no longer rides the prompt line on stream-json.** Probed on agy 1.2.14: the CLI silently drops any single prompt past a ~25KB input cap. The drop reports SUCCESS with an empty response, zero usage, and no model step, and a conversation whose turn was dropped never answers again - resuming it hangs with no result frame. The G10 system-prompt block shipped inline on the first prompt of every fresh conversation by default and routinely crossed the cap, so provider sessions answered boilerplate while the user's message never ran (issue #2). The block now stages as an agy agent file under the agents discovery root and rides `--agent`: the CLI reads agent files from disk, so the cap never applies, and the prompt line carries only the user message. Staging is content-addressed - one dir per distinct body, write-once, pid-marked, orphan-swept - so two conversations in one process can never overwrite each other's carrier (the round-2 review blocked the original per-process slot for exactly that cross-contamination). A user-configured `config.agent` always wins, with the inline block as fallback and a one-time warning. ACP keeps the inline block: the JSON-RPC transport has no cap and no `--agent` slot.
+- **A dropped or dead turn now fails loudly instead of poisoning the session.** The stream-json driver settles every turn with model-output and result-frame evidence. An OK outcome with no model output - the exact signature of the silent over-cap drop - fails the turn with the cause and the remedy, and never stores the conversation binding; a deadline on a bound conversation with no result frame clears the binding so the next turn starts a fresh conversation instead of hanging forever on a dead one. Real terse turns (tool steps, thinking, any usage) are untouched; a deadline that recovered a withheld answer keeps settling OK.
+- **Regression coverage pins the whole failure chain at both layers.** The fake agy binary grew a SILENT-DROP branch reproducing the exact wire signature; driver tests pin the evidence fields; provider tests cover the drop, the poisoned resume, a deadline-with-result keeping its binding, terse-turn false positives, carrier isolation across interleaved conversations, and deadline-flavored error copy. 1343 tests, tsc clean; round-2 adversarial review signed off after the carrier-isolation blocker fix.
+
+Thanks @Jamsa for the report (#2).
+
 ## [1.7.7] - 2026-09-30
 
 ### Fixed
