@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { test } from "vitest";
+import { test, vi } from "vitest";
 import { SessionStore } from "../src/sessions.js";
 
 function tmpStorePath(): string {
@@ -63,4 +63,59 @@ test("SessionStore: top-level non-object file is treated as empty", () => {
 	fs.writeFileSync(p, `[1, 2, 3]`); // array, not an object
 	const store = new SessionStore(p);
 	assert.equal(store.size, 0);
+});
+
+test("SessionStore: delete drops only the target key, in memory and on disk", async () => {
+	const p = tmpStorePath();
+	const store = new SessionStore(p);
+	store.set("a", { conversationId: "conv-a", lastStepIdx: 1, lastMessageCount: 5 });
+	store.set("b", { conversationId: "conv-b", lastStepIdx: 2, lastMessageCount: 7 });
+	store.delete("a");
+	assert.equal(store.get("a"), null);
+	assert.equal(store.get("b")?.conversationId, "conv-b");
+	assert.equal(store.size, 1);
+	// persist() overlays dirty keys on the on-disk state; the deleted key must
+	// not resurrect from it.
+	await vi.waitFor(() => {
+		const disk = JSON.parse(fs.readFileSync(p, "utf8"));
+		assert.ok(!("a" in disk), "deleted key must not persist");
+		assert.equal(disk.b?.conversationId, "conv-b");
+	});
+});
+
+test("SessionStore: set after delete resurrects the key", async () => {
+	const p = tmpStorePath();
+	const store = new SessionStore(p);
+	store.set("k", { conversationId: "c-1", lastStepIdx: 0, lastMessageCount: 3 });
+	store.delete("k");
+	store.set("k", { conversationId: "c-2", lastStepIdx: -1, lastMessageCount: 0 });
+	assert.deepEqual(store.get("k"), { conversationId: "c-2", lastStepIdx: -1, lastMessageCount: 0 });
+	await vi.waitFor(() => {
+		const disk = JSON.parse(fs.readFileSync(p, "utf8"));
+		assert.equal(disk.k?.conversationId, "c-2");
+	});
+});
+
+test("SessionStore: a removed key stops being deleted once its persist lands (multi-process)", async () => {
+	const p = tmpStorePath();
+	const store = new SessionStore(p);
+	store.set("a", { conversationId: "conv-a", lastStepIdx: 0, lastMessageCount: 1 });
+	store.delete("a");
+	await vi.waitFor(() => {
+		const disk = JSON.parse(fs.readFileSync(p, "utf8"));
+		assert.ok(!("a" in disk), "delete must land first");
+	});
+	// Another process reclaims the key (the cwd-fallback key is shared across
+	// pi processes in one directory). Our NEXT unrelated persist must honor
+	// its write, not replay our stale deletion.
+	fs.writeFileSync(
+		p,
+		JSON.stringify({ a: { conversationId: "conv-other-process", lastStepIdx: 3, lastMessageCount: 9 } }) + "\n",
+	);
+	store.set("b", { conversationId: "conv-b", lastStepIdx: 0, lastMessageCount: 2 });
+	await vi.waitFor(() => {
+		const disk = JSON.parse(fs.readFileSync(p, "utf8"));
+		assert.equal(disk.a?.conversationId, "conv-other-process", "unrelated persist must not re-delete a reclaimed key");
+		assert.equal(disk.b?.conversationId, "conv-b");
+	});
 });

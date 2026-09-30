@@ -68,6 +68,7 @@ export class SessionStore {
 	private readonly path: string;
 	private cache: StoreMap = {};
 	private readonly dirty = new Set<string>();
+	private readonly removed = new Set<string>();
 	private writeChain: Promise<void> = Promise.resolve();
 
 	constructor(storePath: string = STORE_PATH) {
@@ -100,11 +101,28 @@ export class SessionStore {
 	set(key: string, session: AgySession): void {
 		this.cache[key] = session;
 		this.dirty.add(key);
+		this.removed.delete(key);
 		// Serialize through a chain so concurrent sets don't interleave renames.
 		this.writeChain = this.writeChain
 			.then(() => this.persist())
 			.catch(() => {
 				/* swallow; next set() retries */
+			});
+	}
+
+	/** Drop one session binding and persist the deletion. Used when the driver
+	 *  recreated the conversation under us: the record's watermark claims
+	 *  history the new conversation never saw, and its bound id keeps the
+	 *  sysPrompt gate closed. Dropping resets the watermark to 0 AND re-arms
+	 *  the gate on the next turn (issue #1). The write is queued. */
+	delete(key: string): void {
+		delete this.cache[key];
+		this.dirty.delete(key);
+		this.removed.add(key);
+		this.writeChain = this.writeChain
+			.then(() => this.persist())
+			.catch(() => {
+				/* swallow; next write retries */
 			});
 	}
 
@@ -126,6 +144,9 @@ export class SessionStore {
 		for (const key of this.dirty) {
 			merged[key] = this.cache[key];
 		}
+		for (const key of this.removed) {
+			delete merged[key];
+		}
 
 		const tmp = `${this.path}.${process.pid}.tmp`;
 		await fs.promises.writeFile(tmp, JSON.stringify(merged, null, 2) + "\n", {
@@ -133,6 +154,10 @@ export class SessionStore {
 		});
 		await fs.promises.rename(tmp, this.path);
 		this.dirty.clear();
+		// Mirror dirty: once the deletion is durable, stop re-asserting it. A
+		// later unrelated persist must not destroy a record another process
+		// wrote for that key after our delete landed.
+		this.removed.clear();
 	}
 
 	/** Wipe all session bindings (forces fresh agy conversations on every
@@ -140,6 +165,7 @@ export class SessionStore {
 	clear(): void {
 		this.cache = {};
 		this.dirty.clear();
+		this.removed.clear();
 		this.writeChain = this.writeChain
 			.then(async () => {
 				const tmp = `${this.path}.${process.pid}.tmp`;

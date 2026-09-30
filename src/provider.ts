@@ -1283,11 +1283,28 @@ async function runTurnDriver(
 
 	const outcome = await handle.outcome;
 	if (outcome.conversationId) {
-		store.set(key, {
-			conversationId: outcome.conversationId,
-			lastStepIdx: -1,
-			lastMessageCount: messageCount,
-		});
+		// A different id than the stored one means the driver recreated the
+		// conversation under us (ACP session-load fallback, stream-json CLI
+		// dropping a stale --conversation). The recreated conversation has seen
+		// NOTHING, so the record's watermark would starve the digest forever and
+		// its bound id would keep the sysPrompt gate closed. Drop the record:
+		// the next turn resumes from watermark 0 with the gate re-armed (issue
+		// #1). The recreation turn itself is past the gate, so it is the
+		// documented residual; recovery starts on the next turn.
+		if (existing?.conversationId && outcome.conversationId !== existing.conversationId) {
+			store.delete(key);
+		} else if (outcome.status === "OK" && !outcome.aborted) {
+			store.set(key, {
+				conversationId: outcome.conversationId,
+				lastStepIdx: -1,
+				lastMessageCount: messageCount,
+			});
+		}
+		// A failed or aborted turn on the SAME conversation keeps the pre-turn
+		// record: whether the prompt actually landed in agy's DB is not
+		// observable from here. Keeping the watermark re-delivers the missed
+		// turn in the next digest (bounded by the digest cap); advancing it
+		// would starve the conversation of context it may never have received.
 	}
 	if (outcome.aborted) {
 		finalize(stream, blocks, "aborted", "Operation aborted");
