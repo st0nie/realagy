@@ -31,7 +31,7 @@ Picking **acp** starts the server download immediately (progress in the status b
 | Inline file edit diffs | Sourced from git working tree in thinking block | Sourced from `tool_call content[]` or disk vs git HEAD |
 | Permission handling | `--dangerously-skip-permissions` (unattended CLI requirement) | Protocol-native `session/request_permission` (auto-approve when `skipPermissions` is on; auto-deny when off) |
 | Context digest delivery (G1) | Prepend plain text inline in prompt | Native `embeddedContext` resource block |
-| System prompt delivery (G10) | Prepend to first prompt of conversation | Prepend to first prompt of conversation |
+| System prompt delivery (G10) | Staged agy agent file via `--agent` (content-addressed dir under the agents root, write-once; the prompt line carries only the user text) | Prepend to first prompt of conversation |
 | Authentication methods | Inherits existing `agy` CLI OAuth state | 4 methods: `oauth-personal`, `oauth-business`, `gemini-api-key`, `agent-platform` |
 | Wire protocol | Undocumented CLI NDJSON stream format | Versioned JSON-RPC 2.0 over stdio (`protocolVersion: 1`) |
 | Diagnostics (`/agy doctor`) | Child PID, state, process spawns, recycles, queue stats | Server version, agentInfo, session counts, reconnect count, cancel support |
@@ -39,7 +39,7 @@ Picking **acp** starts the server download immediately (progress in the status b
 
 ## Engine-dependent features
 
-pi image attachments ride natively only on the ACP engine (the picker offers image attach automatically when `config.engine` is `acp`; the stream-json CLI prompt is text-only). With the optional G1 digest enabled, its delivery also differs: ACP ships it as a native `embeddedContext` resource block, stream-json prepends it to the prompt text. The `AskAntigravity` delegation tool is unaffected by `config.engine` and runs the `stream-json` CLI (`agy -p`) across both configurations.
+pi image attachments ride natively only on the ACP engine (the picker offers image attach automatically when `config.engine` is `acp`; the stream-json CLI prompt is text-only). With the optional G1 digest enabled, its delivery also differs: ACP ships it as a native `embeddedContext` resource block, stream-json prepends it to the prompt text. The G10 system prompt likewise splits: stream-json stages it as an agent file passed via `--agent` because the CLI silently drops any single prompt past a ~25KB input cap (a dropped turn answers empty and the conversation never responds again), while ACP prepends it to the first prompt of the conversation. The `AskAntigravity` delegation tool is unaffected by `config.engine` and runs the `stream-json` CLI (`agy -p`) across both configurations.
 
 ## Switching and setup
 
