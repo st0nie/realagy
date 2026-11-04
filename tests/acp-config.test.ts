@@ -22,6 +22,7 @@ test("engine defaults to acp (stream-json is the fallback)", () => {
 		const c = loadConfig(p);
 		assert.equal(c.engine, "acp");
 		assert.equal(c.acp.bin, "");
+		assert.deepEqual(c.acp.disabledTools, ["run_workflow"]);
 	} finally {
 		rm(p);
 	}
@@ -140,7 +141,7 @@ test("AGY_ACP_BIN env overrides acp.bin", () => {
 test("acp.bin persists through saveConfig", () => {
 	const p = tmpConfig();
 	try {
-		saveConfig({ acp: { bin: "~/.local/opt/agy-acp/current/agy_acp_server.par", usageEstimate: "estimate" } }, p);
+		saveConfig({ acp: { bin: "~/.local/opt/agy-acp/current/agy_acp_server.par", usageEstimate: "estimate", disabledTools: ["run_workflow"] } }, p);
 		assert.equal(loadConfig(p).acp.bin, "~/.local/opt/agy-acp/current/agy_acp_server.par");
 		saveConfig({ digest: true }, p);
 		assert.equal(loadConfig(p).acp.bin, "~/.local/opt/agy-acp/current/agy_acp_server.par");
@@ -150,11 +151,29 @@ test("acp.bin persists through saveConfig", () => {
 	}
 });
 
+test("acp.disabledTools filters malformed entries and round-trips", () => {
+	const p = tmpConfig();
+	try {
+		fs.writeFileSync(p, JSON.stringify({ acp: { disabledTools: ["run_workflow", 42, null] } }));
+		assert.deepEqual(loadConfig(p).acp.disabledTools, ["run_workflow"]);
+
+		saveConfig({ acp: { ...loadConfig(p).acp, disabledTools: ["run_workflow", "generate_image"] } }, p);
+		assert.deepEqual(loadConfig(p).acp.disabledTools, ["run_workflow", "generate_image"]);
+		saveConfig({ digest: true }, p);
+		assert.deepEqual(loadConfig(p).acp.disabledTools, ["run_workflow", "generate_image"], "unrelated saves preserve the filter");
+
+		saveConfig({ acp: { ...loadConfig(p).acp, disabledTools: [] } }, p);
+		assert.deepEqual(loadConfig(p).acp.disabledTools, [], "an explicit empty list disables no tools");
+	} finally {
+		rm(p);
+	}
+});
+
 test("usageEstimate defaults to estimate; unknown values fall back", () => {
 	const p = tmpConfig();
 	try {
 		assert.equal(loadConfig(p).acp.usageEstimate, "estimate");
-		saveConfig({ acp: { bin: "", usageEstimate: "direct" } }, p);
+		saveConfig({ acp: { bin: "", usageEstimate: "direct", disabledTools: ["run_workflow"] } }, p);
 		assert.equal(loadConfig(p).acp.usageEstimate, "direct");
 		const raw = JSON.parse(fs.readFileSync(p, "utf8")) as Record<string, unknown>;
 		const acpRaw = raw.acp as Record<string, unknown>;

@@ -7,8 +7,20 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test, describe } from "vitest";
-import { AcpConnection, setAuthInvalidatedHook, translateError } from "../src/acp/connection.js";
+import { AcpConnection, acpServerArgs, setAuthInvalidatedHook, translateError } from "../src/acp/connection.js";
 import { JsonRpcResponseError } from "../src/acp/jsonrpc.js";
+
+describe("acpServerArgs", () => {
+	test("keeps root credentials readable by disabling the default nobody demotion", () => {
+		assert.deepEqual(acpServerArgs(undefined, 0, "linux"), ["--uid="]);
+	});
+
+	test("does not alter non-root, Windows, or custom test/wrapper arguments", () => {
+		assert.deepEqual(acpServerArgs(undefined, 1000, "linux"), []);
+		assert.deepEqual(acpServerArgs(undefined, 0, "win32"), []);
+		assert.deepEqual(acpServerArgs(["fake-server.mjs"], 0, "linux"), ["fake-server.mjs"]);
+	});
+});
 
 test("acp connection: stderr tail and exit info are redacted", async () => {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-conn-"));

@@ -7,7 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, test } from "vitest";
-import { findOnPath, parseAuthPort, readLastUrl, setupAuthUrlCapture } from "../src/acp/browser-capture.js";
+import { findOnPath, isWsl, parseAuthPort, readLastUrl, setupAuthUrlCapture } from "../src/acp/browser-capture.js";
 
 function tmpDir(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "agy-acp-capture-"));
@@ -70,7 +70,7 @@ describe("acp/browser-capture setupAuthUrlCapture", () => {
 		assert.match(body, /^#!\/usr\/bin\/env sh$/m);
 		// Appends every argument (the URL) to the record file...
 		assert.ok(body.includes(`>> '${cap.file}'`), "must append to the record file");
-		// ...and with no opener found, exits without one (headless no-op).
+		// ...and only invokes an opener when one was resolved.
 		assert.ok(body.includes('if [ -n "$REAL" ]'), "must branch on the opener");
 		// The record file starts empty (mirrors the current login attempt).
 		assert.equal(fs.readFileSync(cap.file, "utf8"), "");
@@ -87,7 +87,28 @@ describe("acp/browser-capture setupAuthUrlCapture", () => {
 		const body = fs.readFileSync(cap.browserEnv.BROWSER, "utf8");
 		assert.ok(body.includes(`REAL='${mine}'`));
 		// Flag forms of BROWSER forward with word splitting (set -f: no globs).
-		assert.ok(body.includes("set -f; exec $REAL \"$@\""));
+		assert.ok(body.includes('*) exec $REAL "$@" ;;'));
+	});
+
+	test("uses the Windows browser on WSL when no Unix opener exists", () => {
+		const cap = setupAuthUrlCapture(tmpDir(), { PATH: "/nonexistent-dir", WSL_DISTRO_NAME: "Ubuntu" });
+		assert.ok(cap);
+		assert.equal(isWsl({ WSL_DISTRO_NAME: "Ubuntu" }), true);
+		const body = fs.readFileSync(cap.browserEnv.BROWSER, "utf8");
+		assert.ok(body.includes("REAL='/mnt/c/Windows/System32/cmd.exe'"));
+		assert.ok(body.includes('*cmd.exe|*cmd) exec $REAL /c start "" "$@" ;;'));
+	});
+
+	test("prefers wslview over cmd.exe on WSL when available", () => {
+		const dir = tmpDir();
+		const wslview = path.join(dir, "wslview");
+		fs.writeFileSync(wslview, "#!/bin/sh\n");
+		fs.chmodSync(wslview, 0o755);
+		const cap = setupAuthUrlCapture(dir, { PATH: dir, WSL_DISTRO_NAME: "Ubuntu" });
+		assert.ok(cap);
+		const body = fs.readFileSync(cap.browserEnv.BROWSER, "utf8");
+		assert.ok(body.includes(`REAL='${wslview}'`));
+		assert.ok(body.includes('*) exec $REAL "$@" ;;'));
 	});
 
 	test("lastUrl sees URLs appended after setup", () => {

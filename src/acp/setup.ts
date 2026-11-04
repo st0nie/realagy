@@ -155,6 +155,7 @@ async function downloadTo(
 	let done = 0;
 	let lastPct = -1;
 	for await (const chunk of res.body) {
+		// SAFETY: Node's fetch ReadableStream async iterator yields Uint8Array chunks.
 		const buf = Buffer.from(chunk as unknown as Uint8Array);
 		hash.update(buf);
 		done += buf.length;

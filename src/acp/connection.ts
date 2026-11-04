@@ -101,6 +101,20 @@ export interface AcpConnectionOptions {
 const INIT_TIMEOUT_MS = 30_000;
 const SESSION_OP_TIMEOUT_MS = 20_000;
 
+/** Arguments for the real ACP server. Google's Abseil launcher defaults to
+ *  `--uid=nobody` when started by root, which makes ~/.gemini credentials
+ *  unreadable. An explicit empty --uid keeps the current user. Custom binArgs
+ *  are test/wrapper inputs and are left untouched. */
+export function acpServerArgs(
+	binArgs?: string[],
+	uid: number | undefined = typeof process.getuid === "function" ? process.getuid() : undefined,
+	platform: NodeJS.Platform = process.platform,
+): string[] {
+	const args = [...(binArgs ?? [])];
+	if (binArgs === undefined && platform !== "win32" && uid === 0) args.push("--uid=");
+	return args;
+}
+
 /** Human-decision budget for one parked permission request. Mirrors the
  *  approval-gate park budget (APPROVAL_PARK_TIMEOUT_MS): the dialog must
  *  deny by itself, never hold the agy prompt open forever. */
@@ -193,7 +207,7 @@ export class AcpConnection {
 	 *  instance: call once. */
 	async start(): Promise<void> {
 		if (this.#child) return;
-		const args = [...(this.#opts.binArgs ?? [])];
+		const args = acpServerArgs(this.#opts.binArgs);
 		const child = spawn(this.#opts.bin, args, {
 			cwd: this.#opts.cwd,
 			stdio: ["pipe", "pipe", "pipe"],
@@ -279,7 +293,7 @@ export class AcpConnection {
 	async newSession(cwd: string): Promise<AcpSessionInfo> {
 		const result = (await this.guarded(
 			"session/new",
-			{ cwd, mcpServers: this.#mcpServers() },
+			{ cwd, mcpServers: this.#mcpServers(), ...this.#antigravityMeta() },
 			SESSION_OP_TIMEOUT_MS,
 		)) as Record<string, unknown>;
 		const sessionId = result.sessionId;
@@ -299,7 +313,7 @@ export class AcpConnection {
 			// suppression flag drops it (never live text).
 			const result = (await this.request(
 				"session/load",
-				{ sessionId, cwd, mcpServers: this.#mcpServers() },
+				{ sessionId, cwd, mcpServers: this.#mcpServers(), ...this.#antigravityMeta() },
 				SESSION_OP_TIMEOUT_MS,
 			)) as Record<string, unknown> | undefined;
 			this.lastConfigOptions = result?.configOptions;

@@ -37,6 +37,7 @@ async function runDriver(
 		timeoutMin?: number;
 		skipPermissions?: boolean;
 		usageEstimate?: "estimate" | "direct" | "off";
+		disabledTools?: string[];
 		onPermissionRequest?: AcpPermissionHandler;
 		permissionParkMs?: number;
 		signal?: AbortSignal;
@@ -53,6 +54,7 @@ async function runDriver(
 		binArgs: [FAKE_SERVER],
 		extraEnv: { ACP_FAKE_SCENARIO: scenario, ACP_FAKE_LOG: logPath },
 		usageEstimate: opts.usageEstimate,
+		disabledTools: () => opts.disabledTools ?? [],
 		onPermissionRequest: opts.onPermissionRequest,
 		permissionParkMs: opts.permissionParkMs,
 		log: () => {},
@@ -146,22 +148,24 @@ describe("acp/driver happy path", () => {
 		assert.deepEqual(prompt.params.prompt, [{ type: "text", text: "hi" }]);
 	});
 
-	test("registers the bridge on session/new and session/load", async () => {
-		// Load flow: session/load carries mcpServers; session/new is NOT called
-		// when the load succeeds.
-		const load = await tracked("load-replay", { conversationId: SESSION_ID, prompt: "live" });
+	test("registers the bridge and disabled tools on session/new and session/load", async () => {
+		// Load flow: session/load carries mcpServers and the Antigravity tool
+		// filter; session/new is NOT called when the load succeeds.
+		const load = await tracked("load-replay", { conversationId: SESSION_ID, prompt: "live", disabledTools: ["run_workflow"] });
 		await load.handle.outcome;
 		const loadReqs = sentRequests(load._logPath);
-		const loaded = loadReqs.find((r) => r.method === "session/load") as { params: { mcpServers: unknown[] } };
+		const loaded = loadReqs.find((r) => r.method === "session/load") as { params: { mcpServers: unknown[]; _meta: unknown } };
 		assert.ok(Array.isArray(loaded.params.mcpServers));
+		assert.deepEqual(loaded.params._meta, { antigravity: { disabledTools: ["run_workflow"] } });
 		assert.equal(loadReqs.find((r) => r.method === "session/new"), undefined);
 
-		// Fresh flow: session/new carries mcpServers.
-		const fresh = await tracked("happy", { prompt: "hi" });
+		// Fresh flow: session/new carries the same registration and filter.
+		const fresh = await tracked("happy", { prompt: "hi", disabledTools: ["run_workflow"] });
 		await fresh.handle.outcome;
 		const newReqs = sentRequests(fresh._logPath);
-		const created = newReqs.find((r) => r.method === "session/new") as { params: { mcpServers: unknown[] } };
+		const created = newReqs.find((r) => r.method === "session/new") as { params: { mcpServers: unknown[]; _meta: unknown } };
 		assert.ok(Array.isArray(created.params.mcpServers));
+		assert.deepEqual(created.params._meta, { antigravity: { disabledTools: ["run_workflow"] } });
 	});
 });
 
