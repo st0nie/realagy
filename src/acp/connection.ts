@@ -358,13 +358,8 @@ export class AcpConnection {
 		images: Array<{ data: string; mimeType: string }> = [],
 		contextBlock?: { uri: string; text: string },
 	): Promise<{ stopReason: string; usage?: AgyUsage }> {
-		// Block order: images, then the embedded-context resource (pi-side
-		// digest), then the text question last (it refers to everything before
-		// it). Shapes per the ACP v1 content-block schema; embeddedContext is
-		// advertised in promptCapabilities (verified run 5).
-		const blocks: Array<Record<string, unknown>> = [
-			...images.map((i) => ({ type: "image", data: i.data, mimeType: i.mimeType })),
-		];
+		// Put the stable transcript first; image blocks retain transcript order.
+		const blocks: Array<Record<string, unknown>> = [];
 		if (contextBlock) {
 			blocks.push({
 				type: "resource",
@@ -375,6 +370,7 @@ export class AcpConnection {
 				},
 			});
 		}
+		blocks.push(...images.map((i) => ({ type: "image", data: i.data, mimeType: i.mimeType })));
 		blocks.push({ type: "text", text });
 		const result = (await this.request("session/prompt", {
 			sessionId,

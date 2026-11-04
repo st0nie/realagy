@@ -34,6 +34,7 @@ test("ACP initialize enables third-party models and session metadata disables na
 		const session = await connection.newSession(process.cwd());
 		assert.ok(session.availableModels.some((model) => model.modelId.startsWith("claude-")));
 		assert.ok(session.availableModels.some((model) => model.modelId.startsWith("gpt-oss-")));
+		await connection.prompt(session.sessionId, "continue", [{ data: "aW1hZ2U=", mimeType: "image/png" }], { uri: "pi://transcript", text: "history" });
 		const wire = requests(capture);
 		const init = wire.find((request) => request.method === "initialize")!;
 		assert.equal((init.params.clientInfo as { name: string }).name, "zed");
@@ -42,6 +43,12 @@ test("ACP initialize enables third-party models and session metadata disables na
 		assert.deepEqual(meta.enabledTools, []);
 		assert.deepEqual(meta.eagerMcpServers, ["pi-bridge"]);
 		assert.equal((created.params.mcpServers as Array<{ name: string }>)[0].name, "pi-bridge");
+		const prompt = wire.find((request) => request.method === "session/prompt")!;
+		assert.deepEqual(prompt.params.prompt, [
+			{ type: "resource", resource: { uri: "pi://transcript", mimeType: "text/markdown", text: "history" } },
+			{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
+			{ type: "text", text: "continue" },
+		]);
 	} finally {
 		connection.kill();
 	}

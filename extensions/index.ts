@@ -21,6 +21,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	let bin = resolveAcpBinary("");
 	let bridge: McpServerHandle | null = null;
 	let ui: ExtensionUIContext | null = null;
+	let stopped = false;
 
 	const driver = new AcpDriver({
 		bin: () => bin,
@@ -99,8 +100,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const refreshCatalog = async (ctx: { hasUI: boolean; ui: ExtensionUIContext }): Promise<void> => {
 		ui = ctx.hasUI ? ctx.ui : null;
 		const status = await ensureAcpReady({
-			onProgress: (message) => { if (ctx.hasUI) ctx.ui.setStatus("antigravity-setup", message); },
+			onProgress: (message) => { if (!stopped && ctx.hasUI) ctx.ui.setStatus("antigravity-setup", message); },
 		});
+		if (stopped) return;
 		if (ctx.hasUI) ctx.ui.setStatus("antigravity-setup", undefined);
 		if (!status.ok) {
 			ctx.ui.notify(`Antigravity ACP setup failed: ${status.error}\n${status.manual}`, "warning");
@@ -113,21 +115,26 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		}
 		try {
 			const discovered = entriesFromAcpModels(await driver.listModels(process.cwd()));
+			if (stopped) return;
 			if (discovered.length > 0) {
 				entries.splice(0, entries.length, ...discovered);
 				registerModels();
 			}
 		} catch (error) {
+			if (stopped) return;
 			ctx.ui.notify(`Antigravity model discovery failed: ${error instanceof Error ? error.message : String(error)}. Run /realagy auth if sign-in is required.`, "warning");
 		}
 	};
 
 	pi.on("session_start", (_event, ctx) => {
 		ui = ctx.hasUI ? ctx.ui : null;
-		refresh ??= refreshCatalog(ctx).finally(() => { refresh = null; });
-		void refresh;
+		refresh ??= refreshCatalog(ctx).catch((error: unknown) => {
+			if (!stopped && ctx.hasUI) ctx.ui.notify(`Antigravity setup failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+		}).finally(() => { refresh = null; });
 	});
 	pi.on("session_shutdown", () => {
+		stopped = true;
+		ui = null;
 		roundTrips.failAll("pi session shut down");
 		void driver.close("shutdown");
 		if (bridge) void bridge.close();
@@ -148,16 +155,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				log: (message, data) => {
 					if (message === "auth-url" && data && typeof data === "object") {
 						const url = (data as { url?: unknown }).url;
-						if (typeof url === "string") ctx.ui.notify(`Complete the Google sign-in:\n${url}`, "info");
+						if (!stopped && typeof url === "string") ctx.ui.notify(`Complete the Google sign-in:\n${url}`, "info");
 					}
 				},
 			});
+			if (stopped) return;
 			if (!result.ok) {
 				ctx.ui.notify(`Antigravity sign-in failed: ${result.error}`, "warning");
 				return;
 			}
 			ctx.ui.notify(result.note ? `Signed in (${result.note}).` : "Signed in to Antigravity.", "info");
 			await driver.close("recycle", "authentication refreshed");
+			if (stopped) return;
 			await refreshCatalog(ctx);
 		},
 	});

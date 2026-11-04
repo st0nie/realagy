@@ -75,6 +75,24 @@ async function collect(stream: ReturnType<typeof createAssistantMessageEventStre
 	return events;
 }
 
+test("fresh turns preserve transcript prefix, avoid duplicate prompts, and carry historical images", async () => {
+	const driver = new FakeDriver();
+	const entry = FALLBACK_MODELS[0];
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
+	const image = { type: "image" as const, data: "aW1hZ2U=", mimeType: "image/png" };
+	const first: Message = { role: "user", content: [{ type: "text", text: "look at this" }, image], timestamp: 1 };
+	const result: Message = { role: "toolResult", toolCallId: "call", toolName: "read", content: [{ type: "text", text: "image file" }, image], isError: false, timestamp: 2 };
+	await collect(stream(toPiModel(entry), context([system(), first])));
+	await collect(stream(toPiModel(entry), context([system(), first, result, user("what is in it?")])));
+	const [a, b] = driver.requests;
+	assert.equal(a.prompt, b.prompt);
+	assert.ok(!a.prompt.includes("look at this"));
+	assert.ok(b.contextBlock!.text.startsWith(a.contextBlock!.text));
+	assert.equal((b.contextBlock!.text.match(/what is in it\?/g) ?? []).length, 1);
+	assert.match(b.contextBlock!.text, /\[Attached image 1\]/);
+	assert.match(b.contextBlock!.text, /\[Attached image 2\]/);
+	assert.deepEqual(b.images, [{ data: image.data, mimeType: image.mimeType }, { data: image.data, mimeType: image.mimeType }]);
+});
 test("provider streams native thinking/text and maps GPT to its medium ACP slug", async () => {
 	const driver = new FakeDriver();
 	driver.script = [{ type: "thought", delta: "reasoning" }, { type: "text", delta: "OK" }];

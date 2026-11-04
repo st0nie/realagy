@@ -175,15 +175,28 @@ function resultImages(message: Message): Array<{ data: string; mimeType: string 
 
 /** A fresh user turn starts a fresh ACP session, making pi's transcript the
  * single source of truth across compaction, retries, and provider switches. */
-function transcriptForAcp(context: TranscriptContext): string {
+function transcriptForAcp(context: TranscriptContext): { text: string; images: Array<{ data: string; mimeType: string }> } {
 	const parts: string[] = [];
+	const images: Array<{ data: string; mimeType: string }> = [];
 	const system = getCurrentSystemPrompt(context.messages);
 	if (system) parts.push(`<pi-system>\n${system}\n</pi-system>`);
 	for (const message of context.messages) {
 		if (message.role === "system") continue;
-		if (message.role === "user") {
+		if (message.role === "user" || message.role === "toolResult") {
 			const text = contentText(message.content);
-			if (text) parts.push(`<user>\n${text}\n</user>`);
+			const blocks = Array.isArray(message.content) ? message.content : [];
+			const references: string[] = [];
+			for (const block of blocks) {
+				if (block.type !== "image") continue;
+				images.push({ data: block.data, mimeType: block.mimeType });
+				references.push(`[Attached image ${images.length}]`);
+			}
+			const content = [text, ...references].filter(Boolean).join("\n");
+			if (message.role === "user") {
+				if (content) parts.push(`<user>\n${content}\n</user>`);
+			} else {
+				parts.push(`<pi-tool-result name=${JSON.stringify(message.toolName)} id=${JSON.stringify(message.toolCallId)} error=${message.isError}>\n${content}\n</pi-tool-result>`);
+			}
 			continue;
 		}
 		if (message.role === "assistant") {
@@ -191,20 +204,9 @@ function transcriptForAcp(context: TranscriptContext): string {
 				if (block.type === "text" && block.text) parts.push(`<assistant>\n${block.text}\n</assistant>`);
 				if (block.type === "toolCall") parts.push(`<assistant-tool-call name=${JSON.stringify(block.name)} id=${JSON.stringify(block.id)}>\n${JSON.stringify(block.arguments)}\n</assistant-tool-call>`);
 			}
-			continue;
-		}
-		if (message.role === "toolResult") {
-			parts.push(`<pi-tool-result name=${JSON.stringify(message.toolName)} id=${JSON.stringify(message.toolCallId)} error=${message.isError}>\n${contentText(message.content)}\n</pi-tool-result>`);
 		}
 	}
-	return parts.join("\n\n");
-}
-
-function latestUser(context: TranscriptContext): { text: string; images: Array<{ data: string; mimeType: string }> } | null {
-	const last = context.messages[context.messages.length - 1];
-	if (!last || last.role !== "user") return null;
-	const images = Array.isArray(last.content) ? last.content.flatMap((block) => block.type === "image" ? [{ data: block.data, mimeType: block.mimeType }] : []) : [];
-	return { text: contentText(last.content), images };
+	return { text: parts.join("\n\n"), images };
 }
 
 function applyUsage(target: Usage, usage: AgyUsage): void {
@@ -341,7 +343,7 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 
 				const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 				const entry = deps.entries.find((candidate) => candidate.id === model.id);
-				const user = latestUser(context);
+				const transcript = transcriptForAcp(context);
 				const request: DriverTurnRequest = {
 					cwd,
 					model: entry?.full ?? model.id,
@@ -351,9 +353,9 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					// executed by pi, where pi's normal permission policy applies.
 					skipPermissions: true,
 					conversationId: null,
-					prompt: user?.text || "Continue the task from the pi transcript, including any tool results or discarded previous attempt.",
-					images: user?.images ?? [],
-					contextBlock: { uri: "pi://transcript", text: transcriptForAcp(context) },
+					prompt: "Continue the task from the pi transcript, including any tool results or discarded previous attempt. Attached images are numbered in transcript order.",
+					images: transcript.images,
+					contextBlock: { uri: "pi://transcript", text: transcript.text },
 					signal: options?.signal,
 					timeoutMin: 0,
 					inactivityMin: 5,
