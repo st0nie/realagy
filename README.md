@@ -16,7 +16,7 @@ There is no settings panel, engine switch, stream-json fallback, delegation tool
 ## Install and sign in
 
 ```sh
-pi install git:github.com/st0nie/pi-antigravity-bridge
+pi install git:github.com/st0nie/realagy
 /realagy auth
 ```
 
