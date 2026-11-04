@@ -81,10 +81,10 @@ Full mechanics, configuration, and a sample gate extension: [docs/APPROVAL-GATE.
 
 > The bridge runs on pi's public APIs; the extension never edits your pi install.
 
-Install with pi's package manager:
+Install this standalone fork with pi's package manager. It includes the ACP `run_workflow` workspace-pollution fix, root launch compatibility, and WSL browser sign-in support:
 
 ```bash
-pi install npm:@estebanforge/pi-antigravity-bridge
+pi install git:github.com/st0nie/pi-antigravity-bridge
 ```
 
 Requires the **`agy` CLI** installed and authenticated. If you don't have it, follow Google's [official install guide](https://antigravity.google/docs/cli/install) for your platform, then run `agy` once to complete Google OAuth. The extension resolves `agy` on `$PATH`, or via the `AGY_BIN` environment variable. While the stream-json engine is active and the binary cannot be found, pi warns on every start (toast in the TUI, stderr headless) pointing at the install guide; the warning stops once the binary is detected.
@@ -214,6 +214,12 @@ When you report an issue, attach the last day or two of files from that director
 
 ## Development
 
+```bash
+bun install
+bun run check
+```
+
+For a reproducible local run that cannot inherit your live `~/.pi/agent/antigravity-bridge/config.json`, run the checks with a temporary `HOME`.
 Build, test, and debug instructions live in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md). For the internal architecture (engines, bridge round-trips, conversation discovery) see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Terms of Service notice
