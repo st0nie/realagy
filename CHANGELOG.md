@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Use ACP context occupancy for pi's existing context API instead of cumulative internal-call usage; keep the original cumulative total as `agyCumulativeTotalTokens` and avoid counting cached input twice.
+- Enable only native `view_file` and stage pi-returned image bytes in agy's allowed directory. Clipboard and other image tool results can now be viewed without restarting the ACP session or replaying history.
+- Deduplicate staged image files and remove them on normal session shutdown.
+- Add stock-pi compatibility tests and opt-in Sonnet context/image bridge probes. No pi core modifications required.
+
 ## 2.0.0 — realagy minimal rewrite
 
 - Renamed the package and command to `realagy` / `/realagy auth`; provider model ids remain `antigravity/*`.

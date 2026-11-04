@@ -36,6 +36,9 @@ rl.on("line", async (line) => {
 		return;
 	}
 	if (method === "session/prompt") {
+		send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update: { sessionUpdate: "usage_update", used: 321, size: 1000 } } });
+		send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update: { sessionUpdate: "usage_update", used: -1, size: 0 } } });
+		send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "other-session", update: { sessionUpdate: "usage_update", used: 999, size: 1000 } } });
 		send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "think" } } } });
 		send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "OK" } } } });
 		result(id, { stopReason: "end_turn" });

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createAssistantMessageEventStream, type AssistantMessageEvent, type Message, type TranscriptContext } from "@earendil-works/pi-ai";
+import { calculateContextTokens, AgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { test, vi } from "vitest";
 import { createStreamSimple, POLL_TOOL_NAME, ToolRoundTrips } from "../src/provider.js";
 import type { DriverActivity, DriverSnapshot, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../src/driver-types.js";
@@ -110,6 +111,33 @@ test("provider streams native thinking/text and maps GPT to its medium ACP slug"
 	assert.equal(driver.requests[0].conversationId, null);
 });
 
+test("provider preserves context occupancy separately from cumulative usage", async () => {
+	const driver = new FakeDriver();
+	driver.script = [
+		{ type: "context_usage", contextUsage: { used: 54357, size: 1000000 } },
+		{ type: "usage", usage: { input_tokens: 693513, output_tokens: 3731, total_tokens: 697244, cache_read_tokens: 633966 } },
+		{ type: "text", delta: "OK" },
+	];
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
+	const done = (await collect(stream(toPiModel(FALLBACK_MODELS[0]), context([system(), user("Reply")])))).find((event) => event.type === "done");
+	assert.equal(done?.type, "done");
+	if (done?.type !== "done") throw new Error("No done event");
+	assert.equal(done.message.usage.totalTokens, 54357);
+	assert.equal(calculateContextTokens(done.message.usage), 54357);
+	assert.equal(done.message.usage.input, 59547);
+	assert.equal(done.message.usage.input + done.message.usage.output + done.message.usage.cacheRead, 697244);
+	assert.equal((done.message.usage as typeof done.message.usage & { agyCumulativeTotalTokens?: number }).agyCumulativeTotalTokens, 697244);
+	const sessionManager = SessionManager.inMemory();
+	sessionManager.appendMessage(user("Reply"));
+	sessionManager.appendMessage(done.message);
+	// Exercise stock pi's plugin-facing getter with only its two state dependencies.
+	const receiver = { sessionManager, _limitsModel: () => ({ contextWindow: 1000000 }) };
+	// SAFETY: getContextUsage only accesses sessionManager and _limitsModel.
+	const usage = AgentSession.prototype.getContextUsage.call(receiver as unknown as AgentSession);
+	assert.equal(usage?.tokens, 54357);
+	assert.equal(usage?.percent, 54357 / 1000000 * 100);
+});
+
 test("MCP call becomes a genuine pi toolUse and its toolResult resumes ACP", async () => {
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
@@ -129,6 +157,8 @@ test("MCP call becomes a genuine pi toolUse and its toolResult resumes ACP", asy
 	assert.deepEqual(toolCall?.type === "toolcall_end" && toolCall.toolCall.arguments, { command: "printf ok" });
 
 	const handle = driver.activeHandle as FakeHandle;
+	handle.pushExternal({ type: "context_usage", contextUsage: { used: 54357, size: 1000000 } });
+	handle.pushExternal({ type: "usage", usage: { input_tokens: 693513, output_tokens: 3731, total_tokens: 697244 } });
 	handle.pushExternal({ type: "text", delta: "finished" });
 	handle.complete();
 	const toolResult: Message = { role: "toolResult", toolCallId: "call-1", toolName: "bash", content: [{ type: "text", text: "ok" }], isError: false, timestamp: Date.now() };
@@ -137,6 +167,9 @@ test("MCP call becomes a genuine pi toolUse and its toolResult resumes ACP", asy
 	const secondEvents = await second;
 	assert.ok(secondEvents.some((event) => event.type === "text_delta" && event.delta === "finished"));
 	assert.equal(secondEvents.at(-1)?.type, "done");
+	const finalDone = secondEvents.find((event) => event.type === "done");
+	assert.equal(finalDone?.type === "done" && finalDone.message.usage.totalTokens, 54357);
+	assert.equal(finalDone?.type === "done" && (finalDone.message.usage as typeof finalDone.message.usage & { agyCumulativeTotalTokens?: number }).agyCumulativeTotalTokens, 697244);
 });
 
 test("slow tools early-ack and return the real result through the poll tool", async () => {
@@ -156,4 +189,30 @@ test("slow tools early-ack and return the real result through the poll tool", as
 	} finally {
 		vi.useRealTimers();
 	}
+});
+
+
+test("image tool results resume the existing ACP handle instead of replaying history", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const close = vi.spyOn(driver, "close");
+	const roundTrips = new ToolRoundTrips(driver);
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips });
+	try {
+		const first = collect(stream(model, context([system(), user("Read the image")])));
+		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+		const parked = roundTrips.onToolCall("image-call", "read", { path: "/tmp/arbitrary.png" }, new AbortController().signal);
+		await first;
+		const handle = driver.activeHandle as FakeHandle;
+		handle.pushExternal({ type: "text", delta: "seen" });
+		handle.complete();
+		const result: Message = { role: "toolResult", toolCallId: "image-call", toolName: "read", content: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }], isError: false, timestamp: 2 };
+		await collect(stream(model, context([system(), user("Read the image"), result])));
+		const reply = await parked;
+		assert.equal(reply.content[0].type, "text");
+		assert.match(reply.content[0].type === "text" ? reply.content[0].text : "", /native view_file/);
+		assert.equal(driver.requests.length, 1);
+		assert.equal(close.mock.calls.length, 0);
+	} finally { roundTrips.clearImages(); }
 });

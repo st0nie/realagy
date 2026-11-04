@@ -93,6 +93,7 @@ interface ActiveTurn {
 	thoughtDeltas: number;
 	/** Estimated once, not re-tokenized for every streaming delta. */
 	estimatedInputTokens: number;
+	contextUsage?: { used: number; size: number };
 	sawResult: boolean;
 	/** True once the prompt RPC was issued. Abort before this point has
 	 *  nothing to cancel: probing would risk a success-as-noop answer from a
@@ -424,6 +425,15 @@ export class AcpDriver implements TurnDriver {
 		if (!turn || turn.closed) return;
 		if (sessionId !== null && sessionId !== turn.sessionId) return;
 		if (turn.idleTimer) turn.idleTimer.refresh();
+		if (typeof update === "object" && update !== null && !Array.isArray(update)) {
+			const frame = update as Record<string, unknown>;
+			if (frame.sessionUpdate === "usage_update" && Number.isSafeInteger(frame.used) && Number.isSafeInteger(frame.size)
+				&& (frame.used as number) >= 0 && (frame.size as number) > 0) {
+				const contextUsage = { used: frame.used as number, size: frame.size as number };
+				turn.contextUsage = contextUsage;
+				this.#emit(turn, { type: "context_usage", contextUsage });
+			}
+		}
 		const mapped = mapUpdate(update);
 		if (!mapped) return;
 		switch (mapped.kind) {
@@ -754,6 +764,7 @@ export class AcpDriver implements TurnDriver {
 			this.#emit(turn, { type: "text", delta: flushed });
 		}
 		outcome.response = turn.response.text;
+		if (turn.contextUsage) outcome.contextUsage = turn.contextUsage;
 		// Gate B stopgap: synthesize usage on clean turns while the server sends
 		// none. Runs BEFORE close so the usage activity drains through the
 		// normal #nextActivity loop (provider maps it onto partial.usage).

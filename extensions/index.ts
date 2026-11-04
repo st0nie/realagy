@@ -1,6 +1,6 @@
 // Minimal realagy provider: official ACP transport, pi-native tools.
 // There is intentionally no config panel, stream-json engine, delegation tool,
-// global MCP registration, or Antigravity-native tool surface.
+// or global MCP registration. Only the native image/file viewer is enabled.
 
 import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { AcpDriver } from "../src/acp/driver.js";
@@ -25,7 +25,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	const driver = new AcpDriver({
 		bin: () => bin,
-		enabledTools: () => [], // official ACP: disable ALL Antigravity builtins
+		enabledTools: () => ["view_file"], // native viewer delivers pixels that MCP offloads
 		mcpServers: () => bridge ? [{
 			name: "pi-bridge",
 			type: "http",
@@ -136,6 +136,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		stopped = true;
 		ui = null;
 		roundTrips.failAll("pi session shut down");
+		roundTrips.clearImages();
 		void driver.close("shutdown");
 		if (bridge) void bridge.close();
 		bridge = null;

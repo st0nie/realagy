@@ -17,6 +17,7 @@ import {
 import type { AgyUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle } from "./driver-types.js";
 import { toAgyEffort, type AgyModelEntry } from "./models.js";
 import type { BridgeResult } from "./mcp-server.js";
+import { ImageResults } from "./image-results.js";
 
 export const POLL_TOOL_NAME = "bridge_poll_result";
 const PARK_TIMEOUT_MS = 8 * 60_000;
@@ -49,7 +50,7 @@ export class ToolRoundTrips {
 	#pending = new Map<string, PendingCall>();
 	#polls = new Map<string, PollResult>();
 
-	constructor(private readonly driver: TurnDriver) {}
+	constructor(private readonly driver: TurnDriver, private readonly images = new ImageResults()) {}
 
 	get pendingIds(): string[] {
 		return [...this.#pending.keys()];
@@ -97,15 +98,15 @@ export class ToolRoundTrips {
 		if (pending.escalated) {
 			this.#polls.set(callId, { name: pending.name, state: "done", text, isError, images, expires: Date.now() + ESCALATED_TTL_MS });
 		} else {
-			pending.resolve({
-				content: [...images.map((image) => ({ type: "image" as const, ...image })), { type: "text" as const, text: text || "(no output)" }],
-				isError,
-			});
+			pending.resolve(this.images.result(text, isError, images));
 		}
 		this.driver.kickIdle();
 		return true;
 	}
 
+	clearImages(): void {
+		this.images.clear();
+	}
 	failAll(reason: string): void {
 		for (const id of [...this.#pending.keys()]) {
 			if (!this.#pending.get(id)?.escalated) this.#fail(id, reason);
@@ -131,10 +132,7 @@ export class ToolRoundTrips {
 		const result = this.#polls.get(callId);
 		if (!result) return { content: [{ type: "text", text: `Unknown or non-escalated callId: ${callId || "(missing)"}` }], isError: true };
 		if (result.state === "running") return { content: [{ type: "text", text: `STILL RUNNING\nCall ${POLL_TOOL_NAME} again with the same callId.` }] };
-		return {
-			content: [...result.images.map((image) => ({ type: "image" as const, ...image })), { type: "text" as const, text: result.text || "(no output)" }],
-			isError: result.isError,
-		};
+		return this.images.result(result.text ?? "", result.isError ?? false, result.images);
 	}
 
 	#prunePolls(): void {
@@ -209,11 +207,25 @@ function transcriptForAcp(context: TranscriptContext): { text: string; images: A
 	return { text: parts.join("\n\n"), images };
 }
 
+// Pi uses usage.totalTokens as the latest context size. ACP prompt usage can be
+// cumulative across multiple internal model calls, so keep that original total
+// separately when a context occupancy update is available.
+type AgyPiUsage = Usage & { agyContextTokens?: number; agyCumulativeTotalTokens?: number };
+
 function applyUsage(target: Usage, usage: AgyUsage): void {
-	target.input = usage.input_tokens ?? 0;
+	const piUsage = target as AgyPiUsage;
+	// ACP inputTokens includes cachedReadTokens; pi counts them separately.
+	target.input = Math.max(0, (usage.input_tokens ?? 0) - (usage.cache_read_tokens ?? 0));
 	target.output = (usage.output_tokens ?? 0) + (usage.thinking_tokens ?? 0);
 	target.cacheRead = usage.cache_read_tokens ?? 0;
-	target.totalTokens = usage.total_tokens ?? target.input + target.output + target.cacheRead;
+	const total = usage.total_tokens ?? target.input + target.output + target.cacheRead;
+	piUsage.agyCumulativeTotalTokens = total;
+	target.totalTokens = piUsage.agyContextTokens ?? total;
+}
+
+function applyContextUsage(target: Usage, used: number): void {
+	(target as AgyPiUsage).agyContextTokens = used;
+	target.totalTokens = used;
 }
 
 function ensureStarted(stream: AssistantMessageEventStream, blocks: BlockState): void {
@@ -304,14 +316,16 @@ async function consumeTurn(
 		if (activity.type === "text") appendText(stream, blocks, activity.delta);
 		else if (activity.type === "thought" && activity.delta) appendThinking(stream, blocks, activity.delta);
 		else if (activity.type === "usage") applyUsage(blocks.partial.usage, activity.usage);
+		else if (activity.type === "context_usage") applyContextUsage(blocks.partial.usage, activity.contextUsage.used);
 		else if (activity.type === "bridge_call") {
 			emitToolUse(stream, blocks, activity);
 			return;
 		}
-		// ACP native tool frames are deliberately ignored: native tools are
-		// disabled and the pi-bridge MCP call already has a genuine pi card.
+		// Native viewer frames need no second pi tool card. Other execution
+		// remains on the pi bridge; view_file exists to deliver image pixels.
 	}
 	const outcome = await handle.outcome;
+	if (outcome.contextUsage) applyContextUsage(blocks.partial.usage, outcome.contextUsage.used);
 	if (outcome.aborted) return finish(stream, blocks, "aborted", "Operation aborted");
 	if (outcome.status === "ERROR") return finish(stream, blocks, "error", outcome.error ?? "Antigravity turn failed");
 	if (blocks.textIdx === null && outcome.response) appendText(stream, blocks, outcome.response);
@@ -349,11 +363,11 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					model: entry?.full ?? model.id,
 					effort: entry?.efforts?.length ? toAgyEffort(options?.reasoning, entry.efforts) : undefined,
 					mode: "accept-edits",
-					// ACP auto-approves only its MCP transport. The actual operation is
-					// executed by pi, where pi's normal permission policy applies.
+					// ACP transport and its native viewer are auto-approved. Original
+					// pi tool execution still goes through pi's permission policy.
 					skipPermissions: true,
 					conversationId: null,
-					prompt: "Continue the task from the pi transcript, including any tool results or discarded previous attempt. Attached images are numbered in transcript order.",
+					prompt: "Continue the task from the pi transcript, including any tool results or discarded previous attempt. Attached images are numbered in transcript order. Use pi-bridge tools for original files and URLs (including clipboard images outside the workspace). When a pi result gives staged image paths, use native view_file on those paths to see the pixels; do not re-read the staged copies through MCP.",
 					images: transcript.images,
 					contextBlock: { uri: "pi://transcript", text: transcript.text },
 					signal: options?.signal,

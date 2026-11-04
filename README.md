@@ -6,7 +6,7 @@ Minimal Antigravity provider for [pi](https://github.com/earendil-works/pi-codin
 
 - Discovers the live ACP model catalog, including Claude Opus/Sonnet and GPT-OSS alongside Gemini.
 - Streams text and reasoning into pi's native assistant/thinking blocks.
-- Disables every Antigravity built-in tool with `enabledTools: []`.
+- Enables only Antigravity's native `view_file` for image viewing; other operations stay on pi tools.
 - Exposes pi's active tools through a loopback, token-protected MCP bridge. Pi executes them with its normal cards, permissions, hooks, and diffs.
 - Uses pi's transcript as the source of truth for every new user turn.
 - Installs the official ACP server automatically when needed.
@@ -32,7 +32,7 @@ The exact catalog depends on the account and the current ACP response. GPT-OSS c
 
 ## How tools work
 
-ACP is only the model transport. Antigravity's native tools are disabled, while the `pi-bridge` MCP server is marked eager so models see pi tools directly instead of going through agy's lazy `call_mcp_tool` helper.
+ACP is only the model transport. Antigravity's native tools are disabled except `view_file` for image viewing, while the `pi-bridge` MCP server is marked eager so models see pi tools directly instead of going through agy's lazy `call_mcp_tool` helper.
 
 A tool call follows this path:
 
@@ -43,6 +43,13 @@ A tool call follows this path:
 
 Slow tools return a `STILL RUNNING` handle after 20 seconds and complete through `bridge_poll_result`, avoiding upstream MCP timeouts.
 
+## Images and context accounting
+
+Pi image tool results are copied to a private, content-deduplicated directory under `~/.gemini/antigravity-acp/pi-images-*`. The MCP response directs the model to open those bytes with native `view_file`, because agy offloads MCP image blocks instead of showing their pixels. The existing ACP session stays open: no history replay or session restart is added for image reads. Copies are deleted on normal pi session shutdown (after a crash, leftover `pi-images-*` directories may be removed manually). This applies to any tool returning image blocks, not only `/tmp/pi-clipboard-*`. URLs still require an appropriate active pi tool; this does not make unsupported/authenticated resources universally readable.
+
+ACP's `usage_update.used` is mapped to pi's existing `usage.totalTokens` context-count input, so the footer, `ctx.getContextUsage()` and compaction see occupancy rather than cumulative internal-call usage. Input/output/cache fields retain accounting information; ACP cached input is removed from pi's uncached input to avoid double counting. The original ACP total is preserved as `usage.agyCumulativeTotalTokens`. This is an extension-only compatibility adapter: plugins summing `totalTokens` for billing should instead use the accounting fields or this original total. No pi runtime patch is needed. Old JSONL counts are not rewritten; the next measured response supplies a fresh count. If ACP omits occupancy updates, the existing usage fallback remains an estimate.
+
+There is still a real image-token cost and one native viewer tool round-trip. Cache hits depend on the service; preserving the ACP session avoids deliberately discarding its history/cache state but cannot guarantee a particular hit rate.
 ## Protocol note
 
 The current ACP server offers third-party models only to recognized client surfaces. realagy declares `clientInfo.name = "zed"` to enable the same Claude/GPT catalog that ACP exposes to Zed. Credentials, account quotas, model requests, and generation still use Google's official ACP server; realagy does not call the private generation endpoint directly or bypass quota checks.

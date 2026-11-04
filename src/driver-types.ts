@@ -55,6 +55,9 @@ export type AgyUsage = {
 	total_tokens?: number;
 };
 
+/** ACP-reported context occupancy, not cumulative per-model-call token usage. */
+export type AgyContextUsage = { used: number; size: number };
+
 export type DriverActivity =
 	| { type: "text"; delta: string }
 	/** Stream-json emits a token count only; ACP carries the actual thought text in
@@ -78,6 +81,7 @@ export type DriverActivity =
 	  }
 	| { type: "tool_error"; stepId?: number; name: string; message: string; mcpServer?: string; toolCallId?: string }
 	| { type: "usage"; usage: AgyUsage }
+	| { type: "context_usage"; contextUsage: AgyContextUsage }
 	/** Synthetic: injected by the provider when the MCP bridge receives a call
 	 *  (G9). Parks the turn: output is expected to stall while pi executes the
 	 *  tool, so the driver suspends its idle/overall timers. */
@@ -89,6 +93,7 @@ export interface TurnOutcome {
 	response: string;
 	error?: string;
 	usage?: AgyUsage;
+	contextUsage?: AgyContextUsage;
 	finished: boolean;
 	aborted: boolean;
 	/** The model demonstrably produced output this turn: an agent_response

@@ -63,8 +63,10 @@ test("AcpDriver lists all families and sends GPT's full medium model slug", asyn
 		const handle = await driver.run({ cwd: process.cwd(), model: "gpt-oss-120b", effort: "medium", mode: "accept-edits", skipPermissions: true, prompt: "Reply" });
 		const activities = [];
 		for await (const activity of { async *[Symbol.asyncIterator]() { for (;;) { const next = await handle.next(); if (!next) return; yield next; } } }) activities.push(activity);
-		assert.deepEqual(activities.filter((activity) => activity.type !== "usage").map((activity) => activity.type), ["thought", "text"]);
+		assert.deepEqual(activities.filter((activity) => activity.type !== "usage" && activity.type !== "context_usage").map((activity) => activity.type), ["thought", "text"]);
 		assert.equal((await handle.outcome).status, "OK");
+		assert.deepEqual(activities.filter((activity) => activity.type === "context_usage"), [{ type: "context_usage", contextUsage: { used: 321, size: 1000 } }]);
+		assert.deepEqual((await handle.outcome).contextUsage, { used: 321, size: 1000 });
 		const modelConfig = requests(capture).find((request) => request.method === "session/set_config_option" && (request.params as { configId?: string }).configId === "model")!;
 		assert.equal(modelConfig.params.value, "gpt-oss-120b-medium");
 	} finally {

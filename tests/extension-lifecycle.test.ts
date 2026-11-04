@@ -10,7 +10,7 @@ vi.mock("../src/acp/driver.js", () => ({ AcpDriver: class {
 	close = mocks.close;
 } }));
 vi.mock("../src/mcp-server.js", () => ({ startMcpServer: async () => ({ ok: true, handle: { port: 1, token: "test", close: vi.fn() } }), TOKEN_HEADER: "token" }));
-vi.mock("../src/provider.js", () => ({ createStreamSimple: vi.fn(), POLL_TOOL_NAME: "poll", ToolRoundTrips: class { failAll() {} } }));
+vi.mock("../src/provider.js", () => ({ createStreamSimple: vi.fn(), POLL_TOOL_NAME: "poll", ToolRoundTrips: class { failAll() {} clearImages() {} } }));
 
 import extension from "../extensions/index.js";
 
