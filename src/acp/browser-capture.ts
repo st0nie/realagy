@@ -19,6 +19,17 @@ export interface AuthUrlCapture {
 	lastUrl(): string | null;
 }
 
+/** True when running inside WSL (including WSL2). `env.WSL_DISTRO_NAME` is
+ *  always set there; the os-release fallback covers stripped environments. */
+export function isWsl(env: NodeJS.ProcessEnv = process.env): boolean {
+	if (env.WSL_DISTRO_NAME || env.WSL_INTEROP) return true;
+	try {
+		return /microsoft/i.test(fs.readFileSync("/proc/sys/kernel/osrelease", "utf8"));
+	} catch {
+		return false;
+	}
+}
+
 /** First existing executable named `name` on `env.PATH`, or null. */
 export function findOnPath(name: string, env: NodeJS.ProcessEnv = process.env): string | null {
 	for (const dir of (env.PATH ?? "").split(path.delimiter)) {
@@ -76,7 +87,13 @@ export function setupAuthUrlCapture(dataDir = path.join(os.homedir(), ".pi", "ag
 		// Truncate: the file mirrors the current login attempt only. OAuth
 		// URLs carry state + PKCE challenges, so keep the record private.
 		fs.writeFileSync(file, "", { mode: 0o600 });
-		const opener = env.BROWSER?.trim() || findOnPath("xdg-open", env) || findOnPath("open", env) || "";
+		let opener = env.BROWSER?.trim() || findOnPath("xdg-open", env) || findOnPath("open", env) || "";
+		if (!opener && isWsl(env)) {
+			// WSL: xdg-open is usually missing. Prefer wslu/wslview when installed,
+			// else fall back to the Windows browser via cmd.exe start. Quoting is
+			// done in the wrapper body below, not here.
+			opener = findOnPath("wslview", env) || findOnPath("cmd.exe", env) || "/mnt/c/Windows/System32/cmd.exe";
+		}
 		const body = [
 			"#!/usr/bin/env sh",
 			"# Antigravity bridge: records the Google OAuth URL the ACP server hands",
@@ -85,7 +102,13 @@ export function setupAuthUrlCapture(dataDir = path.join(os.homedir(), ".pi", "ag
 			"# SSH; forward the redirect port first).",
 			`printf '%s\\n' "$@" >> ${shQuote(file)}`,
 			`REAL=${shQuote(opener)}`,
-			'if [ -n "$REAL" ]; then set -f; exec $REAL "$@"; fi',
+			'if [ -n "$REAL" ]; then',
+			'  set -f',
+			'  case "$REAL" in',
+			'    *cmd.exe|*cmd) exec $REAL /c start "" "$@" ;;',
+			'    *) exec $REAL "$@" ;;',
+			'  esac',
+			'fi',
 			"",
 		].join("\n");
 		const write = (p: string, content: string, mode: number): void => {

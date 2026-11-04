@@ -75,6 +75,10 @@ export interface AcpConnectionOptions {
 	/** mcpServers entries for session/new AND session/load (run 6: load takes
 	 *  the same param). Evaluated lazily per call. */
 	mcpServers?: () => AcpMcpServer[];
+	/** Antigravity built-in tools disabled on session/new and session/load.
+	 *  Sent as `_meta.antigravity.disabledTools` (parsed by the official
+	 *  agy_acp_server tool_filter.py). Empty/omitted = no filtering. */
+	disabledTools?: () => string[];
 	/** Permission policy for session/request_permission, evaluated per request:
 	 *  "auto" selects the first allow option; "deny" consults the human
 	 *  handler (parking) or fail-closes to the first reject option. Absent =
@@ -511,6 +515,20 @@ export class AcpConnection {
 		} catch {
 			return [];
 		}
+	}
+
+	/** `_meta.antigravity` block for session/new and session/load. Disabling
+	 *  run_workflow stops localharness from extracting the run-workflow skill
+	 *  into <cwd>/skills/system/ on every session. */
+	#antigravityMeta(): Record<string, unknown> {
+		let disabled: string[] = [];
+		try {
+			disabled = this.#opts.disabledTools?.() ?? [];
+		} catch {
+			disabled = [];
+		}
+		if (disabled.length === 0) return {};
+		return { _meta: { antigravity: { disabledTools: disabled } } };
 	}
 
 	#write(frame: string): void {

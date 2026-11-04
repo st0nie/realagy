@@ -88,6 +88,12 @@ export interface AcpConfig {
 	 *  usage surfaces show nonzero numbers. Estimates are labeled as such in
 	 *  /agy doctor and auto-disable when the server sends real usage. */
 	usageEstimate: UsageEstimate;
+	/** Antigravity built-in tools disabled on every ACP session. Sent as
+	 *  `_meta.antigravity.disabledTools` on session/new and session/load.
+	 *  Defaults to ["run_workflow"]: the localharness engine extracts the
+	 *  run-workflow skill into <cwd>/skills/system/ whenever that tool is
+	 *  enabled, polluting the workspace Pi runs in. */
+	disabledTools: string[];
 }
 
 export interface AgyConfig {
@@ -215,7 +221,7 @@ const DEFAULTS: AgyConfig = {
 	turnTimeoutMin: 0, // placeholder: the real default is resolved per loadConfig call (defaultTurnTimeoutMin)
 	inactivityTimeoutMin: 5,
 	approvals: { gateMode: "auto", mode: "ask" },
-	acp: { bin: "", usageEstimate: "estimate" },
+	acp: { bin: "", usageEstimate: "estimate", disabledTools: ["run_workflow"] },
 };
 
 /** Hard ceiling for a free-typed turn cap: one day, in minutes. */
@@ -384,6 +390,9 @@ export function loadConfig(configPath: string = CONFIG_PATH): AgyConfig {
 			process.env.AGY_ACP_BIN ??
 			(typeof fileAcp.bin === "string" ? fileAcp.bin : DEFAULTS.acp.bin),
 		usageEstimate,
+		disabledTools: Array.isArray(fileAcp.disabledTools)
+			? fileAcp.disabledTools.filter((t): t is string => typeof t === "string")
+			: DEFAULTS.acp.disabledTools,
 	};
 
 	// Custom agent for stream-json turns (--agent). Env wins over the file
@@ -445,7 +454,7 @@ export function saveConfig(patch: Partial<AgyConfig>, configPath: string = CONFI
 		...DEFAULTS,
 		...file,
 		...(file.acp !== undefined
-			? { acp: { bin: fileAcp.bin ?? DEFAULTS.acp.bin, usageEstimate: fileAcp.usageEstimate ?? DEFAULTS.acp.usageEstimate } }
+			? { acp: { bin: fileAcp.bin ?? DEFAULTS.acp.bin, usageEstimate: fileAcp.usageEstimate ?? DEFAULTS.acp.usageEstimate, disabledTools: fileAcp.disabledTools ?? DEFAULTS.acp.disabledTools } }
 			: {}),
 		...(file.approvals !== undefined
 			? { approvals: { gateMode: fileApprovals.gateMode ?? DEFAULTS.approvals.gateMode, mode: fileApprovals.mode ?? DEFAULTS.approvals.mode } }

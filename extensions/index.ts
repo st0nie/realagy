@@ -317,6 +317,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		// a restart. Without this the driver defaults to "estimate" and the
 		// config knob (incl. "off") is dead.
 		usageEstimate: () => loadConfig().acp.usageEstimate,
+		// Disable Antigravity built-in tools (default: run_workflow) so the ACP
+		// engine stops extracting skills/system/ into the workspace.
+		disabledTools: () => loadConfig().acp.disabledTools,
 		// ACP request_permission parity with the approval gate: skipPermissions
 		// turns auto-allow in the driver; approvals.mode allow short-circuits
 		// to the same synchronous allow; everything else opens a dialog (esc
@@ -657,6 +660,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			const r = await runAcpAuth({
 				bin: status.bin,
 				...(authCapture ? { extraEnv: authCapture.browserEnv, authUrlFile: authCapture.file } : {}),
+				disabledTools: loadConfig().acp.disabledTools,
 				log: acpLog,
 			});
 			fileLog.log("acp-auth", r.ok ? { ok: true } : { ok: false, error: r.error }, r.ok ? "info" : "warn");
@@ -1320,6 +1324,7 @@ function registerAgyCommand(pi: ExtensionAPI, ctx: AgyCommandCtx): void {
 				const r = await runAcpAuth({
 					bin: status.bin,
 					extraEnv: ctx.authCapture?.browserEnv,
+					disabledTools: loadConfig().acp.disabledTools,
 					authUrlFile: ctx.authCapture?.file,
 					log: ctx.acpLog,
 				});

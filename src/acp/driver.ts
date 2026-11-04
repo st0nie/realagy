@@ -53,6 +53,8 @@ export interface AcpDriverOptions {
 	authUrlFile?: string;
 	/** Bridge registration for session/new AND session/load. */
 	mcpServers?: () => AcpMcpServer[];
+	/** Antigravity built-in tools disabled on session/new and session/load. */
+	disabledTools?: () => string[];
 	/** Gate B stopgap: how ACP turns synthesize usage while the server sends
 	 *  none. A function is resolved per turn (follows live config, like bin).
 	 *  Default "estimate". */
@@ -516,6 +518,7 @@ export class AcpDriver implements TurnDriver {
 			authUrlFile: this.#opts.authUrlFile,
 			cwd: request.cwd,
 			mcpServers: this.#opts.mcpServers,
+			disabledTools: this.#opts.disabledTools,
 			log: (msg, data) => this.#log(msg, data),
 			// Fail-closed permissions: skipPermissions answers allow; a standing
 			// policy override (approvals.mode allow) may widen that; everything

@@ -25,6 +25,8 @@ export interface AcpAuthOptions {
 	cwd?: string;
 	extraEnv?: Record<string, string>;
 	authUrlFile?: string;
+	/** Antigravity built-in tools disabled during the credential probe session. */
+	disabledTools?: string[];
 	/** Directory holding acp_token.json. Default: ~/.gemini/antigravity-acp.
 	 *  Tests point this at a fixture dir; production callers use the default. */
 	tokenDir?: string;
@@ -76,6 +78,7 @@ export function runAcpAuth(opts: AcpAuthOptions): Promise<AcpAuthResult> {
 		cwd: opts.cwd ?? process.cwd(),
 		extraEnv: opts.extraEnv,
 		authUrlFile: opts.authUrlFile,
+		disabledTools: () => opts.disabledTools ?? [],
 		log: opts.log ?? (() => {}),
 		onUpdate: () => {},
 		onExit: () => {},
