@@ -22,7 +22,7 @@
 //     approvals.mode allow to the same synchronous auto path
 
 import { randomUUID } from "node:crypto";
-import type { UsageEstimate } from "../config.js";
+import type { UsageEstimate } from "./usage-estimate.js";
 import { AcpConnection, resolveAcpBinary, type AcpMcpServer, type AcpPermissionRequest } from "./connection.js";
 import type { AcpPermissionHandler } from "./connection.js";
 import { mapStopReason, mapUpdate, TextAccumulator, type AcpEditDiff } from "./events.js";
@@ -53,7 +53,9 @@ export interface AcpDriverOptions {
 	authUrlFile?: string;
 	/** Bridge registration for session/new AND session/load. */
 	mcpServers?: () => AcpMcpServer[];
-	/** Antigravity built-in tools disabled on session/new and session/load. */
+	/** [] disables all Antigravity built-ins; MCP tools remain available. */
+	enabledTools?: () => string[];
+	/** Additional Antigravity built-in tools disabled on session/new and load. */
 	disabledTools?: () => string[];
 	/** Gate B stopgap: how ACP turns synthesize usage while the server sends
 	 *  none. A function is resolved per turn (follows live config, like bin).
@@ -134,7 +136,6 @@ export class AcpDriver implements TurnDriver {
 	#opts: AcpDriverOptions;
 	#state: DriverState = "idle";
 	#conn: AcpConnection | undefined;
-	#generation = 0;
 	#active: ActiveTurn | undefined;
 	#queueTail: Promise<void> = Promise.resolve();
 	#lifecycle: string[] = [];
@@ -154,6 +155,13 @@ export class AcpDriver implements TurnDriver {
 	constructor(opts: AcpDriverOptions) {
 		this.#opts = opts;
 		this.#log("driver-created", { bin: typeof opts.bin === "function" ? "(resolved per turn)" : resolveAcpBinary(opts.bin) });
+	}
+
+	/** Read the account's live catalog through the official ACP session flow. */
+	async listModels(cwd: string): Promise<Array<{ modelId: string; name?: string }>> {
+		const conn = await this.#ensureConnection({ cwd, model: "", mode: "accept-edits", skipPermissions: true, prompt: "" });
+		const session = await conn.newSession(cwd);
+		return session.availableModels;
 	}
 
 	get state(): DriverState {
@@ -508,7 +516,6 @@ export class AcpDriver implements TurnDriver {
 
 	#ensureConnection(request: DriverTurnRequest): Promise<AcpConnection> {
 		if (this.#conn?.alive) return Promise.resolve(this.#conn);
-		this.#generation += 1;
 		this.#state = "starting";
 		this.#stats.spawns += 1;
 		const conn = new AcpConnection({
@@ -518,6 +525,7 @@ export class AcpDriver implements TurnDriver {
 			authUrlFile: this.#opts.authUrlFile,
 			cwd: request.cwd,
 			mcpServers: this.#opts.mcpServers,
+			enabledTools: this.#opts.enabledTools,
 			disabledTools: this.#opts.disabledTools,
 			log: (msg, data) => this.#log(msg, data),
 			// Fail-closed permissions: skipPermissions answers allow; a standing

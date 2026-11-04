@@ -1,7 +1,7 @@
 import { AcpConnection } from "./connection.js";
 import { hasAcpToken, writeAcpAuthVerified } from "./setup.js";
 
-// Explicit sign-in (/agy auth): spawn a short-lived server, send
+// Explicit sign-in (/realagy auth): spawn a short-lived server, send
 // `authenticate` (the RPC that fires the loopback listener + browser OAuth
 // flow), and wait for the token to land in the shared acp_token.json. A
 // dedicated process keeps the minutes-scale login ritual away from live
@@ -25,8 +25,6 @@ export interface AcpAuthOptions {
 	cwd?: string;
 	extraEnv?: Record<string, string>;
 	authUrlFile?: string;
-	/** Antigravity built-in tools disabled during the credential probe session. */
-	disabledTools?: string[];
 	/** Directory holding acp_token.json. Default: ~/.gemini/antigravity-acp.
 	 *  Tests point this at a fixture dir; production callers use the default. */
 	tokenDir?: string;
@@ -78,7 +76,7 @@ export function runAcpAuth(opts: AcpAuthOptions): Promise<AcpAuthResult> {
 		cwd: opts.cwd ?? process.cwd(),
 		extraEnv: opts.extraEnv,
 		authUrlFile: opts.authUrlFile,
-		disabledTools: () => opts.disabledTools ?? [],
+		enabledTools: () => [],
 		log: opts.log ?? (() => {}),
 		onUpdate: () => {},
 		onExit: () => {},
@@ -98,7 +96,7 @@ export function runAcpAuth(opts: AcpAuthOptions): Promise<AcpAuthResult> {
 				if (!(await probeUsableCredentials(conn, opts.cwd))) {
 					return {
 						ok: false,
-						error: `the server accepted the sign-in but holds no usable credentials (session probe failed; token file absent in ${opts.tokenDir ?? "~/.gemini/antigravity-acp"}). Finish the Google sign-in if a browser opened, then retry /agy auth.`,
+						error: `the server accepted the sign-in but holds no usable credentials (session probe failed; token file absent in ${opts.tokenDir ?? "~/.gemini/antigravity-acp"}). Finish the Google sign-in if a browser opened, then retry /realagy auth.`,
 					};
 				}
 				writeAcpAuthVerified(opts.authVerifiedFile);

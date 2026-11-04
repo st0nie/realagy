@@ -62,25 +62,15 @@ export type AcpSetupStatus =
 	| { ok: false; stage: "install" | "auth"; error: string; manual: string };
 
 export const MANUAL_SETUP = [
-	"For some unknown reason, Google ships its ACP server as a separate",
-	"binary from the Agy CLI. So, as with any other part of its Antigravity",
-	"suite (Agy Desktop, Agy Editor, Agy CLI), you need to log in to",
-	"this one as well. Separately ¯\\_(ツ)_/¯",
 	"ACP manual setup:",
 	"1. Download the server zip for your platform from the antigravity-acp",
-	"   registry entry (github.com/agentclientprotocol/registry, folder",
-	"   antigravity-acp/agent.json) and unzip it, e.g. to",
-	"   ~/.local/opt/agy-acp/<build>/; chmod +x agy_acp_server.par.",
-	"2. Point AGY_ACP_BIN or /agy config acp.bin at the binary",
-	"   (~/.local/opt/agy-acp/current/agy_acp_server.par works; 'current' is a",
-	"   symlink to the build dir).",
-	'3. Log in: put {"auth":{"type":"oauth-personal"}} in',
-	"   ~/.gemini/antigravity-acp/settings.json and run /agy auth, then complete",
-	"   the Google login that opens in your browser. That login IS your",
-	"   Antigravity subscription (Google AI Plus/Pro/Ultra).",
-	"Details: /agy auth-manual",
+	"   registry (github.com/agentclientprotocol/registry, antigravity-acp/agent.json),",
+	"   unzip it, and chmod +x agy_acp_server.par.",
+	"2. Optionally point AGY_ACP_BIN at that binary. Automatic setup otherwise uses",
+	"   ~/.local/opt/agy-acp/current/agy_acp_server.par.",
+	'3. Put {"auth":{"type":"oauth-personal"}} in ~/.gemini/antigravity-acp/settings.json,',
+	"   then run /realagy auth and complete the Google sign-in.",
 ].join("\n");
-
 export function platformKey(): string {
 	const goos = process.platform === "darwin" ? "darwin" : process.platform === "win32" ? "windows" : "linux";
 	const goarch = process.arch === "arm64" ? "aarch64" : "x86_64";
@@ -259,7 +249,7 @@ export function hasAcpToken(dir?: string): boolean {
  *  (-32000), so a stale marker never masks a real logout. Never holds a
  *  credential value: a boolean and a timestamp. */
 export function defaultAcpAuthVerifiedPath(): string {
-	return path.join(os.homedir(), ".pi", "agent", "antigravity-bridge", "acp-auth-verified.json");
+	return path.join(os.homedir(), ".pi", "agent", "realagy", "acp-auth-verified.json");
 }
 
 export function readAcpAuthVerified(file: string = defaultAcpAuthVerifiedPath()): boolean {

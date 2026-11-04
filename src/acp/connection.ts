@@ -39,6 +39,7 @@ export interface AcpMcpServer {
 
 export interface AcpSessionInfo {
 	sessionId: string;
+	availableModels: Array<{ modelId: string; name?: string }>;
 }
 
 /** Auth failed (-32000 family). Message carries the remediation the server
@@ -75,9 +76,10 @@ export interface AcpConnectionOptions {
 	/** mcpServers entries for session/new AND session/load (run 6: load takes
 	 *  the same param). Evaluated lazily per call. */
 	mcpServers?: () => AcpMcpServer[];
-	/** Antigravity built-in tools disabled on session/new and session/load.
-	 *  Sent as `_meta.antigravity.disabledTools` (parsed by the official
-	 *  agy_acp_server tool_filter.py). Empty/omitted = no filtering. */
+	/** Optional built-in allowlist. [] disables every Antigravity native tool
+	 * while leaving MCP tools available (official tool_filter.py contract). */
+	enabledTools?: () => string[];
+	/** Antigravity built-in tools disabled on session/new and session/load. */
 	disabledTools?: () => string[];
 	/** Permission policy for session/request_permission, evaluated per request:
 	 *  "auto" selects the first allow option; "deny" consults the human
@@ -273,6 +275,13 @@ export class AcpConnection {
 			{
 				protocolVersion: 1,
 				clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+				// Identify as a Zed-family client so the ACP server includes
+				// third-party models (Claude, GPT-OSS) in its model catalog.
+				// Without clientInfo the server filters to Gemini-only.
+				// Verified live 2026-07-08: with clientInfo.name="zed", the
+				// catalog includes claude-opus-5-5-*, claude-sonnet-5-5-*,
+				// gpt-oss-120b-medium alongside the Gemini families.
+				clientInfo: { name: "zed", title: "realagy", version: "2.0.0" },
 			},
 			INIT_TIMEOUT_MS,
 		)) as Record<string, unknown> | undefined;
@@ -302,7 +311,17 @@ export class AcpConnection {
 		}
 		this.#updateSessionId = sessionId;
 		this.lastConfigOptions = result.configOptions;
-		return { sessionId };
+		const rawModels = (result.models as { availableModels?: unknown } | undefined)?.availableModels;
+		const availableModels = Array.isArray(rawModels)
+			? rawModels.flatMap((value) => {
+					if (!value || typeof value !== "object") return [];
+					const model = value as { modelId?: unknown; name?: unknown };
+					return typeof model.modelId === "string"
+						? [{ modelId: model.modelId, ...(typeof model.name === "string" ? { name: model.name } : {}) }]
+						: [];
+				})
+			: [];
+		return { sessionId, availableModels };
 	}
 
 	async loadSession(sessionId: string, cwd: string): Promise<void> {
@@ -531,18 +550,29 @@ export class AcpConnection {
 		}
 	}
 
-	/** `_meta.antigravity` block for session/new and session/load. Disabling
-	 *  run_workflow stops localharness from extracting the run-workflow skill
-	 *  into <cwd>/skills/system/ on every session. */
+	/** Native tools stay off: pi's MCP tools are the only tool surface. */
 	#antigravityMeta(): Record<string, unknown> {
+		let enabled: string[] | undefined;
 		let disabled: string[] = [];
 		try {
+			enabled = this.#opts.enabledTools?.();
 			disabled = this.#opts.disabledTools?.() ?? [];
 		} catch {
+			enabled = [];
 			disabled = [];
 		}
-		if (disabled.length === 0) return {};
-		return { _meta: { antigravity: { disabledTools: disabled } } };
+		if (enabled === undefined && disabled.length === 0) return {};
+		return {
+			_meta: {
+				antigravity: {
+					// Expose pi tools directly, not through agy's lazy call_mcp_tool /
+					// read_resource helper loop. The operations still ride MCP.
+					eagerMcpServers: ["pi-bridge"],
+					...(enabled !== undefined ? { enabledTools: enabled } : {}),
+					...(disabled.length > 0 ? { disabledTools: disabled } : {}),
+				},
+			},
+		};
 	}
 
 	#write(frame: string): void {
@@ -658,7 +688,7 @@ export function translateError(method: string, err: unknown): Error {
 			authInvalidatedHook?.();
 			const detail = typeof err.data === "object" && err.data !== null ? (err.data as { message?: unknown }).message : undefined;
 			const detailText = typeof detail === "string" ? `: ${detail}` : `: ${err.message}`;
-			return new AcpAuthError(`ACP authentication required for ${method}${detailText}. Run /agy auth to sign in; /agy auth-manual has manual steps.`);
+			return new AcpAuthError(`ACP authentication required for ${method}${detailText}. Run /realagy auth to sign in.`);
 		}
 		// Typed protocol errors survive: callers probe .code (-32601 cancel-
 		// unsupported, -32602 param shape). The method prefix is lost — describe()

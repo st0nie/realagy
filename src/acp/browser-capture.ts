@@ -78,7 +78,7 @@ const shQuote = (s: string): string => `'${s.replace(/'/g, "'\\''")}'`;
  *  work; a BROWSER path containing spaces does not (rare, and BROWSER lists
  *  are not honored either - the first entry is what chains). Windows browser
  *  resolution differs; no capture there. */
-export function setupAuthUrlCapture(dataDir = path.join(os.homedir(), ".pi", "agent", "antigravity-bridge"), env: NodeJS.ProcessEnv = process.env): AuthUrlCapture | null {
+export function setupAuthUrlCapture(dataDir = path.join(os.homedir(), ".pi", "agent", "realagy"), env: NodeJS.ProcessEnv = process.env): AuthUrlCapture | null {
 	if (process.platform === "win32") return null;
 	const file = path.join(dataDir, "acp-auth-urls.log");
 	const wrapper = path.join(dataDir, "acp-browser-wrapper.sh");
