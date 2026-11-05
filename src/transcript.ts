@@ -75,15 +75,44 @@ function serializeMessage(message: Message, imageBase: number): { text: string; 
 	return { text: "", images };
 }
 
-function serializeRange(messages: Message[]): { text: string; images: AcpImage[] } {
+function serializeRange(messages: Message[], imageBase = 0): { text: string; images: AcpImage[] } {
 	const parts: string[] = [];
 	const images: AcpImage[] = [];
 	for (const message of messages) {
-		const serialized = serializeMessage(message, images.length);
+		const serialized = serializeMessage(message, imageBase + images.length);
 		if (serialized.text) parts.push(serialized.text);
 		images.push(...serialized.images);
 	}
 	return { text: parts.join("\n\n"), images };
+}
+
+/** Format a pi toolResult for the MCP bridge response, attaching any user
+ *  steering messages (or system updates) pi appended after the tool ran. */
+export function formatToolResult(
+	result: Extract<Message, { role: "toolResult" }>,
+	trailing: Message[] = [],
+): { text: string; images: AcpImage[] } {
+	const text = contentText(result.content);
+	const images = Array.isArray(result.content)
+		? result.content.flatMap((block) => block.type === "image" ? [{ data: block.data, mimeType: block.mimeType }] : [])
+		: [];
+	if (trailing.length === 0) return { text, images };
+	const notes: string[] = [];
+	for (const message of trailing) {
+		if (message.role === "system" && typeof message.content === "string" && message.content.trim()) {
+			notes.push(`<pi-system-update>\n${message.content}\n</pi-system-update>`);
+		}
+	}
+	const steered = serializeRange(trailing.filter((message) => message.role !== "system"), images.length);
+	if (steered.text) notes.push(steered.text);
+	if (notes.length === 0) return { text, images };
+	const fallback = images.length > 0 ? "(image result)" : "(no output)";
+	const base = text || fallback;
+	const steering = `<pi-steering>\nThe user sent a steering message while this tool was running. Address it immediately:\n${notes.join("\n\n")}\n</pi-steering>`;
+	return {
+		text: `${base}\n\n${steering}`,
+		images: [...images, ...steered.images],
+	};
 }
 
 /** The whole transcript for a fresh ACP session. Stable and append-only, so

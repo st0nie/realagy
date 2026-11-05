@@ -16,7 +16,7 @@ import {
 import type { AgyStepUsage, AgyUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "./driver-types.js";
 import { toAgyEffort, type AgyModelEntry } from "./models.js";
 import type { BridgeResult } from "./mcp-server.js";
-import { planTurn, warmAfterTurn, type WarmSession } from "./transcript.js";
+import { formatToolResult, planTurn, warmAfterTurn, type WarmSession } from "./transcript.js";
 import { traceUsage } from "./usage-trace.js";
 import { quotaExhaustion, type UsageMeter } from "./quota.js";
 
@@ -178,20 +178,6 @@ function newAssistant(model: Model<Api>): AssistantMessage {
 	return { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, usage: zeroUsage(), stopReason: "stop", timestamp: Date.now() };
 }
 
-function contentText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content.flatMap((block) => {
-		if (!block || typeof block !== "object") return [];
-		const value = block as { type?: string; text?: string };
-		return value.type === "text" && typeof value.text === "string" ? [value.text] : [];
-	}).join("\n");
-}
-
-function resultImages(message: Message): Array<{ data: string; mimeType: string }> {
-	if (message.role !== "toolResult" || !Array.isArray(message.content)) return [];
-	return message.content.flatMap((block) => block.type === "image" ? [{ data: block.data, mimeType: block.mimeType }] : []);
-}
 
 // Pi reads usage.totalTokens (else input + output + cache) of the latest
 // assistant message as the CURRENT context size, and input/cacheRead as that
@@ -394,7 +380,12 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 				const results = context.messages.filter((message): message is Extract<Message, { role: "toolResult" }> =>
 					message.role === "toolResult" && deps.roundTrips.pendingIds.includes(message.toolCallId),
 				);
-				for (const result of results) deps.roundTrips.resolve(result.toolCallId, contentText(result.content), result.isError, resultImages(result));
+				for (let i = 0; i < results.length; i++) {
+					const result = results[i];
+					const trailing = i === results.length - 1 ? context.messages.slice(context.messages.lastIndexOf(result) + 1) : [];
+					const payload = formatToolResult(result, trailing);
+					deps.roundTrips.resolve(result.toolCallId, payload.text, result.isError, payload.images);
+				}
 				const active = results.length > 0 ? deps.driver.reentry() : null;
 				if (active) {
 					await consumeTurn(stream, blocks, active, model, options, onCompleted, deps.meter);

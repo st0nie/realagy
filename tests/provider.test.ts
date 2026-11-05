@@ -215,3 +215,75 @@ test("image tool results go back as MCP image blocks on the existing ACP handle"
 		assert.equal(close.mock.calls.length, 0);
 	} finally { roundTrips.failAll("test done"); }
 });
+
+test("steering messages queued during a tool call ride the MCP tool result and preserve warm sessions", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const roundTrips = new ToolRoundTrips(driver);
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const sessions = {};
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+	const image = { type: "image" as const, data: "c3RlZXI=", mimeType: "image/png" };
+	try {
+		const turnStart = [system(), user("Update docs")];
+		const step1 = collect(stream(model, context(turnStart)));
+		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+		const parked1 = roundTrips.onToolCall("call-1", "read", { path: "README.md" }, new AbortController().signal);
+		const step1Done = (await step1).find((event) => event.type === "done");
+		assert.equal(step1Done?.type, "done");
+		if (step1Done?.type !== "done") return;
+
+		// User sends two steering messages (second with an image) while call-1 runs.
+		const result1: Message = { role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "# Old README" }], isError: false, timestamp: 2 };
+		const steer1 = user("put docs in docs/xxx");
+		const steer2: Message = { role: "user", content: [{ type: "text", text: "not a huge README.md" }, image], timestamp: 3 };
+		const afterSteer = [...turnStart, step1Done.message, result1, steer1, steer2];
+
+		const step2 = collect(stream(model, context(afterSteer)));
+		const reply1 = await parked1;
+		assert.equal(reply1.isError, false);
+		assert.deepEqual(reply1.content, [
+			{
+				type: "text",
+				text: [
+					"# Old README",
+					"",
+					"<pi-steering>",
+					"The user sent a steering message while this tool was running. Address it immediately:",
+					"<user>\nput docs in docs/xxx\n</user>",
+					"",
+					"<user>\nnot a huge README.md\n[Attached image 1]\n</user>",
+					"</pi-steering>",
+				].join("\n"),
+			},
+			{ type: "image", data: "c3RlZXI=", mimeType: "image/png" },
+		]);
+
+		// A subsequent tool call in the same turn must not re-send earlier steering.
+		const parked2 = roundTrips.onToolCall("call-2", "bash", { command: "cargo test" }, new AbortController().signal);
+		const step2Done = (await step2).find((event) => event.type === "done");
+		assert.equal(step2Done?.type, "done");
+		if (step2Done?.type !== "done") return;
+
+		const handle = driver.activeHandle as FakeHandle;
+		handle.pushExternal({ type: "text", delta: "all done" });
+		handle.complete({ status: "OK", response: "all done", finished: true, aborted: false, conversationId: "acp-warm" });
+		const result2: Message = { role: "toolResult", toolCallId: "call-2", toolName: "bash", content: [{ type: "text", text: "9 passed" }], isError: false, timestamp: 4 };
+		const afterCall2 = [...afterSteer, step2Done.message, result2];
+		const step3Done = (await collect(stream(model, context(afterCall2)))).find((event) => event.type === "done");
+		assert.deepEqual(await parked2, { content: [{ type: "text", text: "9 passed" }], isError: false });
+		assert.equal(step3Done?.type, "done");
+		if (step3Done?.type !== "done") return;
+
+		// Next user turn reuses the warm session cleanly with only the new user prompt.
+		driver.autoFinish = true;
+		driver.script = [{ type: "text", delta: "no change needed" }];
+		await collect(stream(model, context([...afterCall2, step3Done.message, user("do I need to change compose?")])));
+		assert.equal(driver.requests.length, 2);
+		assert.equal(driver.requests[1].conversationId, "acp-warm");
+		assert.equal(driver.requests[1].prompt, "do I need to change compose?");
+		assert.equal(driver.requests[1].contextBlock, undefined);
+	} finally {
+		roundTrips.failAll("test done");
+	}
+});

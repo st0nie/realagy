@@ -21,7 +21,7 @@ A pi tool call follows this path:
 1. agy calls a pi tool over MCP. The request is parked.
 2. realagy emits a genuine pi `toolCall` and ends the assistant message with `toolUse`.
 3. Pi runs the tool under its normal permission policy and hooks.
-4. Pi's `toolResult` answers the parked MCP request, and the same ACP turn continues.
+4. Pi's `toolResult` answers the parked MCP request — appending any user steering messages and images queued while the tool ran as a `<pi-steering>` block — and the same ACP turn continues.
 
 After 20 seconds, a slow tool returns a `STILL RUNNING` handle that the model resolves through `bridge_poll_result`. This avoids upstream MCP timeouts.
 
