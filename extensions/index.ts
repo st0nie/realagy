@@ -16,14 +16,10 @@ import { createStreamSimple, POLL_TOOL_NAME, ToolRoundTrips } from "../src/provi
 
 import { normalizeSchema } from "../src/schema.js";
 
-/** Plan quota changes slowly; `agy --print /usage` takes ~10 s. */
-const QUOTA_REFRESH_MS = 2 * 60_000;
-
 export default async function (pi: ExtensionAPI): Promise<void> {
 	const entries: AgyModelEntry[] = [...FALLBACK_MODELS];
 	let bin = resolveAcpBinary("");
 	let bridge: McpServerHandle | null = null;
-	let ui: ExtensionUIContext | null = null;
 	let stopped = false;
 
 	const driver = new AcpDriver({
@@ -73,34 +69,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	const sessions: AcpSessions = {};
 	const meter = new UsageMeter();
-	let usageShown = false;
-	let modelId: string | undefined;
-	const updateUsageStatus = (): void => {
-		const status = meter.status(modelId);
-		if (stopped || !ui || (!status && !usageShown)) return;
-		ui.setStatus("realagy-usage", status);
-		usageShown = status !== undefined;
-	};
-	meter.onChange = updateUsageStatus;
-	const selectModel = (model: { provider: string; id: string } | undefined): void => {
-		modelId = model?.provider === "antigravity" ? model.id : undefined;
-		updateUsageStatus();
-	};
 	let ready = false;
-	let quotaAt = 0;
-	let quotaRun: Promise<void> | null = null;
-	let quotaError: string | undefined;
-	const refreshQuota = (force = false): Promise<void> => {
-		if (!ready || stopped) return Promise.resolve();
-		if (quotaRun || (!force && Date.now() - quotaAt < QUOTA_REFRESH_MS)) return quotaRun ?? Promise.resolve();
-		quotaAt = Date.now();
-		quotaRun = fetchCliUsage(bin)
-			.then((groups) => { quotaError = undefined; if (!stopped) meter.setQuota(groups); })
-			// Quota is decoration; turns surface real failures. /agy usage shows it.
-			.catch((error: unknown) => { quotaError = error instanceof Error ? error.message : String(error); })
-			.finally(() => { quotaRun = null; });
-		return quotaRun;
-	};
 	const streamSimple = createStreamSimple({ entries, driver, roundTrips, sessions, meter });
 	const registerModels = () => {
 		const models = entries.map((entry) => toPiModel(entry));
@@ -134,7 +103,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		}
 		bin = status.bin;
 		ready = true;
-		void refreshQuota(true);
 		try {
 			const discovered = entriesFromAcpModels(await driver.listModels(process.cwd()));
 			if (stopped) return;
@@ -149,31 +117,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	};
 
 	pi.on("session_start", (_event, ctx) => {
-		ui = ctx.hasUI ? ctx.ui : null;
-		selectModel(ctx.model);
 		refresh ??= refreshCatalog(ctx).catch((error: unknown) => {
 			if (!stopped && ctx.hasUI) ctx.ui.notify(`Antigravity setup failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
 		}).finally(() => { refresh = null; });
 	});
 	pi.on("session_shutdown", () => {
 		stopped = true;
-		if (usageShown) ui?.setStatus("realagy-usage", undefined);
-		ui = null;
-		meter.onChange = undefined;
 		sessions.warm = undefined;
 		roundTrips.failAll("pi session shut down");
 		roundTrips.clearImages();
 		void driver.close("shutdown");
 		if (bridge) void bridge.close();
 		bridge = null;
-	});
-
-	pi.on("model_select", (event) => {
-		selectModel(event.model);
-		if (modelId) void refreshQuota();
-	});
-	pi.on("agent_end", () => {
-		if (modelId) void refreshQuota();
 	});
 
 	pi.registerCommand("agy", {
@@ -193,9 +148,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				ctx.ui.notify(status.ok ? "Antigravity is still starting; try again shortly." : `Antigravity: ${status.error}.\n${status.manual}`, "warning");
 				return;
 			}
-			await refreshQuota(true);
+			// On demand only: `agy --print /usage` takes ~10 s.
+			let quotaError = "";
+			try {
+				meter.setQuota(await fetchCliUsage(bin));
+			} catch (error) {
+				quotaError = `\n\nQuota unavailable: ${error instanceof Error ? error.message : String(error)}`;
+			}
 			if (stopped) return;
-			ctx.ui.notify(`${meter.report()}${quotaError ? `\n\nQuota unavailable: ${quotaError}` : ""}`, "info");
+			ctx.ui.notify(`${meter.report()}${quotaError}`, "info");
 		},
 	});
 }

@@ -44,4 +44,4 @@ REALAGY_TRACE_USAGE=/tmp/trace.jsonl pi      # turn plans, usage_update, step to
 - An aborted `npm install` leaves a corrupt `node_modules`, and `tsc`/`vitest` then die with "Bus error". Delete `node_modules` and run `bun install`.
 - `node:sqlite` prints an ExperimentalWarning on Node 22. `src/acp/step-usage.ts` silences it for that one `require`, because it would corrupt pi's TUI.
 - The conversation store is agy's internal format. Every read degrades to "no measurement" rather than failing a turn.
-- `agy --print /usage` takes about 10 s. Never await it on a turn's path.
+- `agy --print /usage` takes about 10 s. Run it only from `/agy usage`, never on a turn's path or in the background.

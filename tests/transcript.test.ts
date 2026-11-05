@@ -109,7 +109,7 @@ test("provider reports exact step usage, reuses the ACP session, and feeds the m
 	assert.equal(done.message.usage.input, 1000);
 	assert.equal(calculateContextTokens(done.message.usage), 10_050, "measured call wins over usage_update");
 	assert.equal(sessions.warm?.sessionId, "acp-1");
-	assert.equal(meter.status(undefined), "agy cache 90% (session 90%)");
+	assert.match(meter.report(), /Cache hits: 90% latest · 90% this session/);
 
 	await run(streamSimple(model, ctx([...first, done.message, user("again")]), { cwd: "/w" } as never));
 	assert.equal(driver.requests[1].conversationId, "acp-1");
@@ -131,6 +131,6 @@ test("provider leaves unmeasured messages to pi and turns quota notices into err
 	const sessions: AcpSessions = {};
 	const failed = await run(createStreamSimple({ entries: [...FALLBACK_MODELS], driver: exhaustedDriver, roundTrips: new ToolRoundTrips(exhaustedDriver), meter, sessions })(model, ctx([system(), user("hello")])));
 	assert.equal(failed.type, "error");
-	assert.match(meter.status(undefined)!, /quota exhausted/);
+	assert.match(meter.report(), /Quota exhausted/);
 	assert.equal(sessions.warm, undefined);
 });

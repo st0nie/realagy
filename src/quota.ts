@@ -1,4 +1,4 @@
-// Footer status: cache-hit rate from exact per-model-call usage (step_usage)
+// `/agy usage`: cache-hit rate from exact per-model-call usage (step_usage)
 // and plan quota from `agy --print /usage`, plus agy's fixed "Usage Limit
 // Reached" notice, which arrives as ordinary model text.
 
@@ -90,16 +90,6 @@ export function fetchCliUsage(bin: string, timeoutMs = 60_000): Promise<UsageGro
 	});
 }
 
-/** The quota group a model draws from: agy names them "Gemini Models",
- *  "Claude and GPT models", and dedicated groups such as "Gemini 4 Argon". */
-export function groupForModel(groups: UsageGroup[], modelId: string): UsageGroup | undefined {
-	const id = modelId.toLowerCase().replace(/[-_.]/g, " ");
-	const dedicated = groups.find((group) => id.includes(group.name.toLowerCase().replace(/[-_.]/g, " ")));
-	if (dedicated) return dedicated;
-	const family = /claude|gpt/.test(id) ? /claude|gpt/ : /gemini/;
-	return groups.find((group) => family.test(group.name.toLowerCase()));
-}
-
 function percent(fraction: number): string {
 	return `${Math.round(Math.min(1, Math.max(0, fraction)) * 100)}%`;
 }
@@ -111,7 +101,7 @@ export function formatReset(iso: string, now = new Date()): string | undefined {
 	return reset.toDateString() === now.toDateString() ? time : `${reset.getDate()} ${MONTHS[reset.getMonth()]} ${time}`;
 }
 
-/** Per-extension accumulator behind the footer status. */
+/** Per-extension accumulator behind `/agy usage`. */
 export class UsageMeter {
 	prompt = 0;
 	cacheRead = 0;
@@ -119,7 +109,6 @@ export class UsageMeter {
 	lastHitRate: number | undefined;
 	quota: UsageGroup[] | undefined;
 	exhausted: { resetAt?: string } | undefined;
-	onChange: (() => void) | undefined;
 
 	addSteps(usage: AgyStepUsage): void {
 		const prompt = usage.input + usage.cacheRead + usage.cacheWrite;
@@ -128,35 +117,14 @@ export class UsageMeter {
 		this.cacheRead += usage.cacheRead;
 		this.lastHitRate = usage.cacheRead / prompt;
 		this.exhausted = undefined;
-		this.onChange?.();
 	}
 
 	setQuota(groups: UsageGroup[]): void {
 		this.quota = groups;
-		this.onChange?.();
 	}
 
 	setExhausted(info: { resetAt?: string }): void {
 		this.exhausted = info;
-		this.onChange?.();
-	}
-
-	/** e.g. "agy cache 92% (session 78%) · quota 5h 99% · weekly 71%". */
-	status(modelId: string | undefined, now = new Date()): string | undefined {
-		const parts: string[] = [];
-		if (this.prompt > 0) parts.push(`agy cache ${percent(this.lastHitRate ?? 0)} (session ${percent(this.cacheRead / this.prompt)})`);
-		if (this.exhausted) {
-			const reset = this.exhausted.resetAt ? formatReset(this.exhausted.resetAt, now) : undefined;
-			parts.push(`quota exhausted${reset ? ` · resets ${reset}` : ""}`);
-		} else if (this.quota && modelId) {
-			const group = groupForModel(this.quota, modelId);
-			const buckets = group?.buckets.map((bucket) => {
-				const reset = bucket.remainingFraction < 1 && bucket.resetTime ? formatReset(bucket.resetTime, now) : undefined;
-				return `${bucket.window} ${percent(bucket.remainingFraction)}${reset ? ` (${reset})` : ""}`;
-			});
-			if (buckets?.length) parts.push(`quota ${buckets.join(" · ")}`);
-		}
-		return parts.length > 0 ? parts.join(" · ") : undefined;
 	}
 
 	/** Multi-line report for `/agy usage`. */

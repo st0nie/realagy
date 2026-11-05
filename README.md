@@ -35,7 +35,7 @@ The catalog comes live from agy and depends on the account.
 | --- | --- |
 | `/agy usage` | Cache-hit rate for this session plus every quota group's 5-hour and weekly remaining share and reset times (from `agy --print /usage`) |
 
-The footer status shows the same numbers for the selected model's quota group without running a command. There is no settings panel, engine switch, delegation tool, global MCP registration, or config file.
+Nothing runs in the background: quota is fetched only when you run `/agy usage`. There is no footer status, settings panel, engine switch, delegation tool, global MCP registration, or config file.
 
 | Environment | Effect |
 | --- | --- |
@@ -47,7 +47,7 @@ The footer status shows the same numbers for the selected model's quota group wi
 
 | Path | What it holds |
 | --- | --- |
-| `extensions/index.ts` | Composition root: pi MCP bridge, `antigravity/*` models, agy discovery, footer status, `/agy usage` |
+| `extensions/index.ts` | Composition root: pi MCP bridge, `antigravity/*` models, agy discovery, `/agy usage` |
 | `src/provider.ts` | pi assistant event stream, MCP → `toolUse` → `toolResult` round-trips, usage mapping |
 | `src/transcript.ts` | Transcript serialization, fingerprints, warm-session turn planning |
 | `src/models.ts` | ACP model catalog parsing, effort grouping, family limits, offline fallback catalog |

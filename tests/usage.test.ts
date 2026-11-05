@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { test } from "vitest";
 import { AcpDriver } from "../src/acp/driver.js";
 import { lastStepIdx, readStepTokens, summarizeSteps, tokensFromMetadata } from "../src/acp/step-usage.js";
-import { groupForModel, parseCliUsage, quotaExhaustion, UsageMeter } from "../src/quota.js";
+import { parseCliUsage, quotaExhaustion, UsageMeter } from "../src/quota.js";
 import type { DriverActivity, TurnHandle } from "../src/driver-types.js";
 
 const varint = (n: number): number[] => {
@@ -114,10 +114,6 @@ const CLI_USAGE = JSON.stringify({
 test("quota helpers parse agy /usage output and exhaustion notices", () => {
 	const groups = parseCliUsage(CLI_USAGE);
 	assert.deepEqual(groups.map((group) => group.name), ["Gemini Models", "Claude and GPT models", "Gemini 4 Argon"]);
-	assert.equal(groupForModel(groups, "gemini-3-8-flash")?.name, "Gemini Models");
-	assert.equal(groupForModel(groups, "claude-sonnet-5-5")?.name, "Claude and GPT models");
-	assert.equal(groupForModel(groups, "gpt-oss-120b")?.name, "Claude and GPT models");
-	assert.equal(groupForModel(groups, "gemini-4-argon")?.name, "Gemini 4 Argon");
 	assert.throws(() => parseCliUsage("nope"));
 	assert.throws(() => parseCliUsage(JSON.stringify({ status: "ERROR", error: "not signed in" })), /not signed in/);
 	const now = Date.UTC(2026, 10, 5, 0, 0);
@@ -128,21 +124,16 @@ test("quota helpers parse agy /usage output and exhaustion notices", () => {
 	assert.equal(quotaExhaustion("All good"), undefined);
 });
 
-test("usage meter summarizes cache hits and the current model's quota", () => {
+test("usage meter reports cache hits and every quota group", () => {
 	const meter = new UsageMeter();
-	let changes = 0;
-	meter.onChange = () => { changes += 1; };
-	assert.equal(meter.status("claude-sonnet-5-5"), undefined);
+	assert.match(meter.report(), /no measured Antigravity calls/);
 	meter.addSteps({ input: 1000, output: 10, cacheRead: 0, cacheWrite: 0, contextTokens: 1010, steps: 1 });
 	meter.addSteps({ input: 100, output: 10, cacheRead: 900, cacheWrite: 0, contextTokens: 1010, steps: 1 });
-	assert.equal(meter.status(undefined), "agy cache 90% (session 45%)");
 	meter.setQuota(parseCliUsage(CLI_USAGE));
-	assert.equal(meter.status("claude-sonnet-5-5"), "agy cache 90% (session 45%) · quota weekly 44%");
-	assert.match(meter.status("gemini-3-8-flash")!, /quota weekly 71% \(.+\) · 5h 100%$/);
-	meter.setExhausted({});
-	assert.match(meter.status("gemini-3-8-flash")!, /quota exhausted/);
-	assert.equal(changes, 4);
 	const report = meter.report(new Date(Date.UTC(2026, 10, 5)));
 	assert.match(report, /Cache hits: 90% latest · 45% this session/);
 	assert.match(report, /Claude and GPT models\n  weekly: 44% left/);
+	assert.match(report, /Gemini 4 Argon\n  weekly: 99% left/);
+	meter.setExhausted({});
+	assert.match(meter.report(), /Quota exhausted/);
 });

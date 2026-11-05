@@ -5,7 +5,7 @@ const mocks = vi.hoisted(() => ({
 }));
 vi.mock("../src/acp/setup.js", () => ({ ensureAgyReady: mocks.ensure }));
 vi.mock("../src/acp/connection.js", () => ({ resolveAcpBinary: () => "agy" }));
-vi.mock("../src/quota.js", () => ({ fetchCliUsage: vi.fn(async () => []), UsageMeter: class { onChange: unknown; status() { return undefined; } setQuota() {} report() { return "REPORT"; } } }));
+vi.mock("../src/quota.js", () => ({ fetchCliUsage: vi.fn(async () => []), UsageMeter: class { setQuota() {} report() { return "REPORT"; } } }));
 vi.mock("../src/acp/driver.js", () => ({ AcpDriver: class {
 	listModels = mocks.listModels;
 	close = mocks.close;
