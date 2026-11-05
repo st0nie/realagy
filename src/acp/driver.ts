@@ -27,9 +27,10 @@ import { AcpConnection, resolveAcpBinary, type AcpMcpServer, type AcpPermissionR
 import type { AcpPermissionHandler } from "./connection.js";
 import { mapStopReason, mapUpdate, TextAccumulator, type AcpEditDiff } from "./events.js";
 import { estimateTokens, synthesizeUsage } from "./usage-estimate.js";
-import { conversationDbPath, lastStepIdx, readStepTokens, summarizeSteps } from "./step-usage.js";
+import { conversationDbPath, lastStepIdx, readStepTokens, siblingUsage, summarizeSteps, type StepTokens, type StepUsage } from "./step-usage.js";
 import { traceUsage } from "../usage-trace.js";
 import type {
+	AgyStepUsage,
 	AgyUsage,
 	DriverActivity,
 	DriverSnapshot,
@@ -83,6 +84,8 @@ interface ActiveTurn {
 	/** Conversation store of this session and the last step already reported. */
 	dbPath?: string;
 	stepCursor: number;
+	/** Latest measured model call, for sibling tool-call messages. */
+	lastStep?: StepTokens;
 	stepUsageSeen: boolean;
 	sessionId: string;
 	buffer: DriverActivity[];
@@ -193,9 +196,12 @@ export class AcpDriver implements TurnDriver {
 		const t = this.#active;
 		if (!t || t.closed) return;
 		if (activity.type === "bridge_call") {
+			traceUsage("bridge-call", { sessionId: t.sessionId, callId: activity.callId, name: activity.name, parks: t.parks });
 			// The model call that requested this tool has finished: report its
 			// exact usage on the pi message that this bridge call completes.
-			this.#collectStepUsage(t);
+			// A parallel sibling call of the same model call finds no new step
+			// and gets a ratio-only placeholder instead of zero usage.
+			if (!this.#collectStepUsage(t) && t.lastStep) this.#emit(t, { type: "step_usage", usage: stripIdx(siblingUsage(t.lastStep)) });
 			t.parks += 1;
 			this.#clearIdle(t);
 			this.#pauseOverall(t);
@@ -856,16 +862,17 @@ export class AcpDriver implements TurnDriver {
 
 	/** Emit exact usage for model calls the server persisted since the last
 	 *  report. Missing or unreadable stores silently report nothing. */
-	#collectStepUsage(turn: ActiveTurn): void {
-		if (!turn.dbPath || turn.closed) return;
+	#collectStepUsage(turn: ActiveTurn): boolean {
+		if (!turn.dbPath || turn.closed) return false;
 		const steps = readStepTokens(turn.dbPath, turn.stepCursor);
 		const usage = steps ? summarizeSteps(steps) : undefined;
-		if (!usage) return;
+		if (!usage) return false;
 		turn.stepCursor = usage.lastIdx;
+		turn.lastStep = steps!.at(-1);
 		turn.stepUsageSeen = true;
 		traceUsage("step-usage", { sessionId: turn.sessionId, steps: steps!.map(({ idx, input, output, cacheRead, cacheWrite }) => ({ idx, input, output, cacheRead, cacheWrite })), contextTokens: usage.contextTokens, usageUpdate: turn.contextUsage?.used });
-		const { lastIdx: _lastIdx, ...activity } = usage;
-		this.#emit(turn, { type: "step_usage", usage: activity });
+		this.#emit(turn, { type: "step_usage", usage: stripIdx(usage) });
+		return true;
 	}
 
 	/** Update Pi's partial usage before the next visible text/thought delta.
@@ -964,3 +971,7 @@ function describe(err: unknown): string {
 
 // re-exported for the extension's doctor (server version display)
 export type { AcpMcpServer } from "./connection.js";
+
+function stripIdx({ lastIdx: _lastIdx, ...usage }: StepUsage): AgyStepUsage {
+	return usage;
+}

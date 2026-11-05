@@ -5,7 +5,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "vitest";
 import { AcpDriver } from "../src/acp/driver.js";
-import { lastStepIdx, readStepTokens, summarizeSteps, tokensFromMetadata } from "../src/acp/step-usage.js";
+import { lastStepIdx, readStepTokens, siblingUsage, summarizeSteps, tokensFromMetadata } from "../src/acp/step-usage.js";
 import { parseCliUsage, quotaExhaustion, UsageMeter } from "../src/quota.js";
 import type { DriverActivity, TurnHandle } from "../src/driver-types.js";
 
@@ -26,6 +26,14 @@ const metadata = (input: number, output: number, cacheRead: number) =>
 function tmp(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "realagy-usage-test-"));
 }
+
+test("sibling tool calls keep the model call's cache ratio and context, not its tokens", () => {
+	const usage = siblingUsage({ idx: 3, input: 2399, output: 99, cacheRead: 25612, cacheWrite: 0 });
+	assert.deepEqual(usage, { input: 9, output: 0, cacheRead: 91, cacheWrite: 0, contextTokens: 28110, steps: 0, lastIdx: 3 });
+	const meter = new UsageMeter();
+	meter.addSteps({ ...usage, steps: 0 });
+	assert.match(meter.report(), /no measured Antigravity calls/, "placeholders never count as measured calls");
+});
 
 test("step usage reads agent-step token stats after a cursor", () => {
 	const db = path.join(tmp(), "s.db");

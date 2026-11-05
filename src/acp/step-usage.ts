@@ -182,3 +182,28 @@ export function summarizeSteps(steps: StepTokens[]): StepUsage | undefined {
 		lastIdx: last.idx,
 	};
 }
+
+/** Prompt tokens a sibling placeholder reports. Small enough to leave the
+ *  session's token totals effectively exact. */
+export const SIBLING_PROMPT_TOKENS = 100;
+
+/** Usage for a pi message that shares its model call with an earlier one
+ *  (parallel tool calls: one call, several pi toolUse messages). The call's
+ *  tokens were already reported, so this carries only the call's cache-hit
+ *  ratio, scaled to SIBLING_PROMPT_TOKENS, and its measured context size, so
+ *  pi's per-message cache-hit rate and context bar stay steady. */
+export function siblingUsage(last: StepTokens): StepUsage {
+	const prompt = last.input + last.cacheRead + last.cacheWrite;
+	const scale = prompt > 0 ? SIBLING_PROMPT_TOKENS / prompt : 0;
+	const cacheRead = Math.round(last.cacheRead * scale);
+	const cacheWrite = Math.round(last.cacheWrite * scale);
+	return {
+		input: prompt > 0 ? Math.max(0, SIBLING_PROMPT_TOKENS - cacheRead - cacheWrite) : 0,
+		output: 0,
+		cacheRead,
+		cacheWrite,
+		contextTokens: prompt + last.output,
+		steps: 0,
+		lastIdx: last.idx,
+	};
+}

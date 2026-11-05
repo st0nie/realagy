@@ -112,7 +112,8 @@ export class UsageMeter {
 
 	addSteps(usage: AgyStepUsage): void {
 		const prompt = usage.input + usage.cacheRead + usage.cacheWrite;
-		if (prompt <= 0) return;
+		// steps === 0: sibling placeholder of an already counted model call.
+		if (prompt <= 0 || usage.steps === 0) return;
 		this.prompt += prompt;
 		this.cacheRead += usage.cacheRead;
 		this.lastHitRate = usage.cacheRead / prompt;

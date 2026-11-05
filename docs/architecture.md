@@ -46,6 +46,7 @@ If agy can no longer load a remembered session, the driver opens a new session a
 | --- | --- |
 | `input`, `cacheRead`, `output` | Sum over the model calls the pi message covers, so pi's footer shows real `↑ R ↓` and `CH` |
 | `totalTokens` | Context held by the latest model call. Pi's footer, `ctx.getContextUsage()`, and compaction use it as current occupancy |
+| parallel tool calls | One model call can request several tools, and each becomes its own pi `toolUse` message. The first carries the call's usage. Each sibling carries a 100-token placeholder split by the same cache ratio, plus the same context size, so pi's per-message `CH` and context bar don't drop out. `/agy usage` ignores placeholders |
 | fallback | ACP `usage_update.used` for occupancy when no step was measured |
 | none | Zero usage, so pi estimates the message itself. realagy never puts regex estimates or turn-cumulative totals into `totalTokens` |
 
