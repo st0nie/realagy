@@ -8,9 +8,10 @@ import path from "node:path";
 import { ensureQueuedMessagesInFile } from "../queued-messages.js";
 
 export const MANUAL_SETUP = [
-	"Install the Antigravity CLI and sign in once, then restart pi:",
+	"Install the Antigravity CLI, then sign in once in a terminal:",
 	"  curl -fsSL https://antigravity.google/cli/install.sh | bash",
 	"  agy",
+	"Docs: https://antigravity.google/docs/cli/acp/",
 	"Set AGY_BIN if agy is not on PATH or in ~/.local/bin.",
 ].join("\n");
 

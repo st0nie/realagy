@@ -6,11 +6,11 @@ realagy uses ACP only as the model transport. `agy acp` generates text, reasonin
 
 The extension starts one long-lived `agy acp` process per pi session (`src/acp/driver.ts`). It shares the Antigravity CLI's sign-in, settings, and data dir (`~/.gemini/antigravity-cli`). On startup realagy:
 
-1. finds `agy` (`AGY_BIN` > `PATH` > `~/.local/bin/agy`). If none is found, it shows install instructions and stops there;
+1. finds `agy` (`AGY_BIN` > `PATH` > `~/.local/bin/agy`). If none is found, it points to `/agy setup` and stops there;
 2. sets `queuedMessages` to `send-immediately` in agy's `settings.json` when it is unset, so pi steering interrupts the agent the way pi expects;
 3. reads the live model catalog from `session/new` and registers it as `antigravity/*`. Effort tiers (`-low`, `-medium`, `-high`) collapse into one pi model with thinking levels (`src/models.ts`).
 
-agy offers Claude/GPT only to clients it recognizes, so `initialize` sends `clientInfo.name = "zed"`.
+The provider is registered with ambient-only auth: there is no `login` method, pi never stores a key, and the provider counts as configured whenever agy is present. agy offers Claude/GPT only to clients it recognizes, so `initialize` sends `clientInfo.name = "zed"`.
 
 ## Tools
 

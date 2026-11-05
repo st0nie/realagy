@@ -32,7 +32,7 @@ REALAGY_TRACE_USAGE=/tmp/trace.jsonl pi      # turn plans, usage_update, step to
 
 ## Conventions
 
-- Keep the extension minimal: one command (`/agy usage`), no installers, sign-in flows, config panel, fallback engine, delegation framework, global agy/MCP mutation, or Antigravity-native tools beyond `view_file`.
+- Keep the extension minimal: one command (`/agy setup`, `/agy usage`), no installers, sign-in flows, config panel, fallback engine, delegation framework, global agy/MCP mutation, or Antigravity-native tools beyond `view_file`.
 - Pi owns tools, permissions, transcript, rendering, and diffs. ACP owns only generation.
 - Small functional modules, explicit types, early returns.
 - `enabledTools: ["view_file"]` disables Antigravity built-ins while keeping MCP. `eagerMcpServers: ["pi-bridge"]` avoids agy's lazy `call_mcp_tool` loop.

@@ -13,11 +13,11 @@ Install the [Antigravity CLI](https://antigravity.google/docs/cli/acp/), sign in
 
 ```sh
 curl -fsSL https://antigravity.google/cli/install.sh | bash
-agy                                   # sign in
+agy                                   # sign in (or: agy acp --login)
 pi install git:github.com/st0nie/realagy
 ```
 
-realagy looks for `agy` in `AGY_BIN`, then on `PATH`, then at `~/.local/bin/agy`. It never installs agy or signs you in. When agy is missing, pi shows these instructions at startup. agy updates itself.
+realagy looks for `agy` in `AGY_BIN`, then on `PATH`, then at `~/.local/bin/agy`. It never installs agy or handles credentials, so pi's `/login` has nothing to configure for `antigravity`. If agy is missing or signed out, pi says so at startup; `/agy setup` checks again and shows the install or sign-in steps. agy updates itself.
 
 Choose a model in pi's `/model` picker:
 
@@ -33,6 +33,7 @@ The catalog comes live from agy and depends on the account.
 
 | Command | What it does |
 | --- | --- |
+| `/agy setup` | Checks agy: shows install steps when it is missing, sign-in steps when it cannot start a session, and reloads the model catalog when it is ready |
 | `/agy usage` | Cache-hit rate for this session plus every quota group's 5-hour and weekly remaining share and reset times (from `agy --print /usage`) |
 
 Nothing runs in the background: quota is fetched only when you run `/agy usage`. There is no footer status, settings panel, engine switch, delegation tool, global MCP registration, or config file.
@@ -47,7 +48,7 @@ Nothing runs in the background: quota is fetched only when you run `/agy usage`.
 
 | Path | What it holds |
 | --- | --- |
-| `extensions/index.ts` | Composition root: pi MCP bridge, `antigravity/*` models, agy discovery, `/agy usage` |
+| `extensions/index.ts` | Composition root: pi MCP bridge, `antigravity/*` models, agy discovery, `/agy setup`, `/agy usage` |
 | `src/provider.ts` | pi assistant event stream, MCP → `toolUse` → `toolResult` round-trips, usage mapping |
 | `src/transcript.ts` | Transcript serialization, fingerprints, warm-session turn planning |
 | `src/models.ts` | ACP model catalog parsing, effort grouping, family limits, offline fallback catalog |
