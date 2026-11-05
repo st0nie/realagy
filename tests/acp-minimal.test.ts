@@ -17,13 +17,12 @@ function requests(capture: string): Array<{ method: string; params: Record<strin
 	return fs.readFileSync(capture, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
-test("ACP initialize enables third-party models and session metadata disables native tools", async () => {
+test("ACP initialize enables third-party models and sessions expose pi tools eagerly", async () => {
 	const { capture, binArgs } = fixture();
 	const connection = new AcpConnection({
 		bin: process.execPath,
 		binArgs,
 		cwd: process.cwd(),
-		enabledTools: () => [],
 		mcpServers: () => [{ name: "pi-bridge", type: "http", url: "http://127.0.0.1:1/mcp", headers: [] }],
 		log: () => {},
 		onUpdate: () => {},
@@ -40,7 +39,7 @@ test("ACP initialize enables third-party models and session metadata disables na
 		assert.equal((init.params.clientInfo as { name: string }).name, "zed");
 		const created = wire.find((request) => request.method === "session/new")!;
 		const meta = (created.params._meta as { antigravity: Record<string, unknown> }).antigravity;
-		assert.deepEqual(meta.enabledTools, []);
+		assert.equal(meta.enabledTools, undefined);
 		assert.deepEqual(meta.eagerMcpServers, ["pi-bridge"]);
 		assert.equal((created.params.mcpServers as Array<{ name: string }>)[0].name, "pi-bridge");
 		const prompt = wire.find((request) => request.method === "session/prompt")!;
@@ -56,7 +55,7 @@ test("ACP initialize enables third-party models and session metadata disables na
 
 test("AcpDriver lists all families and sends GPT's full medium model slug", async () => {
 	const { capture, binArgs } = fixture();
-	const driver = new AcpDriver({ bin: process.execPath, binArgs, enabledTools: () => [] });
+	const driver = new AcpDriver({ bin: process.execPath, binArgs });
 	try {
 		const models = await driver.listModels(process.cwd());
 		assert.equal(models.length, 3);

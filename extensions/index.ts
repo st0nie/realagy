@@ -32,7 +32,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	const driver = new AcpDriver({
 		bin: () => bin,
-		enabledTools: () => ["view_file"], // native viewer delivers pixels that MCP offloads
 		mcpServers: () => bridge ? [{
 			name: "pi-bridge",
 			type: "http",
@@ -134,7 +133,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		stopped = true;
 		sessions.warm = undefined;
 		roundTrips.failAll("pi session shut down");
-		roundTrips.clearImages();
 		void driver.close("shutdown");
 		if (bridge) void bridge.close();
 		bridge = null;

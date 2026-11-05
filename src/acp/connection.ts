@@ -64,11 +64,6 @@ export interface AcpConnectionOptions {
 	/** mcpServers entries for session/new AND session/load (run 6: load takes
 	 *  the same param). Evaluated lazily per call. */
 	mcpServers?: () => AcpMcpServer[];
-	/** Optional built-in allowlist. [] disables every Antigravity native tool
-	 * while leaving MCP tools available (official tool_filter.py contract). */
-	enabledTools?: () => string[];
-	/** Antigravity built-in tools disabled on session/new and session/load. */
-	disabledTools?: () => string[];
 	/** Permission policy for session/request_permission, evaluated per request:
 	 *  "auto" selects the first allow option; "deny" consults the human
 	 *  handler (parking) or fail-closes to the first reject option. Absent =
@@ -518,29 +513,11 @@ export class AcpConnection {
 		}
 	}
 
-	/** Native tools stay off: pi's MCP tools are the only tool surface. */
+	/** agy keeps its native tools alongside pi's (agy acp ignores tool
+	 *  allowlists). Expose pi tools directly, not through agy's lazy
+	 *  call_mcp_tool / read_resource helper loop. */
 	#antigravityMeta(): Record<string, unknown> {
-		let enabled: string[] | undefined;
-		let disabled: string[] = [];
-		try {
-			enabled = this.#opts.enabledTools?.();
-			disabled = this.#opts.disabledTools?.() ?? [];
-		} catch {
-			enabled = [];
-			disabled = [];
-		}
-		if (enabled === undefined && disabled.length === 0) return {};
-		return {
-			_meta: {
-				antigravity: {
-					// Expose pi tools directly, not through agy's lazy call_mcp_tool /
-					// read_resource helper loop. The operations still ride MCP.
-					eagerMcpServers: ["pi-bridge"],
-					...(enabled !== undefined ? { enabledTools: enabled } : {}),
-					...(disabled.length > 0 ? { disabledTools: disabled } : {}),
-				},
-			},
-		};
+		return { _meta: { antigravity: { eagerMcpServers: ["pi-bridge"] } } };
 	}
 
 	#write(frame: string): void {

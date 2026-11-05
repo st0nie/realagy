@@ -53,10 +53,6 @@ export interface AcpDriverOptions {
 	extraEnv?: Record<string, string>;
 	/** Bridge registration for session/new AND session/load. */
 	mcpServers?: () => AcpMcpServer[];
-	/** [] disables all Antigravity built-ins; MCP tools remain available. */
-	enabledTools?: () => string[];
-	/** Additional Antigravity built-in tools disabled on session/new and load. */
-	disabledTools?: () => string[];
 	/** Client-side usage synthesis. Default "off": regex estimates must not
 	 *  become pi's context count; pi estimates unmeasured messages itself. */
 	usageEstimate?: UsageEstimate | (() => UsageEstimate);
@@ -581,8 +577,6 @@ export class AcpDriver implements TurnDriver {
 			extraEnv: this.#opts.extraEnv,
 			cwd: request.cwd,
 			mcpServers: this.#opts.mcpServers,
-			enabledTools: this.#opts.enabledTools,
-			disabledTools: this.#opts.disabledTools,
 			log: (msg, data) => this.#log(msg, data),
 			// Fail-closed permissions: skipPermissions answers allow; a standing
 			// policy override (approvals.mode allow) may widen that; everything

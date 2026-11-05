@@ -77,7 +77,6 @@ test("AcpDriver reports exact step usage, reuses live sessions, and falls back w
 		binArgs: [path.join(process.cwd(), "tests/helpers/fake-acp-server.mjs"), capture],
 		extraEnv: { FAKE_ACP_DB_DIR: dir },
 		conversationsDir: () => dir,
-		enabledTools: () => [],
 	});
 	const base = { cwd: process.cwd(), model: "gemini-3.8-flash", effort: "medium", mode: "accept-edits", skipPermissions: true };
 	const wire = () => fs.readFileSync(capture, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { method: string; params: Record<string, unknown> });

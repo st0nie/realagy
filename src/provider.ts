@@ -16,7 +16,6 @@ import {
 import type { AgyStepUsage, AgyUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "./driver-types.js";
 import { toAgyEffort, type AgyModelEntry } from "./models.js";
 import type { BridgeResult } from "./mcp-server.js";
-import { ImageResults } from "./image-results.js";
 import { planTurn, warmAfterTurn, type WarmSession } from "./transcript.js";
 import { traceUsage } from "./usage-trace.js";
 import { quotaExhaustion, type UsageMeter } from "./quota.js";
@@ -48,11 +47,24 @@ interface PollResult {
 
 /** MCP calls park into a real pi toolUse. Slow calls early-ack with a poll
  * handle so ACP's MCP request deadline cannot kill a legitimate long pi tool. */
+/** pi's tool result as MCP content. Images ride as ordinary MCP image blocks;
+ *  what agy shows the model is agy's decision (it can also open image files
+ *  itself with its native read_file). */
+function bridgeResult(text: string, isError: boolean, images: Array<{ data: string; mimeType: string }>): BridgeResult {
+	return {
+		content: [
+			{ type: "text", text: text || (images.length > 0 ? "(image result)" : "(no output)") },
+			...images.map((image) => ({ type: "image" as const, data: image.data, mimeType: image.mimeType })),
+		],
+		isError,
+	};
+}
+
 export class ToolRoundTrips {
 	#pending = new Map<string, PendingCall>();
 	#polls = new Map<string, PollResult>();
 
-	constructor(private readonly driver: TurnDriver, private readonly images = new ImageResults()) {}
+	constructor(private readonly driver: TurnDriver) {}
 
 	get pendingIds(): string[] {
 		return [...this.#pending.keys()];
@@ -100,15 +112,12 @@ export class ToolRoundTrips {
 		if (pending.escalated) {
 			this.#polls.set(callId, { name: pending.name, state: "done", text, isError, images, expires: Date.now() + ESCALATED_TTL_MS });
 		} else {
-			pending.resolve(this.images.result(text, isError, images));
+			pending.resolve(bridgeResult(text, isError, images));
 		}
 		this.driver.kickIdle();
 		return true;
 	}
 
-	clearImages(): void {
-		this.images.clear();
-	}
 	failAll(reason: string): void {
 		for (const id of [...this.#pending.keys()]) {
 			if (!this.#pending.get(id)?.escalated) this.#fail(id, reason);
@@ -134,7 +143,7 @@ export class ToolRoundTrips {
 		const result = this.#polls.get(callId);
 		if (!result) return { content: [{ type: "text", text: `Unknown or non-escalated callId: ${callId || "(missing)"}` }], isError: true };
 		if (result.state === "running") return { content: [{ type: "text", text: `STILL RUNNING\nCall ${POLL_TOOL_NAME} again with the same callId.` }] };
-		return this.images.result(result.text ?? "", result.isError ?? false, result.images);
+		return bridgeResult(result.text ?? "", result.isError ?? false, result.images);
 	}
 
 	#prunePolls(): void {
@@ -335,8 +344,7 @@ async function consumeTurn(
 			emitToolUse(stream, blocks, activity);
 			return;
 		}
-		// Native viewer frames need no second pi tool card. Other execution
-		// remains on the pi bridge; view_file exists to deliver image pixels.
+		// agy's native tool frames need no pi tool card: agy runs them itself.
 	}
 	// Occupancy reported during an EARLIER message of this turn is stale here
 	// (tool results were added since), so outcome.contextUsage is not applied.

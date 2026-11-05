@@ -174,7 +174,7 @@ function recordField(v: unknown): Record<string, unknown> {
 
 /** Derive a tool name from the title ("Run create_file?", "Running edit_file")
  *  with the kind as fallback. Titles observed live: "Run create_file?",
- *  "Running edit_file", "Running view_file". */
+ *  "Running edit_file", "Running read_file". */
 export function toolName(title: unknown, kind: unknown): string {
 	if (typeof title === "string") {
 		const m = /(?:Run|Running)\s+([A-Za-z_][\w.]*)/i.exec(title);

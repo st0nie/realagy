@@ -1,6 +1,6 @@
 # Architecture
 
-realagy uses ACP only as the model transport. `agy acp` generates text, reasoning, and tool requests. Pi owns tools, permissions, the transcript, rendering, and diffs.
+`agy acp` runs the agent: it generates text and reasoning and decides which tools to use. Pi owns the transcript and rendering, and its active tools are offered alongside agy's own.
 
 ## Process and models
 
@@ -14,9 +14,9 @@ The provider is registered with ambient-only auth: there is no `login` method, p
 
 ## Tools
 
-Antigravity's native tools are disabled (`enabledTools`), except `view_file`, which is the only way agy shows image pixels to the model. Pi's active tools are served by a loopback MCP server (`src/mcp-server.ts`) that requires a shared-secret header. The server is registered with every ACP session as the eager `pi-bridge`, so models see pi tools directly instead of going through agy's lazy `call_mcp_tool` helper.
+agy keeps its native tools (`read_file`, `run_command`, `edit_file`, `write_file`, `search_web`, subagents, …); `agy acp` ignores tool allowlists, and the model picks whichever tool fits. Native tools run inside agy under its own permission rules (`~/.gemini/antigravity-cli/settings.json`), and realagy approves agy's permission requests. Pi's active tools are served by a loopback MCP server (`src/mcp-server.ts`) that requires a shared-secret header. The server is registered with every ACP session as the eager `pi-bridge`, so models see pi tools directly instead of going through agy's lazy `call_mcp_tool` helper.
 
-A tool call follows this path:
+A pi tool call follows this path:
 
 1. agy calls a pi tool over MCP. The request is parked.
 2. realagy emits a genuine pi `toolCall` and ends the assistant message with `toolUse`.
@@ -27,7 +27,7 @@ After 20 seconds, a slow tool returns a `STILL RUNNING` handle that the model re
 
 ## Images
 
-agy offloads MCP image blocks instead of showing them. Pi image results are therefore copied, deduplicated by content, to `~/.gemini/antigravity-cli/pi-images-*`, and the MCP reply tells the model to open them with `view_file` (`src/image-results.ts`). The session stays open, and no history is replayed. The copies are removed on a normal pi shutdown; after a crash, leftover `pi-images-*` directories can be deleted by hand.
+Pi image results go back as ordinary MCP image blocks. agy stores them under its conversation (`brain/<session>/.system_generated/steps/<n>/media_*.png`) and shows them to the model, so the same ACP session continues and no history is replayed. Image files can also be opened directly with agy's native `read_file`. Images in pi's transcript are sent as ACP image blocks when a fresh session starts.
 
 ## Session reuse and prompt caching
 

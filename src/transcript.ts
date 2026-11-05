@@ -32,7 +32,7 @@ export interface WarmSession {
 	tools: string;
 }
 
-export const FRESH_PROMPT = "Continue the task from the pi transcript, including any tool results or discarded previous attempt. Attached images are numbered in transcript order. Use pi-bridge tools for original files and URLs (including clipboard images outside the workspace). When a pi result gives staged image paths, use native view_file on those paths to see the pixels; do not re-read the staged copies through MCP.";
+export const FRESH_PROMPT = "Continue the task from the pi transcript, including any tool results or discarded previous attempt. Attached images are numbered in transcript order.";
 
 export const DELTA_PROMPT = "Continue the task. The pi transcript delta lists, in order, the messages pi recorded after your last reply (other models' replies, tool results, user messages, or updated pi system instructions). Attached images are numbered in delta order. The same tool rules as before apply.";
 

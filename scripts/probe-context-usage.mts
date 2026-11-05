@@ -8,7 +8,7 @@ import type { TranscriptContext } from "@earendil-works/pi-ai";
 
 const setup = ensureAgyReady();
 if (!setup.ok) throw new Error(setup.error);
-const driver = new AcpDriver({ bin: setup.bin, enabledTools: () => [] });
+const driver = new AcpDriver({ bin: setup.bin });
 try {
  const model = FALLBACK_MODELS.find((entry) => entry.id === "claude-sonnet-5-5");
  if (!model) throw new Error("Sonnet model missing");

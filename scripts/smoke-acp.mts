@@ -7,7 +7,7 @@ import { ensureAgyReady } from "../src/acp/setup.js";
 
 const setup = ensureAgyReady();
 if (!setup.ok) throw new Error(`${setup.error}\n${setup.manual}`);
-const driver = new AcpDriver({ bin: setup.bin, enabledTools: () => [] });
+const driver = new AcpDriver({ bin: setup.bin });
 try {
 	const entries = entriesFromAcpModels(await driver.listModels(process.cwd()));
 	console.log("catalog:", entries.map((entry) => `${entry.full}[${entry.efforts?.join("/") ?? "fixed"}]`).join(", "));

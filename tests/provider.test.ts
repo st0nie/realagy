@@ -192,7 +192,7 @@ test("slow tools early-ack and return the real result through the poll tool", as
 });
 
 
-test("image tool results resume the existing ACP handle instead of replaying history", async () => {
+test("image tool results go back as MCP image blocks on the existing ACP handle", async () => {
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
 	const close = vi.spyOn(driver, "close");
@@ -210,9 +210,8 @@ test("image tool results resume the existing ACP handle instead of replaying his
 		const result: Message = { role: "toolResult", toolCallId: "image-call", toolName: "read", content: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }], isError: false, timestamp: 2 };
 		await collect(stream(model, context([system(), user("Read the image"), result])));
 		const reply = await parked;
-		assert.equal(reply.content[0].type, "text");
-		assert.match(reply.content[0].type === "text" ? reply.content[0].text : "", /native view_file/);
+		assert.deepEqual(reply.content, [{ type: "text", text: "(image result)" }, { type: "image", data: "aW1hZ2U=", mimeType: "image/png" }]);
 		assert.equal(driver.requests.length, 1);
 		assert.equal(close.mock.calls.length, 0);
-	} finally { roundTrips.clearImages(); }
+	} finally { roundTrips.failAll("test done"); }
 });

@@ -1,6 +1,6 @@
 # realagy
 
-A minimal [pi](https://github.com/earendil-works/pi-coding-agent) provider for Google Antigravity. It runs the local Antigravity CLI as an ACP server (`agy acp`) and exposes the account's Gemini, Claude, and GPT models as ordinary `antigravity/*` pi models. Pi keeps its own tools, permissions, transcript, and rendering.
+A minimal [pi](https://github.com/earendil-works/pi-coding-agent) provider for Google Antigravity. It runs the local Antigravity CLI as an ACP server (`agy acp`) and exposes the account's Gemini, Claude, and GPT models as ordinary `antigravity/*` pi models. Pi's active tools are offered to the model next to agy's own tools, and pi keeps the transcript.
 
 | Document | For |
 | --- | --- |
@@ -53,7 +53,6 @@ Nothing runs in the background: quota is fetched only when you run `/agy usage`.
 | `src/transcript.ts` | Transcript serialization, fingerprints, warm-session turn planning |
 | `src/models.ts` | ACP model catalog parsing, effort grouping, family limits, offline fallback catalog |
 | `src/mcp-server.ts`, `src/bridge-catalog.ts` | Loopback, token-protected MCP server for pi's active tools |
-| `src/image-results.ts` | Staging pi image results for agy's native `view_file` |
 | `src/quota.ts`, `src/usage-trace.ts` | Cache/quota meter, quota-exhaustion notice, usage diagnostics |
 | `src/acp/setup.ts` | Finding `agy` and its data dir |
 | `src/acp/connection.ts`, `driver.ts`, `events.ts`, `jsonrpc.ts` | `agy acp` process, ACP protocol, serialized turns, frame mapping |
