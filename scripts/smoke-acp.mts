@@ -3,9 +3,9 @@ import type { TranscriptContext } from "@earendil-works/pi-ai";
 import { AcpDriver } from "../src/acp/driver.js";
 import { entriesFromAcpModels, toPiModel } from "../src/models.js";
 import { createStreamSimple, ToolRoundTrips } from "../src/provider.js";
-import { ensureAcpReady } from "../src/acp/setup.js";
+import { ensureAgyReady } from "../src/acp/setup.js";
 
-const setup = await ensureAcpReady();
+const setup = ensureAgyReady();
 if (!setup.ok) throw new Error(`${setup.error}\n${setup.manual}`);
 const driver = new AcpDriver({ bin: setup.bin, enabledTools: () => [] });
 try {

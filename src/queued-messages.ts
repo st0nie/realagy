@@ -5,23 +5,14 @@
 // - "send-immediately": interrupt the agent with follow-up / steering messages immediately
 //
 // Pi expects immediate message delivery / steering during interactive chat.
-// This module ensures that both the stream-json engine (~/.gemini/antigravity-cli/settings.json)
-// and ACP engine (~/.gemini/antigravity-acp/settings.json) default to "send-immediately"
-// so user steering works as expected in Pi without manual user configuration.
+// This module defaults agy's settings (~/.gemini/antigravity-cli/settings.json, also
+// read by `agy acp`) to "send-immediately" so user steering works as expected in Pi.
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 export const QUEUED_MESSAGES_SEND_IMMEDIATELY = "send-immediately";
-
-export function defaultCliSettingsPath(): string {
-	return path.join(os.homedir(), ".gemini", "antigravity-cli", "settings.json");
-}
-
-export function defaultAcpSettingsPath(): string {
-	return path.join(os.homedir(), ".gemini", "antigravity-acp", "settings.json");
-}
 
 export interface EnsureFileResult {
 	path: string;
@@ -139,33 +130,4 @@ export function ensureQueuedMessagesInFile(
 			error: `failed writing ${resolvedPath}: ${String(err)}`,
 		};
 	}
-}
-
-export interface EnsureQueuedMessagesOptions {
-	cliSettingsPath?: string;
-	acpSettingsPath?: string;
-	defaultValue?: string;
-	onlyIfDirExists?: boolean;
-}
-
-export interface EnsureQueuedMessagesReport {
-	cli: EnsureFileResult;
-	acp: EnsureFileResult;
-}
-
-/**
- * Ensure both stream-json (CLI) and ACP engines default to "send-immediately".
- */
-export function ensureQueuedMessagesDefaults(
-	opts: EnsureQueuedMessagesOptions = {},
-): EnsureQueuedMessagesReport {
-	const cliPath = opts.cliSettingsPath ?? defaultCliSettingsPath();
-	const acpPath = opts.acpSettingsPath ?? defaultAcpSettingsPath();
-	const defVal = opts.defaultValue ?? QUEUED_MESSAGES_SEND_IMMEDIATELY;
-	const onlyIfDirExists = opts.onlyIfDirExists ?? false;
-
-	const cli = ensureQueuedMessagesInFile(cliPath, { defaultValue: defVal, onlyIfDirExists });
-	const acp = ensureQueuedMessagesInFile(acpPath, { defaultValue: defVal, onlyIfDirExists });
-
-	return { cli, acp };
 }

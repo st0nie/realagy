@@ -3,14 +3,14 @@
 import { createReadTool, calculateContextTokens } from "@earendil-works/pi-coding-agent";
 import type { Message, TranscriptContext } from "@earendil-works/pi-ai";
 import { AcpDriver } from "../src/acp/driver.js";
-import { ensureAcpReady } from "../src/acp/setup.js";
+import { ensureAgyReady } from "../src/acp/setup.js";
 import { startMcpServer, TOKEN_HEADER } from "../src/mcp-server.js";
 import { FALLBACK_MODELS, toPiModel } from "../src/models.js";
 import { createStreamSimple, ToolRoundTrips } from "../src/provider.js";
 
 const path = process.argv[2];
 if (!path) throw new Error("Expected image path");
-const setup = await ensureAcpReady();
+const setup = ensureAgyReady();
 if (!setup.ok) throw new Error(setup.error);
 let bridge: { port: number; token: string; close(): Promise<void> } | undefined;
 let nativeViews = 0;

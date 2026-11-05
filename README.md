@@ -1,66 +1,75 @@
 # realagy
 
-Minimal Antigravity provider for [pi](https://github.com/earendil-works/pi-coding-agent). Uses Google's official ACP server and exposes the account's Gemini, Claude, and GPT models as ordinary `antigravity/*` pi models.
+A minimal [pi](https://github.com/earendil-works/pi-coding-agent) provider for Google Antigravity. It runs the local Antigravity CLI as an ACP server (`agy acp`) and exposes the account's Gemini, Claude, and GPT models as ordinary `antigravity/*` pi models. Pi keeps its own tools, permissions, transcript, and rendering.
 
-## What it does
+| Document | For |
+| --- | --- |
+| [docs/architecture.md](docs/architecture.md) | How turns, tools, images, session reuse, usage, context, and quota work |
+| [docs/development.md](docs/development.md) | Building, testing, live smokes, conventions and pitfalls for contributors |
 
-- Discovers the live ACP model catalog, including Claude Opus/Sonnet and GPT-OSS alongside Gemini.
-- Streams text and reasoning into pi's native assistant/thinking blocks.
-- Enables only Antigravity's native `view_file` for image viewing; other operations stay on pi tools.
-- Exposes pi's active tools through a loopback, token-protected MCP bridge. Pi executes them with its normal cards, permissions, hooks, and diffs.
-- Uses pi's transcript as the source of truth for every new user turn.
-- Installs the official ACP server automatically when needed.
+## Install
 
-There is no settings panel, engine switch, stream-json fallback, delegation tool, global MCP registration, or plugin config file.
-
-## Install and sign in
+Install the [Antigravity CLI](https://antigravity.google/docs/cli/acp/), sign in once with it, then add the extension:
 
 ```sh
+curl -fsSL https://antigravity.google/cli/install.sh | bash
+agy                                   # sign in
 pi install git:github.com/st0nie/realagy
-/realagy auth
 ```
 
-Select a model through pi's normal `/model` picker, for example:
+realagy looks for `agy` in `AGY_BIN`, then on `PATH`, then at `~/.local/bin/agy`. It never installs agy or signs you in. When agy is missing, pi shows these instructions at startup. agy updates itself.
 
-- `antigravity/gemini-4-argon`
-- `antigravity/gemini-3-8-flash`
-- `antigravity/claude-opus-5-5`
-- `antigravity/claude-sonnet-5-5`
-- `antigravity/gpt-oss-120b`
+Choose a model in pi's `/model` picker:
 
-The exact catalog depends on the account and the current ACP response. GPT-OSS currently supports medium thinking; Claude 5.5 supports low/medium/high.
+| Model | Thinking |
+| --- | --- |
+| `antigravity/gemini-4-argon`, `antigravity/gemini-3-1-pro`, `antigravity/gemini-3-8-flash` | low / medium / high |
+| `antigravity/claude-opus-5-5`, `antigravity/claude-sonnet-5-5` | low / medium / high |
+| `antigravity/gpt-oss-120b` | medium |
 
-## How tools work
+The catalog comes live from agy and depends on the account.
 
-ACP is only the model transport. Antigravity's native tools are disabled except `view_file` for image viewing, while the `pi-bridge` MCP server is marked eager so models see pi tools directly instead of going through agy's lazy `call_mcp_tool` helper.
+## Commands
 
-A tool call follows this path:
+| Command | What it does |
+| --- | --- |
+| `/agy usage` | Cache-hit rate for this session plus every quota group's 5-hour and weekly remaining share and reset times (from `agy --print /usage`) |
 
-1. ACP requests a pi tool over loopback MCP.
-2. realagy emits a genuine pi `toolCall` and ends the assistant turn with `toolUse`.
-3. Pi executes the tool and applies its normal permission policy.
-4. The resulting pi `toolResult` answers the parked MCP request and the ACP turn continues.
+The footer status shows the same numbers for the selected model's quota group without running a command. There is no settings panel, engine switch, delegation tool, global MCP registration, or config file.
 
-Slow tools return a `STILL RUNNING` handle after 20 seconds and complete through `bridge_poll_result`, avoiding upstream MCP timeouts.
+| Environment | Effect |
+| --- | --- |
+| `AGY_BIN` | Path to the `agy` binary |
+| `GEMINI_HOME` | agy's data root (default `~/.gemini`) |
+| `REALAGY_TRACE_USAGE` | `1` or an absolute path: log turn plans and token counts (no content) to `~/.pi/agent/realagy/usage-trace.jsonl` |
 
-## Images and context accounting
+## Layout
 
-Pi image tool results are copied to a private, content-deduplicated directory under `~/.gemini/antigravity-acp/pi-images-*`. The MCP response directs the model to open those bytes with native `view_file`, because agy offloads MCP image blocks instead of showing their pixels. The existing ACP session stays open: no history replay or session restart is added for image reads. Copies are deleted on normal pi session shutdown (after a crash, leftover `pi-images-*` directories may be removed manually). This applies to any tool returning image blocks, not only `/tmp/pi-clipboard-*`. URLs still require an appropriate active pi tool; this does not make unsupported/authenticated resources universally readable.
+| Path | What it holds |
+| --- | --- |
+| `extensions/index.ts` | Composition root: pi MCP bridge, `antigravity/*` models, agy discovery, footer status, `/agy usage` |
+| `src/provider.ts` | pi assistant event stream, MCP → `toolUse` → `toolResult` round-trips, usage mapping |
+| `src/transcript.ts` | Transcript serialization, fingerprints, warm-session turn planning |
+| `src/models.ts` | ACP model catalog parsing, effort grouping, family limits, offline fallback catalog |
+| `src/mcp-server.ts`, `src/bridge-catalog.ts` | Loopback, token-protected MCP server for pi's active tools |
+| `src/image-results.ts` | Staging pi image results for agy's native `view_file` |
+| `src/quota.ts`, `src/usage-trace.ts` | Cache/quota meter, quota-exhaustion notice, usage diagnostics |
+| `src/acp/setup.ts` | Finding `agy` and its data dir |
+| `src/acp/connection.ts`, `driver.ts`, `events.ts`, `jsonrpc.ts` | `agy acp` process, ACP protocol, serialized turns, frame mapping |
+| `src/acp/step-usage.ts` | Exact per-model-call tokens from agy's conversation store |
+| `tests/` | Vitest suites; `tests/helpers/fake-acp-server.mjs` stands in for agy |
+| `scripts/` | Live smokes and probes (spend account quota) |
 
-ACP's `usage_update.used` is mapped to pi's existing `usage.totalTokens` context-count input, so the footer, `ctx.getContextUsage()` and compaction see occupancy rather than cumulative internal-call usage. Input/output/cache fields retain accounting information; ACP cached input is removed from pi's uncached input to avoid double counting. The original ACP total is preserved as `usage.agyCumulativeTotalTokens`. This is an extension-only compatibility adapter: plugins summing `totalTokens` for billing should instead use the accounting fields or this original total. No pi runtime patch is needed. Old JSONL counts are not rewritten; the next measured response supplies a fresh count. If ACP omits occupancy updates, the existing usage fallback remains an estimate.
+## Build
 
-There is still a real image-token cost and one native viewer tool round-trip. Cache hits depend on the service; preserving the ACP session avoids deliberately discarding its history/cache state but cannot guarantee a particular hit rate.
+```sh
+bun install            # or npm install
+npm run check          # TypeScript + tests
+npm run smoke:pi       # load the extension through pi's real loader
+```
+
+[docs/development.md](docs/development.md) has the live smokes and the conventions.
+
 ## Protocol note
 
-The current ACP server offers third-party models only to recognized client surfaces. realagy declares `clientInfo.name = "zed"` to enable the same Claude/GPT catalog that ACP exposes to Zed. Credentials, account quotas, model requests, and generation still use Google's official ACP server; realagy does not call the private generation endpoint directly or bypass quota checks.
-
-## Development
-
-```sh
-npm install
-npm run check          # TypeScript + unit/integration tests
-npm run smoke:pi      # register the provider through pi's real extension loader
-npm run smoke:live -- claude-sonnet-5-5   # live turn; spends account quota
-npm run smoke:live -- gpt-oss-120b
-npm run smoke:live -- gemini-3-8-flash
-```
+agy offers third-party models only to clients it recognizes, so realagy declares `clientInfo.name = "zed"` to get the same Claude/GPT catalog Zed sees. Sign-in, quotas, and generation all still go through Google's official agy CLI. realagy does not call private endpoints or bypass quota checks.

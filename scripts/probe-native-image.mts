@@ -3,14 +3,14 @@
 import { access, realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import { AcpConnection } from "../src/acp/connection.js";
-import { ensureAcpReady } from "../src/acp/setup.js";
+import { ensureAgyReady } from "../src/acp/setup.js";
 
 const arg = process.argv[2];
 if (!arg) throw new Error("Usage: bun run scripts/probe-native-image.mts <image-path> [full-model-id]");
 const imagePath = await realpath(resolve(arg));
 await access(imagePath);
 const wanted = process.argv[3] ?? "claude-sonnet-5-5";
-const setup = await ensureAcpReady();
+const setup = ensureAgyReady();
 if (!setup.ok) throw new Error(`${setup.error}\n${setup.manual}`);
 
 // This isolated session exposes native view_file, which can also read text files.

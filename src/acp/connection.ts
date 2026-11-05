@@ -1,12 +1,12 @@
-// ACP connection: owns the agy_acp_server process, the JSON-RPC session over
-// its stdio, and the protocol methods the driver needs. One connection hosts
+// ACP connection: owns the `agy acp` process (Antigravity CLI), the JSON-RPC
+// session over its stdio, and the protocol methods the driver needs. One connection hosts
 // one session at a time (the driver's model), but the transport supports more.
 //
 // Protocol facts encoded here were verified live against
 // agy_acp_server_20260818_01_RC01 (docs/ACP-PROTOCOL-REFERENCE.md):
 //   - initialize: {protocolVersion:1, clientCapabilities{fs:false,terminal:false}}
 //   - authenticate takes `methodId`; auth errors are -32000 with remediation in
-//     data.message; the token persists in ~/.gemini/antigravity-acp/acp_token.json
+//     data.message; credentials live in agy's own store (shared with the CLI)
 //   - session/set_config_option takes `configId` (model value = FULL slug with
 //     the effort tier baked in, e.g. gemini-3.8-flash-low)
 //   - session/cancel returns -32601 on RC01 (not implemented) — the driver
@@ -21,10 +21,8 @@
 //     LIST; a dead URL is accepted at session time (lazy connect)
 
 import { spawn, type ChildProcess } from "node:child_process";
-import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { parseAuthPort, readLastUrl } from "./browser-capture.js";
 import { frameCarriesUsage } from "./events.js";
 import type { AgyUsage } from "../driver-types.js";
 import { redactText } from "../redact.js";
@@ -43,22 +41,12 @@ export interface AcpSessionInfo {
 }
 
 /** Auth failed (-32000 family). Message carries the remediation the server
- *  provided plus the /agy auth-manual pointer. */
+ *  provided plus the /agy login pointer. */
 export class AcpAuthError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "AcpAuthError";
 	}
-}
-
-/** Fired exactly when the SERVER reports an auth failure (-32000 family).
- *  The extension entry wires this to clearAcpAuthVerified(): a verified
- *  marker must never outlive the server disagreeing with it. Kept as a hook
- *  so the low-level connection stays decoupled from bridge file paths. */
-let authInvalidatedHook: (() => void) | null = null;
-
-export function setAuthInvalidatedHook(fn: (() => void) | null): void {
-	authInvalidatedHook = fn;
 }
 
 export interface AcpConnectionOptions {
@@ -93,28 +81,15 @@ export interface AcpConnectionOptions {
 	onPermissionRequest?: AcpPermissionHandler;
 	/** Park budget for one permission dialog. Tests shrink it. */
 	permissionParkMs?: number;
-	/** Record file for BROWSER-captured OAuth URLs (src/acp/browser-capture.ts).
-	 *  The server hands the login URL only to the browser-open call, so the
-	 *  wrapper records it there; the connection watches the file and logs
-	 *  "auth-url" {url, port} for every new URL. */
-	authUrlFile?: string;
 }
 
 const INIT_TIMEOUT_MS = 30_000;
 const SESSION_OP_TIMEOUT_MS = 20_000;
 
-/** Arguments for the real ACP server. Google's Abseil launcher defaults to
- *  `--uid=nobody` when started by root, which makes ~/.gemini credentials
- *  unreadable. An explicit empty --uid keeps the current user. Custom binArgs
- *  are test/wrapper inputs and are left untouched. */
-export function acpServerArgs(
-	binArgs?: string[],
-	uid: number | undefined = typeof process.getuid === "function" ? process.getuid() : undefined,
-	platform: NodeJS.Platform = process.platform,
-): string[] {
-	const args = [...(binArgs ?? [])];
-	if (binArgs === undefined && platform !== "win32" && uid === 0) args.push("--uid=");
-	return args;
+/** Arguments for the ACP server: `agy acp`. Custom binArgs are test/wrapper
+ *  inputs and replace the default. */
+export function acpServerArgs(binArgs?: string[]): string[] {
+	return [...(binArgs ?? ["acp"])];
 }
 
 /** Human-decision budget for one parked permission request. Mirrors the
@@ -158,8 +133,6 @@ export class AcpConnection {
 	agentInfo: Record<string, unknown> | undefined;
 	/** Last known mode/model config echo from set_config_option results. */
 	lastConfigOptions: unknown = undefined;
-	#authUrlWatcher: fs.FSWatcher | undefined;
-	#lastAuthUrl: string | null = null;
 	/** Parked permission dialogs: each entry settles its own request with a
 	 *  deny. #finish drains the set so a dying connection never leaves the
 	 *  server's request hanging. */
@@ -218,7 +191,6 @@ export class AcpConnection {
 			...(this.#opts.extraEnv ? { env: { ...process.env, ...this.#opts.extraEnv } } : {}),
 		});
 		this.#child = child;
-		if (this.#opts.authUrlFile) this.#watchAuthUrl();
 		child.stdout?.setEncoding("utf8");
 		child.stderr?.setEncoding("utf8");
 		// Pipe failures arrive asynchronously as stream 'error' events; the sync
@@ -615,36 +587,9 @@ export class AcpConnection {
 		}
 	}
 
-	/** Surface OAuth login URLs captured by the BROWSER wrapper: every new
-	 *  URL in the record file is logged once as "auth-url" {url, port}. Best
-	 *  effort only - a broken watch never affects turns. */
-	#watchAuthUrl(): void {
-		const file = this.#opts.authUrlFile!;
-		try {
-			const watcher = fs.watch(file, () => this.#emitAuthUrl());
-			// Without a listener, a watch 'error' event escapes as uncaught.
-			watcher.on("error", () => {
-				/* record file gone: login URL surfacing is off until respawn */
-			});
-			this.#authUrlWatcher = watcher;
-		} catch {
-			/* no watch; the one-shot check below still covers earlier writes */
-		}
-		this.#emitAuthUrl(); // URLs recorded before the watch started
-	}
-
-	#emitAuthUrl(): void {
-		const url = readLastUrl(this.#opts.authUrlFile!);
-		if (!url || url === this.#lastAuthUrl) return;
-		this.#lastAuthUrl = url;
-		this.#opts.log("auth-url", { url, port: parseAuthPort(url) });
-	}
-
 	#finish(reason: string): void {
 		if (this.#exited) return;
 		this.#exited = true;
-		this.#authUrlWatcher?.close();
-		this.#authUrlWatcher = undefined;
 		// Pending permission dialogs must not outlive the connection: deny them
 		// so their replies race the teardown instead of hanging the server.
 		const pendings = [...this.#permissionPending];
@@ -681,10 +626,9 @@ export function translateError(method: string, err: unknown): Error {
 	if (err instanceof AcpAuthError) return err;
 	if (err instanceof JsonRpcResponseError) {
 		if (err.code === -32000) {
-			authInvalidatedHook?.();
 			const detail = typeof err.data === "object" && err.data !== null ? (err.data as { message?: unknown }).message : undefined;
 			const detailText = typeof detail === "string" ? `: ${detail}` : `: ${err.message}`;
-			return new AcpAuthError(`ACP authentication required for ${method}${detailText}. Run /realagy auth to sign in.`);
+			return new AcpAuthError(`ACP authentication required for ${method}${detailText}. Run /agy login to sign in.`);
 		}
 		// Typed protocol errors survive: callers probe .code (-32601 cancel-
 		// unsupported, -32602 param shape). The method prefix is lost — describe()
@@ -695,12 +639,9 @@ export function translateError(method: string, err: unknown): Error {
 	return new Error(`ACP ${method} failed: ${String(err)}`);
 }
 
-/** Resolve the server binary: env > config > PATH. Resolution failure is a
- *  visible turn error naming what was tried (plan §9.5). */
-/** Resolve the server binary: env > config > PATH. `~` expands to the home
- *  directory (spawn does not expand it). Resolution failure is a visible turn
- *  error naming what was tried (plan §9.5). */
+/** Resolve the agy binary: AGY_BIN > configured path > `agy` on PATH. `~`
+ *  expands to the home directory (spawn does not expand it). */
 export function resolveAcpBinary(configBin: string): string {
-	const raw = process.env.AGY_ACP_BIN || (configBin.length > 0 ? configBin : "agy_acp_server.par");
+	const raw = process.env.AGY_BIN?.trim() || (configBin.length > 0 ? configBin : "agy");
 	return raw === "~" || raw.startsWith("~/") ? path.join(os.homedir(), raw.slice(1)) : raw;
 }

@@ -2,9 +2,9 @@
 // copy of pi's image result in an allowed directory, without restarting ACP.
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import type { BridgeResult } from "./mcp-server.js";
+import { agyDataDir } from "./acp/setup.js";
 
 export type ResultImage = { data: string; mimeType: string };
 const EXTENSIONS: Record<string, string> = {
@@ -16,7 +16,7 @@ export class ImageResults {
 	#directory: string | undefined;
 	#paths = new Map<string, string>();
 
-	constructor(private readonly root = join(homedir(), ".gemini", "antigravity-acp")) {}
+	constructor(private readonly root = agyDataDir()) {}
 
 	result(text: string, isError: boolean, images: ResultImage[]): BridgeResult {
 		const references: string[] = [];

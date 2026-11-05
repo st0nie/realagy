@@ -27,6 +27,8 @@ import { AcpConnection, resolveAcpBinary, type AcpMcpServer, type AcpPermissionR
 import type { AcpPermissionHandler } from "./connection.js";
 import { mapStopReason, mapUpdate, TextAccumulator, type AcpEditDiff } from "./events.js";
 import { estimateTokens, synthesizeUsage } from "./usage-estimate.js";
+import { conversationDbPath, lastStepIdx, readStepTokens, summarizeSteps } from "./step-usage.js";
+import { traceUsage } from "../usage-trace.js";
 import type {
 	AgyUsage,
 	DriverActivity,
@@ -48,19 +50,18 @@ export interface AcpDriverOptions {
 	/** Extra argv for the binary (tests: node + fake-server script). */
 	binArgs?: string[];
 	extraEnv?: Record<string, string>;
-	/** Record file for BROWSER-captured OAuth URLs; passed to the connection,
-	 *  which logs "auth-url" when the server tries to open a login. */
-	authUrlFile?: string;
 	/** Bridge registration for session/new AND session/load. */
 	mcpServers?: () => AcpMcpServer[];
 	/** [] disables all Antigravity built-ins; MCP tools remain available. */
 	enabledTools?: () => string[];
 	/** Additional Antigravity built-in tools disabled on session/new and load. */
 	disabledTools?: () => string[];
-	/** Gate B stopgap: how ACP turns synthesize usage while the server sends
-	 *  none. A function is resolved per turn (follows live config, like bin).
-	 *  Default "estimate". */
+	/** Client-side usage synthesis. Default "off": regex estimates must not
+	 *  become pi's context count; pi estimates unmeasured messages itself. */
 	usageEstimate?: UsageEstimate | (() => UsageEstimate);
+	/** Directory holding the server's `<sessionId>.db` conversation stores,
+	 *  read for exact per-model-call usage. undefined disables. */
+	conversationsDir?: () => string | undefined;
 	/** Human gate for ACP request_permission on non-skip turns. Forwarded to
 	 *  the connection; the driver parks the turn budget around each call
 	 *  (dialog time does not eat the deadline). */
@@ -77,6 +78,12 @@ export interface AcpDriverOptions {
 interface ActiveTurn {
 	id: string;
 	request: DriverTurnRequest;
+	/** The input actually sent: the request's, or its fallback after a lost session. */
+	input: { prompt: string; images?: Array<{ data: string; mimeType: string }>; contextBlock?: { uri: string; text: string } };
+	/** Conversation store of this session and the last step already reported. */
+	dbPath?: string;
+	stepCursor: number;
+	stepUsageSeen: boolean;
 	sessionId: string;
 	buffer: DriverActivity[];
 	wake: (() => void)[];
@@ -150,6 +157,8 @@ export class AcpDriver implements TurnDriver {
 	};
 	#serverVersion: string | undefined;
 	#lastSessionId: string | undefined;
+	/** Sessions held in memory by the current server process (reset on respawn). */
+	#liveSessions = new Set<string>();
 	#lastCancelSupported: boolean | null = null;
 	#agentInfo: { name?: string; title?: string } | undefined;
 
@@ -184,6 +193,9 @@ export class AcpDriver implements TurnDriver {
 		const t = this.#active;
 		if (!t || t.closed) return;
 		if (activity.type === "bridge_call") {
+			// The model call that requested this tool has finished: report its
+			// exact usage on the pi message that this bridge call completes.
+			this.#collectStepUsage(t);
 			t.parks += 1;
 			this.#clearIdle(t);
 			this.#pauseOverall(t);
@@ -294,14 +306,22 @@ export class AcpDriver implements TurnDriver {
 		const request = turn.request;
 		const conn = await this.#ensureConnection(request);
 
-		// Session: load (resume) or create. Load failures fall back to a fresh
-		// session — a missing conversation must not fail the turn (9.4).
+		// Session: reuse a session this server process already holds, load
+		// (resume) one it persisted, or create. A missing conversation must not
+		// fail the turn (9.4): the fresh session gets the request's complete
+		// fallback input instead of a delta it could not interpret.
+		let sessionMode: "new" | "reused" | "loaded" | "fallback" = "new";
 		try {
-			if (request.conversationId) {
+			if (request.conversationId && this.#liveSessions.has(request.conversationId)) {
+				turn.sessionId = request.conversationId;
+				sessionMode = "reused";
+				this.#log("session-reuse", { sessionId: request.conversationId });
+			} else if (request.conversationId) {
 				this.#log("session-load", { sessionId: request.conversationId });
 				this.#stats.sessionsLoaded += 1;
 				await conn.loadSession(request.conversationId, request.cwd);
 				turn.sessionId = request.conversationId;
+				sessionMode = "loaded";
 			} else {
 				const created = await conn.newSession(request.cwd);
 				turn.sessionId = created.sessionId;
@@ -328,6 +348,7 @@ export class AcpDriver implements TurnDriver {
 					const created = await conn.newSession(request.cwd);
 					turn.sessionId = created.sessionId;
 					this.#stats.sessionsCreated += 1;
+					sessionMode = "fallback";
 				} catch (err2) {
 					this.#failTurn(turn, `ACP session failed: ${describe(err2)}`);
 					return;
@@ -337,6 +358,22 @@ export class AcpDriver implements TurnDriver {
 				return;
 			}
 		}
+		if (conn === this.#conn) this.#liveSessions.add(turn.sessionId);
+		if (sessionMode === "fallback" && request.fallback) {
+			turn.input = { prompt: request.fallback.prompt, images: request.fallback.images, contextBlock: request.fallback.contextBlock };
+		}
+		const dir = this.#opts.conversationsDir?.();
+		turn.dbPath = dir ? conversationDbPath(dir, turn.sessionId) : undefined;
+		turn.stepCursor = turn.dbPath ? lastStepIdx(turn.dbPath) : -1;
+		traceUsage("turn-start", {
+			sessionId: turn.sessionId,
+			session: sessionMode,
+			model: acpModelSlug(request.model, request.effort),
+			promptChars: turn.input.prompt.length,
+			contextChars: turn.input.contextBlock?.text.length ?? 0,
+			images: turn.input.images?.length ?? 0,
+			stepCursor: turn.stepCursor,
+		});
 		if (turn.closed) return;
 
 		// Config: model + mode. Model failure fails the turn (wrong-model turns
@@ -358,27 +395,30 @@ export class AcpDriver implements TurnDriver {
 		// Timers: overall (turn deadline, pause-aware) + idle (inactivity).
 		this.#armOverall(turn);
 		this.#armIdle(turn);
-		// Live usage is explicitly an estimate: ACP 1.1.1 does not forward the
-		// SDK's exact usage_metadata onto the ACP wire. Emit input first; output
-		// estimates advance with each text/thought delta below.
+		// Optional client estimate (usageEstimate "estimate"/"direct"; default
+		// off). Exact counts come from step_usage, read from the server's
+		// conversation store as each model call finishes.
 		this.#emitLiveEstimate(turn);
 
 		// Prompt. Updates stream through the connection's onUpdate callback.
 		try {
 			// Nothing to cancel before the prompt RPC exists; see promptStarted.
 			turn.promptStarted = true;
-			const result = await conn.prompt(turn.sessionId, request.prompt, request.images, request.contextBlock);
+			const result = await conn.prompt(turn.sessionId, turn.input.prompt, turn.input.images, turn.input.contextBlock);
 			if (turn.closed) return;
 			turn.sawResult = true;
-			// When a future server fills ACP PromptResponse.usage, exact counts
-			// supersede every partial estimate at the end of the turn.
-			if (result.usage) this.#emit(turn, { type: "usage", usage: result.usage });
+			const usage = result.usage;
+			traceUsage("prompt-result", { sessionId: turn.sessionId, stopReason: result.stopReason, usage, usageUpdate: turn.contextUsage });
+			// Exact per-call steps first; the turn-cumulative total is only a
+			// fallback for messages no step measurement covered.
+			this.#collectStepUsage(turn);
+			if (usage && !turn.stepUsageSeen) this.#emit(turn, { type: "usage", usage });
 			const mapped = mapStopReason(result.stopReason);
 			this.#settle(turn, {
 				conversationId: turn.sessionId,
 				status: mapped.status,
 				response: turn.response.text,
-				usage: result.usage,
+				usage,
 				error: mapped.error,
 				finished: true,
 				aborted: mapped.aborted,
@@ -431,6 +471,7 @@ export class AcpDriver implements TurnDriver {
 				&& (frame.used as number) >= 0 && (frame.size as number) > 0) {
 				const contextUsage = { used: frame.used as number, size: frame.size as number };
 				turn.contextUsage = contextUsage;
+				traceUsage("usage-update", { sessionId: turn.sessionId, used: contextUsage.used, size: contextUsage.size });
 				this.#emit(turn, { type: "context_usage", contextUsage });
 			}
 		}
@@ -532,7 +573,6 @@ export class AcpDriver implements TurnDriver {
 			bin: resolveAcpBinary(typeof this.#opts.bin === "function" ? this.#opts.bin() : this.#opts.bin),
 			binArgs: this.#opts.binArgs,
 			extraEnv: this.#opts.extraEnv,
-			authUrlFile: this.#opts.authUrlFile,
 			cwd: request.cwd,
 			mcpServers: this.#opts.mcpServers,
 			enabledTools: this.#opts.enabledTools,
@@ -553,6 +593,7 @@ export class AcpDriver implements TurnDriver {
 			onExit: (info) => this.#onConnectionExit(conn, info),
 		});
 		this.#conn = conn;
+		this.#liveSessions.clear();
 		this.#log("spawn", { bin: resolveAcpBinary(typeof this.#opts.bin === "function" ? this.#opts.bin() : this.#opts.bin) });
 		return conn
 			.start()
@@ -639,6 +680,9 @@ export class AcpDriver implements TurnDriver {
 		const turn: ActiveTurn = {
 			id: randomUUID().slice(0, 8),
 			request,
+			input: { prompt: request.prompt, images: request.images, contextBlock: request.contextBlock },
+			stepCursor: -1,
+			stepUsageSeen: false,
 			sessionId: "",
 			buffer: [],
 			wake: [],
@@ -764,6 +808,7 @@ export class AcpDriver implements TurnDriver {
 			this.#emit(turn, { type: "text", delta: flushed });
 		}
 		outcome.response = turn.response.text;
+		if (turn.promptStarted) this.#collectStepUsage(turn);
 		if (turn.contextUsage) outcome.contextUsage = turn.contextUsage;
 		// Gate B stopgap: synthesize usage on clean turns while the server sends
 		// none. Runs BEFORE close so the usage activity drains through the
@@ -806,7 +851,21 @@ export class AcpDriver implements TurnDriver {
 	/** Usage synthesis mode, resolved per turn (follows live config). */
 	#usageMode(): UsageEstimate {
 		const opt = this.#opts.usageEstimate;
-		return (typeof opt === "function" ? opt() : opt) ?? "estimate";
+		return (typeof opt === "function" ? opt() : opt) ?? "off";
+	}
+
+	/** Emit exact usage for model calls the server persisted since the last
+	 *  report. Missing or unreadable stores silently report nothing. */
+	#collectStepUsage(turn: ActiveTurn): void {
+		if (!turn.dbPath || turn.closed) return;
+		const steps = readStepTokens(turn.dbPath, turn.stepCursor);
+		const usage = steps ? summarizeSteps(steps) : undefined;
+		if (!usage) return;
+		turn.stepCursor = usage.lastIdx;
+		turn.stepUsageSeen = true;
+		traceUsage("step-usage", { sessionId: turn.sessionId, steps: steps!.map(({ idx, input, output, cacheRead, cacheWrite }) => ({ idx, input, output, cacheRead, cacheWrite })), contextTokens: usage.contextTokens, usageUpdate: turn.contextUsage?.used });
+		const { lastIdx: _lastIdx, ...activity } = usage;
+		this.#emit(turn, { type: "step_usage", usage: activity });
 	}
 
 	/** Update Pi's partial usage before the next visible text/thought delta.

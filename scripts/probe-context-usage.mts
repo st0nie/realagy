@@ -1,12 +1,12 @@
 // Isolated live probe; consumes model quota, with no pi tools or production session.
 import { calculateContextTokens } from "@earendil-works/pi-coding-agent";
 import { AcpDriver } from "../src/acp/driver.js";
-import { ensureAcpReady } from "../src/acp/setup.js";
+import { ensureAgyReady } from "../src/acp/setup.js";
 import { FALLBACK_MODELS, toPiModel } from "../src/models.js";
 import { createStreamSimple, ToolRoundTrips } from "../src/provider.js";
 import type { TranscriptContext } from "@earendil-works/pi-ai";
 
-const setup = await ensureAcpReady();
+const setup = ensureAgyReady();
 if (!setup.ok) throw new Error(setup.error);
 const driver = new AcpDriver({ bin: setup.bin, enabledTools: () => [] });
 try {

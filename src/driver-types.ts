@@ -39,6 +39,10 @@ export interface DriverTurnRequest extends DriverProfile {
 	 *  resource block instead of inline prompt text (G1 on ACP). Stream-json
 	 *  embeds the digest in the prompt string and ignores this. */
 	contextBlock?: { uri: string; text: string };
+	/** ACP only: the complete input to send instead when `conversationId`
+	 *  cannot be reused or loaded and a fresh session is created. Without it a
+	 *  delta prompt would reach a session that never saw the earlier turns. */
+	fallback?: { prompt: string; images?: Array<{ data: string; mimeType: string }>; contextBlock?: { uri: string; text: string } };
 	signal?: AbortSignal;
 	/** Overall turn cap in minutes (default 10). Fractional values are valid
 	 *  (tests use sub-minute caps). 0 disables the cap. */
@@ -57,6 +61,16 @@ export type AgyUsage = {
 
 /** ACP-reported context occupancy, not cumulative per-model-call token usage. */
 export type AgyContextUsage = { used: number; size: number };
+
+export type AgyStepUsage = {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	/** Context held by the latest model call (input + cache + output). */
+	contextTokens: number;
+	steps: number;
+};
 
 export type DriverActivity =
 	| { type: "text"; delta: string }
@@ -80,8 +94,12 @@ export type DriverActivity =
 			diff?: { path: string; oldText?: string; newText: string };
 	  }
 	| { type: "tool_error"; stepId?: number; name: string; message: string; mcpServer?: string; toolCallId?: string }
+	/** Turn-cumulative PromptResponse.usage, or a client-side estimate. */
 	| { type: "usage"; usage: AgyUsage }
 	| { type: "context_usage"; contextUsage: AgyContextUsage }
+	/** Exact usage of the model calls completed since the previous one, read
+	 *  from the server's conversation store. */
+	| { type: "step_usage"; usage: AgyStepUsage }
 	/** Synthetic: injected by the provider when the MCP bridge receives a call
 	 *  (G9). Parks the turn: output is expected to stall while pi executes the
 	 *  tool, so the driver suspends its idle/overall timers. */

@@ -1,13 +1,13 @@
 {
   "name": "realagy",
   "version": "2.0.0",
-  "description": "Minimal Antigravity ACP provider for pi: Gemini, Claude, and GPT models with native pi tools and thinking.",
+  "description": "Minimal Antigravity provider for pi: Gemini, Claude, and GPT models through the local agy CLI, with native pi tools and thinking.",
   "keywords": [
     "pi-package",
     "pi-extension",
     "realagy",
     "antigravity",
-    "antigravity-acp",
+    "agy",
     "agent-client-protocol",
     "gemini",
     "claude",
@@ -39,8 +39,8 @@
   "files": [
     "extensions",
     "src",
+    "docs",
     "README.md",
-    "CHANGELOG.md",
     "LICENSE"
   ],
   "pi": {

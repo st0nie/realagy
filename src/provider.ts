@@ -3,7 +3,6 @@
 
 import {
 	createAssistantMessageEventStream,
-	getCurrentSystemPrompt,
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
@@ -14,10 +13,13 @@ import {
 	type TranscriptContext,
 	type Usage,
 } from "@earendil-works/pi-ai";
-import type { AgyUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle } from "./driver-types.js";
+import type { AgyStepUsage, AgyUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "./driver-types.js";
 import { toAgyEffort, type AgyModelEntry } from "./models.js";
 import type { BridgeResult } from "./mcp-server.js";
 import { ImageResults } from "./image-results.js";
+import { planTurn, warmAfterTurn, type WarmSession } from "./transcript.js";
+import { traceUsage } from "./usage-trace.js";
+import { quotaExhaustion, type UsageMeter } from "./quota.js";
 
 export const POLL_TOOL_NAME = "bridge_poll_result";
 const PARK_TIMEOUT_MS = 8 * 60_000;
@@ -146,6 +148,17 @@ interface BlockState {
 	textIdx: number | null;
 	thinkingIdx: number | null;
 	started: boolean;
+	usage: UsageState;
+}
+
+/** Usage evidence for one pi assistant message, folded by syncUsage. */
+interface UsageState {
+	/** Exact per-call usage of the model calls this message covers. */
+	step?: AgyStepUsage;
+	/** Latest ACP usage_update occupancy received during this message. */
+	occupancy?: number;
+	/** Turn-cumulative PromptResponse.usage (or a client estimate). */
+	cumulative?: AgyUsage;
 }
 
 function zeroUsage(): Usage {
@@ -171,61 +184,51 @@ function resultImages(message: Message): Array<{ data: string; mimeType: string 
 	return message.content.flatMap((block) => block.type === "image" ? [{ data: block.data, mimeType: block.mimeType }] : []);
 }
 
-/** A fresh user turn starts a fresh ACP session, making pi's transcript the
- * single source of truth across compaction, retries, and provider switches. */
-function transcriptForAcp(context: TranscriptContext): { text: string; images: Array<{ data: string; mimeType: string }> } {
-	const parts: string[] = [];
-	const images: Array<{ data: string; mimeType: string }> = [];
-	const system = getCurrentSystemPrompt(context.messages);
-	if (system) parts.push(`<pi-system>\n${system}\n</pi-system>`);
-	for (const message of context.messages) {
-		if (message.role === "system") continue;
-		if (message.role === "user" || message.role === "toolResult") {
-			const text = contentText(message.content);
-			const blocks = Array.isArray(message.content) ? message.content : [];
-			const references: string[] = [];
-			for (const block of blocks) {
-				if (block.type !== "image") continue;
-				images.push({ data: block.data, mimeType: block.mimeType });
-				references.push(`[Attached image ${images.length}]`);
-			}
-			const content = [text, ...references].filter(Boolean).join("\n");
-			if (message.role === "user") {
-				if (content) parts.push(`<user>\n${content}\n</user>`);
-			} else {
-				parts.push(`<pi-tool-result name=${JSON.stringify(message.toolName)} id=${JSON.stringify(message.toolCallId)} error=${message.isError}>\n${content}\n</pi-tool-result>`);
-			}
-			continue;
-		}
-		if (message.role === "assistant") {
-			for (const block of message.content) {
-				if (block.type === "text" && block.text) parts.push(`<assistant>\n${block.text}\n</assistant>`);
-				if (block.type === "toolCall") parts.push(`<assistant-tool-call name=${JSON.stringify(block.name)} id=${JSON.stringify(block.id)}>\n${JSON.stringify(block.arguments)}\n</assistant-tool-call>`);
-			}
-		}
-	}
-	return { text: parts.join("\n\n"), images };
-}
-
-// Pi uses usage.totalTokens as the latest context size. ACP prompt usage can be
-// cumulative across multiple internal model calls, so keep that original total
-// separately when a context occupancy update is available.
+// Pi reads usage.totalTokens (else input + output + cache) of the latest
+// assistant message as the CURRENT context size, and input/cacheRead as that
+// call's prompt split (cache-hit rate). One ACP prompt spans many internal
+// model calls, so its cumulative usage must never become totalTokens. Without
+// a measured occupancy the message reports zero usage, and pi estimates it
+// from the transcript like any unmeasured message.
 type AgyPiUsage = Usage & { agyContextTokens?: number; agyCumulativeTotalTokens?: number };
 
-function applyUsage(target: Usage, usage: AgyUsage): void {
+function syncUsage(target: Usage, state: UsageState): void {
 	const piUsage = target as AgyPiUsage;
-	// ACP inputTokens includes cachedReadTokens; pi counts them separately.
-	target.input = Math.max(0, (usage.input_tokens ?? 0) - (usage.cache_read_tokens ?? 0));
-	target.output = (usage.output_tokens ?? 0) + (usage.thinking_tokens ?? 0);
-	target.cacheRead = usage.cache_read_tokens ?? 0;
-	const total = usage.total_tokens ?? target.input + target.output + target.cacheRead;
-	piUsage.agyCumulativeTotalTokens = total;
-	target.totalTokens = piUsage.agyContextTokens ?? total;
+	Object.assign(target, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 });
+	if (state.step) {
+		target.input = state.step.input;
+		target.output = state.step.output;
+		target.cacheRead = state.step.cacheRead;
+		target.cacheWrite = state.step.cacheWrite;
+		target.totalTokens = state.step.contextTokens;
+	} else if (state.occupancy !== undefined) {
+		if (state.cumulative) {
+			// ACP inputTokens includes cachedReadTokens; pi counts them separately.
+			target.input = Math.max(0, (state.cumulative.input_tokens ?? 0) - (state.cumulative.cache_read_tokens ?? 0));
+			target.output = (state.cumulative.output_tokens ?? 0) + (state.cumulative.thinking_tokens ?? 0);
+			target.cacheRead = state.cumulative.cache_read_tokens ?? 0;
+		}
+		target.totalTokens = state.occupancy;
+	}
+	if (state.occupancy !== undefined) piUsage.agyContextTokens = state.occupancy;
+	if (state.cumulative) {
+		const c = state.cumulative;
+		piUsage.agyCumulativeTotalTokens = c.total_tokens ?? (c.input_tokens ?? 0) + (c.output_tokens ?? 0) + (c.thinking_tokens ?? 0);
+	}
 }
 
-function applyContextUsage(target: Usage, used: number): void {
-	(target as AgyPiUsage).agyContextTokens = used;
-	target.totalTokens = used;
+function addStepUsage(state: UsageState, usage: AgyStepUsage): void {
+	const prev = state.step;
+	state.step = prev
+		? {
+			input: prev.input + usage.input,
+			output: prev.output + usage.output,
+			cacheRead: prev.cacheRead + usage.cacheRead,
+			cacheWrite: prev.cacheWrite + usage.cacheWrite,
+			contextTokens: usage.contextTokens,
+			steps: prev.steps + usage.steps,
+		}
+		: { ...usage };
 }
 
 function ensureStarted(stream: AssistantMessageEventStream, blocks: BlockState): void {
@@ -308,41 +311,76 @@ async function consumeTurn(
 	handle: TurnHandle,
 	model: Model<Api>,
 	options: SimpleStreamOptions | undefined,
+	onCompleted: (outcome: TurnOutcome, final: AssistantMessage) => void,
+	meter: UsageMeter | undefined,
 ): Promise<void> {
+	const usage = blocks.usage;
 	for (;;) {
 		const activity = await handle.next();
 		if (!activity) break;
 		await options?.onProviderStreamEvent?.(activity, model);
 		if (activity.type === "text") appendText(stream, blocks, activity.delta);
 		else if (activity.type === "thought" && activity.delta) appendThinking(stream, blocks, activity.delta);
-		else if (activity.type === "usage") applyUsage(blocks.partial.usage, activity.usage);
-		else if (activity.type === "context_usage") applyContextUsage(blocks.partial.usage, activity.contextUsage.used);
-		else if (activity.type === "bridge_call") {
+		else if (activity.type === "step_usage") {
+			addStepUsage(usage, activity.usage);
+			meter?.addSteps(activity.usage);
+			syncUsage(blocks.partial.usage, usage);
+		} else if (activity.type === "usage") {
+			usage.cumulative = activity.usage;
+			syncUsage(blocks.partial.usage, usage);
+		} else if (activity.type === "context_usage") {
+			usage.occupancy = activity.contextUsage.used;
+			syncUsage(blocks.partial.usage, usage);
+		} else if (activity.type === "bridge_call") {
 			emitToolUse(stream, blocks, activity);
 			return;
 		}
 		// Native viewer frames need no second pi tool card. Other execution
 		// remains on the pi bridge; view_file exists to deliver image pixels.
 	}
+	// Occupancy reported during an EARLIER message of this turn is stale here
+	// (tool results were added since), so outcome.contextUsage is not applied.
 	const outcome = await handle.outcome;
-	if (outcome.contextUsage) applyContextUsage(blocks.partial.usage, outcome.contextUsage.used);
 	if (outcome.aborted) return finish(stream, blocks, "aborted", "Operation aborted");
 	if (outcome.status === "ERROR") return finish(stream, blocks, "error", outcome.error ?? "Antigravity turn failed");
+	// agy reports an exhausted plan as ordinary model text; surface it as an
+	// error so pi's retry/fallback logic and the status line see it.
+	const exhausted = quotaExhaustion(outcome.response);
+	if (exhausted) {
+		meter?.setExhausted(exhausted);
+		return finish(stream, blocks, "error", `Antigravity quota exhausted for ${model.id}.${exhausted.resetAt ? ` Resets at ${exhausted.resetAt}.` : ""}`);
+	}
 	if (blocks.textIdx === null && outcome.response) appendText(stream, blocks, outcome.response);
 	if (blocks.textIdx === null && blocks.thinkingIdx === null) appendText(stream, blocks, "");
+	onCompleted(outcome, blocks.partial);
 	finish(stream, blocks, "stop");
+}
+
+/** Per-extension ACP session continuity. `warm` is set only after a turn
+ *  completes cleanly, and cleared while a turn runs. */
+export interface AcpSessions {
+	warm?: WarmSession;
+	/** cwd of the in-flight turn, for continuations that complete it. */
+	turnCwd?: string;
 }
 
 export interface StreamSimpleDeps {
 	entries: AgyModelEntry[];
 	driver: TurnDriver;
 	roundTrips: ToolRoundTrips;
+	sessions?: AcpSessions;
+	meter?: UsageMeter;
 }
 
 export function createStreamSimple(deps: StreamSimpleDeps) {
+	const sessions = deps.sessions ?? {};
 	return (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream => {
 		const stream = createAssistantMessageEventStream();
-		const blocks: BlockState = { partial: newAssistant(model), textIdx: null, thinkingIdx: null, started: false };
+		const blocks: BlockState = { partial: newAssistant(model), textIdx: null, thinkingIdx: null, started: false, usage: {} };
+		const onCompleted = (outcome: TurnOutcome, final: AssistantMessage): void => {
+			if (outcome.status !== "OK" || !outcome.conversationId || sessions.turnCwd === undefined) return;
+			sessions.warm = warmAfterTurn(context, final, outcome.conversationId, sessions.turnCwd);
+		};
 		void (async () => {
 			try {
 				const results = context.messages.filter((message): message is Extract<Message, { role: "toolResult" }> =>
@@ -351,13 +389,19 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 				for (const result of results) deps.roundTrips.resolve(result.toolCallId, contentText(result.content), result.isError, resultImages(result));
 				const active = results.length > 0 ? deps.driver.reentry() : null;
 				if (active) {
-					await consumeTurn(stream, blocks, active, model, options);
+					await consumeTurn(stream, blocks, active, model, options, onCompleted, deps.meter);
 					return;
 				}
 
 				const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 				const entry = deps.entries.find((candidate) => candidate.id === model.id);
-				const transcript = transcriptForAcp(context);
+				const plan = planTurn(context, cwd, sessions.warm);
+				traceUsage("plan", plan.kind === "warm"
+					? { kind: plan.kind, sessionId: plan.sessionId, deltaMessages: plan.deltaMessages, delta: plan.input.contextBlock ? "transcript" : "user" }
+					: { kind: plan.kind, reason: plan.reason, messages: context.messages.length });
+				// Unknown until this turn completes cleanly.
+				sessions.warm = undefined;
+				sessions.turnCwd = cwd;
 				const request: DriverTurnRequest = {
 					cwd,
 					model: entry?.full ?? model.id,
@@ -366,10 +410,11 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					// ACP transport and its native viewer are auto-approved. Original
 					// pi tool execution still goes through pi's permission policy.
 					skipPermissions: true,
-					conversationId: null,
-					prompt: "Continue the task from the pi transcript, including any tool results or discarded previous attempt. Attached images are numbered in transcript order. Use pi-bridge tools for original files and URLs (including clipboard images outside the workspace). When a pi result gives staged image paths, use native view_file on those paths to see the pixels; do not re-read the staged copies through MCP.",
-					images: transcript.images,
-					contextBlock: { uri: "pi://transcript", text: transcript.text },
+					conversationId: plan.kind === "warm" ? plan.sessionId : null,
+					prompt: plan.input.prompt,
+					images: plan.input.images,
+					...(plan.input.contextBlock ? { contextBlock: plan.input.contextBlock } : {}),
+					...(plan.kind === "warm" ? { fallback: plan.fallback } : {}),
 					signal: options?.signal,
 					timeoutMin: 0,
 					inactivityMin: 5,
@@ -377,7 +422,7 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 				const replacement = await options?.onPayload?.(request, model);
 				const handle = await deps.driver.run((replacement === undefined ? request : replacement) as DriverTurnRequest);
 				await options?.onResponse?.({ status: 200, headers: {} }, model);
-				await consumeTurn(stream, blocks, handle, model, options);
+				await consumeTurn(stream, blocks, handle, model, options, onCompleted, deps.meter);
 			} catch (error) {
 				finish(stream, blocks, options?.signal?.aborted ? "aborted" : "error", error instanceof Error ? error.message : String(error));
 			}
