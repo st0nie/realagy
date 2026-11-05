@@ -90,8 +90,13 @@ export function fetchCliUsage(bin: string, timeoutMs = 60_000): Promise<UsageGro
 	});
 }
 
+/** Remaining share, rounded DOWN to 0.1% so a slightly used bucket never
+ *  reads 100% (a few prompts can be ~1% of a large weekly quota). */
 function percent(fraction: number): string {
-	return `${Math.round(Math.min(1, Math.max(0, fraction)) * 100)}%`;
+	const clamped = Math.min(1, Math.max(0, fraction));
+	if (clamped >= 1) return "100%";
+	const tenths = Math.floor(clamped * 1000 + 1e-9) / 10;
+	return `${Number.isInteger(tenths) ? tenths : tenths.toFixed(1)}%`;
 }
 
 export function formatReset(iso: string, now = new Date()): string | undefined {

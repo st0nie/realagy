@@ -114,7 +114,7 @@ const CLI_USAGE = JSON.stringify({
 	command: { name: "usage", data: { groups: [
 		{ name: "Gemini Models", buckets: [{ id: "gemini-weekly", window: "weekly", remaining_fraction: 0.71, reset_time: "2026-11-11T12:51:28Z" }, { id: "gemini-5h", window: "5h", remaining_fraction: 1 }] },
 		{ name: "Claude and GPT models", buckets: [{ id: "3p-weekly", window: "weekly", remaining_fraction: 0.44 }] },
-		{ name: "Gemini 4 Argon", buckets: [{ id: "argon", window: "weekly", remaining_fraction: 0.99 }] },
+		{ name: "Gemini 4 Argon", buckets: [{ id: "argon", window: "weekly", remaining_fraction: 0.9885914921760559 }] },
 	] } },
 });
 
@@ -140,7 +140,7 @@ test("usage meter reports cache hits and every quota group", () => {
 	const report = meter.report(new Date(Date.UTC(2026, 10, 5)));
 	assert.match(report, /Cache hits: 90% latest · 45% this session/);
 	assert.match(report, /Claude and GPT models\n  weekly: 44% left/);
-	assert.match(report, /Gemini 4 Argon\n  weekly: 99% left/);
+	assert.match(report, /Gemini 4 Argon\n  weekly: 98\.8% left/, "never rounds a used bucket up to 100%");
 	meter.setExhausted({});
 	assert.match(meter.report(), /Quota exhausted/);
 });
