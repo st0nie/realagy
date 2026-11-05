@@ -6,7 +6,7 @@ import { DatabaseSync } from "node:sqlite";
 import { test } from "vitest";
 import { AcpDriver } from "../src/acp/driver.js";
 import { lastStepIdx, readStepTokens, siblingUsage, summarizeSteps, tokensFromMetadata } from "../src/acp/step-usage.js";
-import { parseCliUsage, quotaExhaustion, UsageMeter } from "../src/quota.js";
+import { fetchCliUsage, parseCliUsage, quotaExhaustion, UsageMeter } from "../src/quota.js";
 import type { DriverActivity, TurnHandle } from "../src/driver-types.js";
 
 const varint = (n: number): number[] => {
@@ -143,4 +143,18 @@ test("usage meter reports cache hits and every quota group", () => {
 	assert.match(report, /Gemini 4 Argon\n  weekly: 98\.8% left/, "never rounds a used bucket up to 100%");
 	meter.setExhausted({});
 	assert.match(meter.report(), /Quota exhausted/);
+});
+
+test("fetchCliUsage resolves as soon as stdout flushes the JSON line", async () => {
+	const dir = tmp();
+	const script = path.join(dir, "fake-agy.mjs");
+	fs.writeFileSync(
+		script,
+		`#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(CLI_USAGE)} + "\\n");\nsetTimeout(() => process.exit(0), 5000);\n`,
+		{ mode: 0o755 },
+	);
+	const started = Date.now();
+	const groups = await fetchCliUsage(script, 10_000);
+	assert.ok(Date.now() - started < 2000, "resolves without waiting for post-output teardown");
+	assert.equal(groups.length, 3);
 });

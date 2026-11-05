@@ -77,14 +77,42 @@ export function parseCliUsage(stdout: string): UsageGroup[] {
 	return result;
 }
 
-export function fetchCliUsage(bin: string, timeoutMs = 60_000): Promise<UsageGroup[]> {
+export function fetchCliUsage(
+	bin: string,
+	options: number | { timeoutMs?: number; signal?: AbortSignal } = 60_000,
+): Promise<UsageGroup[]> {
+	const timeoutMs = typeof options === "number" ? options : (options.timeoutMs ?? 60_000);
+	const signal = typeof options === "number" ? undefined : options.signal;
 	return new Promise((resolve, reject) => {
-		execFile(bin, ["--print", "/usage", "--output-format", "json"], { timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, encoding: "utf8" }, (error, stdout) => {
-			if (error) return reject(new Error(`agy /usage failed: ${error.message}`));
+		let settled = false;
+		let output = "";
+		const child = execFile(
+			bin,
+			["--print", "/usage", "--output-format", "json"],
+			{ timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024, encoding: "utf8", ...(signal ? { signal } : {}) },
+			(error, stdout) => {
+				if (settled) return;
+				settled = true;
+				if (error) return reject(new Error(`agy /usage failed: ${error.message}`));
+				try {
+					resolve(parseCliUsage(stdout));
+				} catch (parseError) {
+					reject(parseError);
+				}
+			},
+		);
+		// `agy --print /usage` flushes its JSON line before spending ~1-2 s tearing
+		// down its local language server; resolve as soon as the JSON is complete.
+		child?.stdout?.on("data", (chunk: string | Buffer) => {
+			if (settled) return;
+			output += String(chunk);
+			if (!output.includes("\n")) return;
 			try {
-				resolve(parseCliUsage(stdout));
-			} catch (parseError) {
-				reject(parseError);
+				const groups = parseCliUsage(output);
+				settled = true;
+				resolve(groups);
+			} catch {
+				// Wait for the remaining chunks or process exit.
 			}
 		});
 	});

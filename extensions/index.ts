@@ -3,7 +3,7 @@
 // or global MCP registration. Only the native image/file viewer is enabled.
 
 import { createProvider } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader, type ExtensionAPI, type ExtensionCommandContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { AcpDriver } from "../src/acp/driver.js";
 import { fetchCliUsage, UsageMeter } from "../src/quota.js";
 import type { AcpSessions } from "../src/provider.js";
@@ -29,6 +29,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	let bin = resolveAcpBinary("");
 	let bridge: McpServerHandle | null = null;
 	let stopped = false;
+	const shutdownController = new AbortController();
 
 	const driver = new AcpDriver({
 		bin: () => bin,
@@ -131,12 +132,48 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	});
 	pi.on("session_shutdown", () => {
 		stopped = true;
+		shutdownController.abort();
 		sessions.warm = undefined;
 		roundTrips.failAll("pi session shut down");
 		void driver.close("shutdown");
 		if (bridge) void bridge.close();
 		bridge = null;
 	});
+
+	const runWithLoader = async <T>(
+		ctx: ExtensionCommandContext,
+		message: string,
+		task: (signal: AbortSignal) => Promise<T>,
+	): Promise<{ aborted: true } | { aborted: false; value: T }> => {
+		const controller = new AbortController();
+		const abort = () => controller.abort();
+		if (shutdownController.signal.aborted) controller.abort();
+		else shutdownController.signal.addEventListener("abort", abort, { once: true });
+		try {
+			if (ctx.mode === "tui" && typeof ctx.ui.custom === "function") {
+				return await ctx.ui.custom<{ aborted: true } | { aborted: false; value: T }>((tui, theme, _kb, done) => {
+					const loader = new BorderedLoader(tui, theme, message);
+					const cancel = () => {
+						controller.abort();
+						done({ aborted: true });
+					};
+					loader.onAbort = cancel;
+					if (controller.signal.aborted) cancel();
+					else {
+						void task(controller.signal).then(
+							(value) => done(controller.signal.aborted ? { aborted: true } : { aborted: false, value }),
+							() => done({ aborted: true }),
+						);
+					}
+					return loader;
+				});
+			}
+			const value = await task(controller.signal);
+			return controller.signal.aborted ? { aborted: true } : { aborted: false, value };
+		} finally {
+			shutdownController.signal.removeEventListener("abort", abort);
+		}
+	};
 
 	pi.registerCommand("agy", {
 		description: "Antigravity: /agy setup (install and sign-in help) or /agy usage (cache hits and plan quota)",
@@ -151,8 +188,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		handler: async (args, ctx) => {
 			const sub = args.trim();
 			if (sub === "setup") {
-				const result = await discover();
-				if (stopped) return;
+				const loaded = await runWithLoader(ctx, "Checking Antigravity CLI…", () => discover());
+				if (stopped || loaded.aborted) return;
+				const result = loaded.value;
 				if (result.ok) {
 					ctx.ui.notify(`Antigravity is ready: ${bin} is signed in and offers ${result.models} models. Pick one with /model.`, "info");
 				} else if (result.missing) {
@@ -171,15 +209,20 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				ctx.ui.notify(status.ok ? "Antigravity is still starting; try again shortly." : `Antigravity: ${status.error}. Run /agy setup for install steps.`, "warning");
 				return;
 			}
-			// On demand only: `agy --print /usage` takes ~10 s.
+			// Show session cache stats immediately; `agy --print /usage` takes ~5-10 s.
+			ctx.ui.notify(`${meter.report()}\n\nLoading plan quota from agy…`, "info");
 			let quotaError = "";
-			try {
-				meter.setQuota(await fetchCliUsage(bin));
-			} catch (error) {
-				quotaError = `\n\nQuota unavailable: ${error instanceof Error ? error.message : String(error)}`;
-			}
+			const loaded = await runWithLoader(ctx, "Loading Antigravity plan quota…", async (signal) => {
+				try {
+					meter.setQuota(await fetchCliUsage(bin, { signal }));
+				} catch (error) {
+					if (!signal.aborted) {
+						quotaError = `\n\nQuota unavailable: ${error instanceof Error ? error.message : String(error)}`;
+					}
+				}
+			});
 			if (stopped) return;
-			ctx.ui.notify(`${meter.report()}${quotaError}`, "info");
+			ctx.ui.notify(loaded.aborted ? meter.report() : `${meter.report()}${quotaError}`, "info");
 		},
 	});
 }

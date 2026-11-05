@@ -1,11 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-	ensure: vi.fn(), listModels: vi.fn(), close: vi.fn(), register: vi.fn(),
+	ensure: vi.fn(), listModels: vi.fn(), close: vi.fn(), register: vi.fn(), fetchCliUsage: vi.fn(),
 }));
 vi.mock("../src/acp/setup.js", () => ({ ensureAgyReady: mocks.ensure, resolveAgyBinary: () => "agy", MANUAL_SETUP: "curl -fsSL https://antigravity.google/cli/install.sh | bash" }));
 vi.mock("../src/acp/connection.js", () => ({ resolveAcpBinary: () => "agy" }));
-vi.mock("../src/quota.js", () => ({ fetchCliUsage: vi.fn(async () => []), UsageMeter: class { setQuota() {} report() { return "REPORT"; } } }));
+vi.mock("../src/quota.js", () => ({ fetchCliUsage: mocks.fetchCliUsage, UsageMeter: class { setQuota() {} report() { return "REPORT"; } } }));
 vi.mock("../src/acp/driver.js", () => ({ AcpDriver: class {
 	listModels = mocks.listModels;
 	close = mocks.close;
@@ -13,6 +13,7 @@ vi.mock("../src/acp/driver.js", () => ({ AcpDriver: class {
 vi.mock("../src/mcp-server.js", () => ({ startMcpServer: async () => ({ ok: true, handle: { port: 1, token: "test", close: vi.fn() } }), TOKEN_HEADER: "token" }));
 vi.mock("../src/provider.js", () => ({ createStreamSimple: vi.fn(), POLL_TOOL_NAME: "poll", ToolRoundTrips: class { failAll() {} } }));
 
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import extension from "../extensions/index.js";
 
 function deferred<T>() {
@@ -33,7 +34,7 @@ async function start() {
 	return { shutdown: () => { handlers.get("session_shutdown")!(); stale = true; }, ui, commands, ctx };
 }
 
-beforeEach(() => { vi.clearAllMocks(); mocks.close.mockResolvedValue(undefined); });
+beforeEach(() => { vi.clearAllMocks(); mocks.close.mockResolvedValue(undefined); mocks.fetchCliUsage.mockResolvedValue([]); });
 
 describe("extension session lifecycle", () => {
 	it("prompts with install instructions when agy is missing and does not install", async () => {
@@ -57,9 +58,11 @@ describe("extension session lifecycle", () => {
 		expect(session.ui.notify).not.toHaveBeenCalled();
 	});
 
-	it("registers /agy with usage completion and report", async () => {
+	it("registers /agy with usage completion, immediate loading notice, and final report", async () => {
+		const quota = deferred<never[]>();
 		mocks.ensure.mockReturnValue({ ok: true, bin: "agy" });
 		mocks.listModels.mockResolvedValue([]);
+		mocks.fetchCliUsage.mockReturnValueOnce(quota.promise);
 		const session = await start();
 		const agy = session.commands.get("agy");
 		expect([...session.commands.keys()]).toEqual(["agy"]);
@@ -67,7 +70,39 @@ describe("extension session lifecycle", () => {
 		expect(agy.getArgumentCompletions("").map((item: { value: string }) => item.value)).toEqual(["setup", "usage"]);
 		expect(agy.getArgumentCompletions("x")).toBeNull();
 		await vi.waitFor(() => expect(mocks.listModels).toHaveBeenCalled());
-		await agy.handler("usage", session.ctx);
+		const pending = agy.handler("usage", session.ctx);
+		expect(session.ui.notify).toHaveBeenCalledWith("REPORT\n\nLoading plan quota from agy…", "info");
+		quota.resolve([]);
+		await pending;
+		expect(session.ui.notify).toHaveBeenLastCalledWith("REPORT", "info");
+	});
+
+	it("shows a cancellable TUI loader during /agy usage and aborts fetchCliUsage on Esc", async () => {
+		initTheme();
+		let capturedSignal: AbortSignal | undefined;
+		mocks.ensure.mockReturnValue({ ok: true, bin: "agy" });
+		mocks.listModels.mockResolvedValue([]);
+		mocks.fetchCliUsage.mockImplementationOnce((_bin: string, opts?: { signal?: AbortSignal }) => {
+			capturedSignal = opts?.signal;
+			return new Promise<never[]>(() => {});
+		});
+		const session = await start();
+		await vi.waitFor(() => expect(mocks.listModels).toHaveBeenCalled());
+		const custom = vi.fn(async (factory: any) => {
+			let result: unknown;
+			const loader = factory(
+				{ requestRender: vi.fn() },
+				{ fg: (_c: string, s: string) => s },
+				{},
+				(val: unknown) => { result = val; },
+			);
+			loader.handleInput("\x1b");
+			loader.dispose();
+			return result;
+		});
+		await session.commands.get("agy").handler("usage", { ...session.ctx, mode: "tui", ui: { ...session.ui, custom } });
+		expect(custom).toHaveBeenCalledTimes(1);
+		expect(capturedSignal?.aborted).toBe(true);
 		expect(session.ui.notify).toHaveBeenLastCalledWith("REPORT", "info");
 	});
 
