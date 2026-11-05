@@ -416,6 +416,7 @@ export class AcpDriver implements TurnDriver {
 			this.#collectStepUsage(turn);
 			if (usage && !turn.stepUsageSeen) this.#emit(turn, { type: "usage", usage });
 			const mapped = mapStopReason(result.stopReason);
+			const endStepIdx = turn.dbPath ? lastStepIdx(turn.dbPath) : -1;
 			this.#settle(turn, {
 				conversationId: turn.sessionId,
 				status: mapped.status,
@@ -424,6 +425,7 @@ export class AcpDriver implements TurnDriver {
 				error: mapped.error,
 				finished: true,
 				aborted: mapped.aborted,
+				maxStepIdx: endStepIdx >= 0 ? endStepIdx : undefined,
 			});
 		} catch (err) {
 			if (turn.closed) return;

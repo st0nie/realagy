@@ -14,9 +14,8 @@ import { bridgedPiTools } from "../src/bridge-catalog.js";
 import { startMcpServer, TOKEN_HEADER, type McpServerHandle } from "../src/mcp-server.js";
 import { entriesFromAcpModels, FALLBACK_MODELS, toPiModel, type AgyModelEntry } from "../src/models.js";
 import { createStreamSimple, POLL_TOOL_NAME, ToolRoundTrips } from "../src/provider.js";
-
 import { normalizeSchema } from "../src/schema.js";
-
+import { restoreWarmSessions, WARM_SESSION_ENTRY, type SessionEntryLike, type WarmSession } from "../src/transcript.js";
 const SIGN_IN = [
 	"Sign in with the Antigravity CLI in a terminal (realagy never handles credentials):",
 	"  agy                # interactive sign-in on first run",
@@ -75,7 +74,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	if (!started.ok) throw new Error(`Cannot start pi tool bridge: ${started.reason}`);
 	bridge = started.handle;
 
-	const sessions: AcpSessions = {};
+	let pendingWarmEntry: WarmSession | null = null;
+	const sessions: AcpSessions = {
+		conversationsDir: () => defaultConversationsDir(),
+		onWarm: (warm) => {
+			pendingWarmEntry = warm;
+		},
+	};
 	const meter = new UsageMeter();
 	let ready = false;
 	const streamSimple = createStreamSimple({ entries, driver, roundTrips, sessions, meter });
@@ -125,15 +130,38 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			: `Antigravity model discovery failed: ${result.error}. Run /agy setup to sign in.`, "warning");
 	};
 
+	const syncWarmFromSession = (ctx: { sessionManager?: { getBranch?: () => unknown[]; getEntries?: () => unknown[] } }): void => {
+		pendingWarmEntry = null;
+		const branch = (ctx.sessionManager?.getBranch?.() ?? []) as readonly SessionEntryLike[];
+		const all = (ctx.sessionManager?.getEntries?.() ?? branch) as readonly SessionEntryLike[];
+		const restored = restoreWarmSessions(branch, all);
+		sessions.warm = restored.warm;
+		sessions.checkpoints = restored.checkpoints;
+	};
+
 	pi.on("session_start", (_event, ctx) => {
+		syncWarmFromSession(ctx);
 		refresh ??= refreshCatalog(ctx).catch((error: unknown) => {
 			if (!stopped && ctx.hasUI) ctx.ui.notify(`Antigravity setup failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
 		}).finally(() => { refresh = null; });
 	});
+	pi.on("session_tree", (_event, ctx) => {
+		syncWarmFromSession(ctx);
+	});
+	pi.on("turn_end", () => {
+		if (!pendingWarmEntry) return;
+		const entry = pendingWarmEntry;
+		pendingWarmEntry = null;
+		try {
+			pi.appendEntry(WARM_SESSION_ENTRY, entry);
+		} catch { /* ephemeral or read-only session */ }
+	});
 	pi.on("session_shutdown", () => {
 		stopped = true;
 		shutdownController.abort();
+		pendingWarmEntry = null;
 		sessions.warm = undefined;
+		sessions.checkpoints = undefined;
 		roundTrips.failAll("pi session shut down");
 		void driver.close("shutdown");
 		if (bridge) void bridge.close();

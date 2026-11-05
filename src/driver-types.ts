@@ -128,6 +128,8 @@ export interface TurnOutcome {
 	 *  guard (not a user abort, not a process crash). With sawResult false on
 	 *  a resumed conversation this marks the conversation as poisoned. */
 	deadline?: "timeout" | "stall";
+	/** ACP only: highest `steps.idx` in `<conversationId>.db` when this turn settled. */
+	maxStepIdx?: number;
 }
 
 export interface TurnHandle {

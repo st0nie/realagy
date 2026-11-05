@@ -24,10 +24,17 @@ export interface AcpInput {
 export interface WarmSession {
 	sessionId: string;
 	cwd: string;
-	/** Number of leading pi messages the session holds. */
+	/** Number of leading persistent pi messages the session holds. */
 	count: number;
 	/** Fingerprint of those messages. */
 	hash: string;
+	/** Per-message hashes of non-system, non-`<realctx-history>` messages in order,
+	 *  used to match the intact suffix after `realctx` folds early turns into
+	 *  `<realctx-history>` summaries. */
+	keys?: string[];
+	/** Highest `steps.idx` in `~/.gemini/antigravity-cli/conversations/<sessionId>.db`
+	 *  when this turn completed. Used to fork a truncated store on `/tree` rewind. */
+	maxStepIdx?: number;
 	systemPrompt: string;
 	tools: string;
 }
@@ -264,11 +271,35 @@ function splitAtPersistentCount(messages: Message[], count: number): { prefix: M
 	return { prefix, delta: messages.slice(idx) };
 }
 
+const REALCTX_USER_IMAGE_DROP = /\[#\d+ (?:dropped|summarized|superseded) · user images?\b/;
+
 function messageKey(message: Message): string {
-	const serialized = serializeMessage(message, 0);
-	const images = serialized.images.map((image) => createHash("sha256").update(image.data).digest("hex").slice(0, 16));
 	if (message.role === "system") return JSON.stringify(["system", message.content, message.sections ?? null]);
-	return JSON.stringify([message.role, serialized.text, images]);
+	if (message.role === "toolResult") {
+		return JSON.stringify(["toolResult", message.toolName, message.toolCallId, Boolean(message.isError)]);
+	}
+	if (message.role === "user") {
+		const raw = contentText(message.content);
+		const clean = stripForgedRealctx(raw).trim();
+		const hasBlocks = Array.isArray(message.content) && message.content.some((block) => block.type === "image");
+		const hasImage = hasBlocks || REALCTX_USER_IMAGE_DROP.test(raw);
+		return JSON.stringify(["user", clean, hasImage]);
+	}
+	const serialized = serializeMessage(message, 0);
+	return JSON.stringify([message.role, serialized.text]);
+}
+
+function shortMessageHash(message: Message): string {
+	return createHash("sha256").update(messageKey(message)).digest("hex").slice(0, 16);
+}
+
+export function nonHistoryKeys(messages: Message[]): string[] {
+	const out: string[] = [];
+	for (const message of persistentMessages(messages)) {
+		if (message.role === "system" || isHistorySummary(message)) continue;
+		out.push(shortMessageHash(message));
+	}
+	return out;
 }
 
 export function fingerprint(messages: Message[]): string {
@@ -277,13 +308,70 @@ export function fingerprint(messages: Message[]): string {
 	return hash.digest("hex");
 }
 
+function matchKeySuffix(
+	body: ReadonlyArray<{ index: number; key: string }>,
+	targetKeys: readonly string[],
+	allowDropPrefix: boolean,
+): number | null {
+	if (targetKeys.length === 0 || body.length === 0) return null;
+	const maxDrop = allowDropPrefix ? targetKeys.length - 1 : 0;
+	for (let drop = 0; drop <= maxDrop; drop++) {
+		const kept = targetKeys.length - drop;
+		if (body.length < kept) continue;
+		let matches = true;
+		for (let i = 0; i < kept; i++) {
+			if (body[i]?.key !== targetKeys[drop + i]) {
+				matches = false;
+				break;
+			}
+		}
+		if (matches) {
+			const endEntry = body[kept - 1];
+			return endEntry ? endEntry.index + 1 : null;
+		}
+	}
+	return null;
+}
+
+/** Split `messages` into the warm session's prefix and the new delta, allowing
+ *  `realctx` to fold leading turns into `<realctx-history>` summaries while the
+ *  remaining suffix of non-history messages stays intact. */
+export function splitWarmTranscript(
+	messages: Message[],
+	warm: { count: number; hash: string; keys?: readonly string[] },
+): { prefix: Message[]; delta: Message[] } | null {
+	const direct = splitAtPersistentCount(messages, warm.count);
+	if (direct && fingerprint(direct.prefix) === warm.hash) {
+		return direct;
+	}
+	if (!warm.keys || warm.keys.length === 0) return null;
+
+	const body: Array<{ index: number; key: string }> = [];
+	let sawHistorySummary = false;
+	for (let i = 0; i < messages.length; i++) {
+		const message = messages[i];
+		if (!message || isEphemeralMessage(message) || message.role === "system") continue;
+		if (body.length === 0 && isHistorySummary(message)) {
+			sawHistorySummary = true;
+			continue;
+		}
+		body.push({ index: i, key: shortMessageHash(message) });
+	}
+	const splitIdx = matchKeySuffix(body, warm.keys, sawHistorySummary);
+	if (splitIdx === null) return null;
+	return {
+		prefix: persistentMessages(messages.slice(0, splitIdx)),
+		delta: messages.slice(splitIdx),
+	};
+}
+
 export function toolsKey(context: TranscriptContext): string {
-	return getCurrentTools(context.messages).map((tool) => tool.name).sort().join(",");
+	return getCurrentTools(context.messages).map((tool) => tool.name).sort((a, b) => a.localeCompare(b)).join(",");
 }
 
 export type TurnPlan =
 	| { kind: "fresh"; input: AcpInput; reason: string }
-	| { kind: "warm"; sessionId: string; input: AcpInput; fallback: AcpInput; deltaMessages: number };
+	| { kind: "warm"; sessionId: string; maxStepIdx?: number; input: AcpInput; fallback: AcpInput; deltaMessages: number };
 
 export function planTurn(context: TranscriptContext, cwd: string, warm: WarmSession | undefined): TurnPlan {
 	const fresh = (reason: string): TurnPlan => ({ kind: "fresh", input: freshInput(context), reason });
@@ -291,9 +379,12 @@ export function planTurn(context: TranscriptContext, cwd: string, warm: WarmSess
 	if (warm.cwd !== cwd) return fresh("cwd");
 	if (warm.tools !== toolsKey(context)) return fresh("tools");
 	const messages = context.messages;
-	const split = splitAtPersistentCount(messages, warm.count);
-	if (!split || split.delta.length === 0) return fresh("history-shrank");
-	if (fingerprint(split.prefix) !== warm.hash) return fresh("history-diverged");
+	const split = splitWarmTranscript(messages, warm);
+	if (!split) {
+		const persistent = persistentMessages(messages);
+		return fresh(persistent.length <= warm.count ? "history-shrank" : "history-diverged");
+	}
+	if (split.delta.length === 0) return fresh("history-shrank");
 	const delta = split.delta;
 	if (!delta.some((message) => message.role === "user")) return fresh("no-user-message");
 
@@ -318,19 +409,98 @@ export function planTurn(context: TranscriptContext, cwd: string, warm: WarmSess
 		const body = serializeBounded(header, visible);
 		input = { prompt: DELTA_PROMPT, images: body.images, contextBlock: { uri: "pi://transcript-delta", text: body.text } };
 	}
-	return { kind: "warm", sessionId: warm.sessionId, input, fallback: freshInput(context), deltaMessages: delta.length };
+	return {
+		kind: "warm",
+		sessionId: warm.sessionId,
+		maxStepIdx: warm.maxStepIdx,
+		input,
+		fallback: freshInput(context),
+		deltaMessages: delta.length,
+	};
 }
 
 /** State after a completed turn: the session holds pi's persistent messages
  *  plus the final assistant message pi is about to record. */
-export function warmAfterTurn(context: TranscriptContext, final: AssistantMessage, sessionId: string, cwd: string): WarmSession {
+export function warmAfterTurn(
+	context: TranscriptContext,
+	final: AssistantMessage,
+	sessionId: string,
+	cwd: string,
+	maxStepIdx?: number,
+): WarmSession {
 	const messages = [...persistentMessages(context.messages), final];
-	return {
+	const warm: WarmSession = {
 		sessionId,
 		cwd,
 		count: messages.length,
 		hash: fingerprint(messages),
+		keys: nonHistoryKeys(messages),
 		systemPrompt: getCurrentSystemPrompt(context.messages),
 		tools: toolsKey(context),
+	};
+	if (maxStepIdx !== undefined && maxStepIdx >= 0) warm.maxStepIdx = maxStepIdx;
+	return warm;
+}
+
+export const WARM_SESSION_ENTRY = "realagy-warm-session";
+
+export interface SessionEntryLike {
+	type?: string;
+	customType?: string;
+	data?: Partial<WarmSession> | null;
+}
+
+function toWarmSession(data: Partial<WarmSession> | null | undefined): WarmSession | null {
+	if (!data) return null;
+	if (!data.sessionId || !data.cwd || !data.hash) return null;
+	if (data.count === undefined || data.systemPrompt === undefined || data.tools === undefined) return null;
+	const warm: WarmSession = {
+		sessionId: String(data.sessionId),
+		cwd: String(data.cwd),
+		count: Number(data.count),
+		hash: String(data.hash),
+		systemPrompt: String(data.systemPrompt),
+		tools: String(data.tools),
+	};
+	if (Array.isArray(data.keys)) warm.keys = data.keys.map((key) => String(key));
+	if (data.maxStepIdx !== undefined && Number.isFinite(data.maxStepIdx)) {
+		warm.maxStepIdx = Number(data.maxStepIdx);
+	}
+	return warm;
+}
+
+/** Reconstruct `warm` and chronological `checkpoints` from pi's session entries.
+ *  Branch entries take priority at the tail; off-branch entries (such as a
+ *  custom entry immediately following an assistant message selected in `/tree`
+ *  or checkpoints on sibling branches) are included earlier in `checkpoints`
+ *  so `selectTurnPlan` can match any turn across `/reload`, `/resume`, or `/tree`. */
+export function restoreWarmSessions(
+	branchEntries: readonly SessionEntryLike[],
+	allEntries: readonly SessionEntryLike[] = branchEntries,
+): { warm: WarmSession | undefined; checkpoints: WarmSession[] } {
+	const extract = (entries: readonly SessionEntryLike[]): WarmSession[] => {
+		const out: WarmSession[] = [];
+		for (const entry of entries) {
+			if (entry.type !== "custom" || entry.customType !== WARM_SESSION_ENTRY) continue;
+			const warm = toWarmSession(entry.data);
+			if (warm) out.push(warm);
+		}
+		return out;
+	};
+	const onBranch = extract(branchEntries);
+	const fromAll = extract(allEntries);
+	const seen = new Set<string>();
+	const keyOf = (w: WarmSession) => `${w.sessionId}:${w.count}:${w.hash}:${w.maxStepIdx ?? -1}`;
+	for (const w of onBranch) seen.add(keyOf(w));
+	const offBranch = fromAll.filter((w) => {
+		const k = keyOf(w);
+		if (seen.has(k)) return false;
+		seen.add(k);
+		return true;
+	});
+	const checkpoints = [...offBranch, ...onBranch];
+	return {
+		warm: onBranch.at(-1) ?? checkpoints.at(-1),
+		checkpoints,
 	};
 }

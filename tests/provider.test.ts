@@ -1,12 +1,25 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import os from "node:os";
+import path from "node:path";
 import { createAssistantMessageEventStream, type AssistantMessageEvent, type Message, type TranscriptContext } from "@earendil-works/pi-ai";
 import { calculateContextTokens, AgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { test, vi } from "vitest";
-import { createStreamSimple, POLL_TOOL_NAME, ToolRoundTrips } from "../src/provider.js";
+import { conversationDbPath, lastStepIdx } from "../src/acp/step-usage.js";
+import { createStreamSimple, POLL_TOOL_NAME, ToolRoundTrips, type AcpSessions } from "../src/provider.js";
 import type { DriverActivity, DriverSnapshot, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../src/driver-types.js";
 import { FALLBACK_MODELS, toPiModel } from "../src/models.js";
-import { freshInput, MAX_TRANSCRIPT_BYTES, planTurn, serializeBounded, warmAfterTurn } from "../src/transcript.js";
-
+import {
+	freshInput,
+	MAX_TRANSCRIPT_BYTES,
+	planTurn,
+	restoreWarmSessions,
+	serializeBounded,
+	WARM_SESSION_ENTRY,
+	warmAfterTurn,
+	type SessionEntryLike,
+} from "../src/transcript.js";
 class FakeHandle implements TurnHandle {
 	id = "turn-1";
 	outcome: Promise<TurnOutcome>;
@@ -313,9 +326,31 @@ test("bounded transcript keeps system prompt, realctx-history summaries, and new
 	assert.match(huge.contextBlock!.text, /tail prompt/);
 });
 
-test("warm session survives realctx assistant-tag stripping and ephemeral pi-lens context messages", () => {
+test("warm session survives realctx drops, path-notes, history chunks, tag stripping, and ephemeral pi-lens messages", () => {
 	const model = toPiModel(FALLBACK_MODELS[0]);
-	const turn1User = user("can we work with realctx historian?");
+	const img = { type: "image" as const, data: "dXNlckltZw==", mimeType: "image/png" };
+	const turn1User: Message = { role: "user", content: [{ type: "text", text: "inspect this screenshot" }, img], timestamp: 1 };
+	const turn1Asst: Message = {
+		role: "assistant",
+		content: [
+			{ type: "toolCall", id: "call-read-1", name: "read", arguments: { path: "src/a.ts" } },
+		],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "toolUse",
+		timestamp: 2,
+	};
+	const turn1Tool: Message = {
+		role: "toolResult",
+		toolCallId: "call-read-1",
+		toolName: "read",
+		content: [{ type: "text", text: "full file contents\n<realctx-path-notes>\nnote\n</realctx-path-notes>" }],
+		isError: false,
+		timestamp: 3,
+	};
+	const turn2User = user("can we work with realctx historian?");
 	const transient1 = user("[pi-lens automated check — not a user request] Address 🔴 blockers before continuing");
 	const rawFinal = {
 		role: "assistant" as const,
@@ -330,10 +365,27 @@ test("warm session survives realctx assistant-tag stripping and ephemeral pi-len
 		stopReason: "stop" as const,
 		timestamp: 10,
 	};
-	const warm = warmAfterTurn(context([system(), turn1User, transient1]), rawFinal, "acp-session-1", "/repo");
+	const warm = warmAfterTurn(
+		context([system(), turn1User, turn1Asst, turn1Tool, turn2User, transient1]),
+		rawFinal,
+		"acp-session-1",
+		"/repo",
+	);
 
-	// On the next turn, realctx strips forged tags/placeholders from the recorded assistant message
-	// and pi-lens removes its consumed one-request message.
+	// 1. Next turn after realctx drops the user image and toolResult body, strips forged assistant tags,
+	//    and pi-lens removes its ephemeral check message:
+	const turn1UserDropped: Message = {
+		role: "user",
+		content: [
+			{ type: "text", text: "inspect this screenshot" },
+			{ type: "text", text: "[#1 dropped · user image (1 image) · 1.2k tok]" },
+		],
+		timestamp: 1,
+	};
+	const turn1ToolDropped: Message = {
+		...turn1Tool,
+		content: [{ type: "text", text: "[#2 dropped · read src/a.ts · 3.1k tok]" }],
+	};
 	const cleanedAssistant = {
 		...rawFinal,
 		content: [{
@@ -341,19 +393,35 @@ test("warm session survives realctx assistant-tag stripping and ephemeral pi-len
 			text: "Yes, it uses\n\nand\n\nplaceholders.",
 		}],
 	};
-	const plan = planTurn(context([system(), turn1User, cleanedAssistant, user("great, let's adapt it")]), "/repo", warm);
-	assert.equal(plan.kind, "warm");
-	if (plan.kind !== "warm") return;
-	assert.equal(plan.sessionId, "acp-session-1");
-	assert.equal(plan.input.prompt, "great, let's adapt it");
+	const planAfterDrops = planTurn(
+		context([system(), turn1UserDropped, turn1Asst, turn1ToolDropped, turn2User, cleanedAssistant, user("great, let's adapt it")]),
+		"/repo",
+		warm,
+	);
+	assert.equal(planAfterDrops.kind, "warm");
+	if (planAfterDrops.kind !== "warm") return;
+	assert.equal(planAfterDrops.sessionId, "acp-session-1");
+	assert.equal(planAfterDrops.input.prompt, "great, let's adapt it");
+
+	// 2. Next turn after realctx historian also folds turn 1 into a <realctx-history> summary chunk:
+	const historyChunk = user('<realctx-history part="h1" turns="1-1" replaced="4.3k tok">\nTurn 1 summary\n</realctx-history>');
+	const planAfterHistorian = planTurn(
+		context([system(), historyChunk, turn2User, cleanedAssistant, user("still warm after historian?")]),
+		"/repo",
+		warm,
+	);
+	assert.equal(planAfterHistorian.kind, "warm");
+	if (planAfterHistorian.kind !== "warm") return;
+	assert.equal(planAfterHistorian.sessionId, "acp-session-1");
+	assert.equal(planAfterHistorian.input.prompt, "still warm after historian?");
 });
 
-test("mid-turn context compaction during tool reentry invalidates warm reuse for the next turn", async () => {
+test("mid-turn realctx history compression during tool reentry preserves warm reuse for the next turn", async () => {
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
 	const roundTrips = new ToolRoundTrips(driver);
 	const model = toPiModel(FALLBACK_MODELS[0]);
-	const sessions = {};
+	const sessions: AcpSessions = {};
 	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
 	try {
 		const oldTurnUser = user("old question");
@@ -377,29 +445,163 @@ test("mid-turn context compaction during tool reentry invalidates warm reuse for
 		assert.equal(step1Done?.type, "done");
 		if (step1Done?.type !== "done") return;
 
-		// While the tool runs, realctx historian replaces oldTurnUser + oldTurnAsst with a summary chunk.
+		// While the tool runs, realctx historian replaces oldTurnUser + oldTurnAsst with a summary chunk,
+		// while keeping currentUser intact.
 		const historyChunk = user('<realctx-history part="h1" turns="1-1" replaced="2.0k tok">\nSummarized old turn\n</realctx-history>');
 		const result: Message = { role: "toolResult", toolCallId: "call-compact", toolName: "bash", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 3 };
 		const compactedMidTurn = [system(), historyChunk, currentUser, step1Done.message, result];
 
 		const handle = driver.activeHandle as FakeHandle;
 		handle.pushExternal({ type: "text", delta: "checks passed" });
-		handle.complete({ status: "OK", response: "checks passed", finished: true, aborted: false, conversationId: "acp-pre-compaction" });
+		handle.complete({ status: "OK", response: "checks passed", finished: true, aborted: false, conversationId: "acp-warm-midturn" });
 
 		const step2Done = (await collect(stream(model, context(compactedMidTurn)))).find((event) => event.type === "done");
 		await parked;
 		assert.equal(step2Done?.type, "done");
 		if (step2Done?.type !== "done") return;
 
-		// Because history was compacted mid-turn, the next turn starts a fresh session with the compacted transcript.
+		// Because currentUser remained intact after the <realctx-history> summary, the next turn stays warm!
 		driver.autoFinish = true;
-		driver.script = [{ type: "text", delta: "fresh reply" }];
+		driver.script = [{ type: "text", delta: "warm reply" }];
 		await collect(stream(model, context([...compactedMidTurn, step2Done.message, user("next request")])));
 		assert.equal(driver.requests.length, 2);
-		assert.equal(driver.requests[1].conversationId, null);
-		assert.match(driver.requests[1].contextBlock?.text ?? "", /<realctx-history part="h1"/);
-		assert.match(driver.requests[1].contextBlock?.text ?? "", /next request/);
+		assert.equal(driver.requests[1].conversationId, "acp-warm-midturn");
+		assert.equal(driver.requests[1].prompt, "next request");
+		assert.equal(driver.requests[1].contextBlock, undefined);
 	} finally {
 		roundTrips.failAll("test done");
+	}
+});
+
+test("persisted warm checkpoints survive reload and fork the SQLite store on /tree branch rewind", async () => {
+	const require = createRequire(import.meta.url);
+	const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
+	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-rewind-"));
+	const baseSessionId = "11111111-2222-3333-4444-555555555555";
+	const baseTid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+	const dbPath = conversationDbPath(tmpDir, baseSessionId)!;
+
+	const seedSteps = (maxIdx: number) => {
+		const db = new DatabaseSync(dbPath);
+		db.exec(`
+			CREATE TABLE IF NOT EXISTS trajectory_meta (trajectory_id text, cascade_id text, trajectory_type integer, source integer, PRIMARY KEY (trajectory_id));
+			CREATE TABLE IF NOT EXISTS steps (idx integer PRIMARY KEY, step_type integer NOT NULL DEFAULT 0, status integer NOT NULL DEFAULT 0, metadata blob, step_payload blob);
+			CREATE TABLE IF NOT EXISTS gen_metadata (idx integer PRIMARY KEY, data blob, size integer NOT NULL DEFAULT 0);
+			CREATE TABLE IF NOT EXISTS executor_metadata (idx integer PRIMARY KEY, data blob);
+			CREATE TABLE IF NOT EXISTS trajectory_metadata_blob (id text DEFAULT 'main' PRIMARY KEY, data blob);
+		`);
+		db.prepare("INSERT OR REPLACE INTO trajectory_meta VALUES (?, ?, 4, 17)").run(baseTid, baseSessionId);
+		db.prepare("INSERT OR REPLACE INTO trajectory_metadata_blob VALUES ('main', ?)").run(
+			Buffer.from(`meta:${baseSessionId}:tid:${baseTid}`, "utf8"),
+		);
+		for (let i = 0; i <= maxIdx; i++) {
+			db.prepare("INSERT OR REPLACE INTO steps (idx, step_type, status) VALUES (?, ?, 3)").run(i, i === 0 || i === 4 ? 14 : 15);
+		}
+		// gen_metadata[0] -> steps [1, 2], gen_metadata[1] -> steps [5, 6]
+		db.prepare("INSERT OR REPLACE INTO gen_metadata (idx, data, size) VALUES (0, ?, 4)").run(Uint8Array.from([0x12, 0x02, 0x01, 0x02]));
+		if (maxIdx >= 5) {
+			db.prepare("INSERT OR REPLACE INTO gen_metadata (idx, data, size) VALUES (1, ?, 4)").run(Uint8Array.from([0x12, 0x02, 0x05, 0x06]));
+		}
+		// executor_metadata[0] -> end step 3, executor_metadata[1] -> end step 8
+		db.prepare("INSERT OR REPLACE INTO executor_metadata (idx, data) VALUES (0, ?)").run(Uint8Array.from([0x08, 0x04, 0x10, 0x02, 0x18, 0x03]));
+		if (maxIdx >= 8) {
+			db.prepare("INSERT OR REPLACE INTO executor_metadata (idx, data) VALUES (1, ?)").run(Uint8Array.from([0x08, 0x04, 0x10, 0x0c, 0x18, 0x08]));
+		}
+		db.close();
+	};
+
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const roundTrips = new ToolRoundTrips(driver);
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const sessionEntries: SessionEntryLike[] = [];
+	const sessions: AcpSessions = {
+		conversationsDir: () => tmpDir,
+		onWarm: (warm) => {
+			sessionEntries.push({ type: "custom", customType: WARM_SESSION_ENTRY, data: warm });
+		},
+	};
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+
+	try {
+		// Turn 1 completes at maxStepIdx = 3.
+		seedSteps(3);
+		const t1Messages = [system(), user("Turn 1 question")];
+		const t1Promise = collect(stream(model, context(t1Messages)));
+		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+		(driver.activeHandle as FakeHandle).pushExternal({ type: "text", delta: "Turn 1 answer" });
+		(driver.activeHandle as FakeHandle).complete({
+			status: "OK",
+			response: "Turn 1 answer",
+			finished: true,
+			aborted: false,
+			conversationId: baseSessionId,
+			maxStepIdx: 3,
+		});
+		const t1Done = (await t1Promise).find((e) => e.type === "done");
+		assert.equal(t1Done?.type, "done");
+		if (t1Done?.type !== "done") return;
+
+		// Turn 2 (Branch A) reuses baseSessionId (DB is still at step 3 when Turn 2A starts)
+		// and advances DB to maxStepIdx = 8 while Turn 2A executes.
+		const t2AMessages = [...t1Messages, t1Done.message, user("Turn 2A question")];
+		const t2APromise = collect(stream(model, context(t2AMessages)));
+		await vi.waitFor(() => assert.equal(driver.requests.length, 2));
+		assert.equal(driver.requests[1].conversationId, baseSessionId);
+		assert.equal(driver.requests[1].prompt, "Turn 2A question");
+		seedSteps(8);
+		(driver.activeHandle as FakeHandle).pushExternal({ type: "text", delta: "Turn 2A answer" });
+		(driver.activeHandle as FakeHandle).complete({
+			status: "OK",
+			response: "Turn 2A answer",
+			finished: true,
+			aborted: false,
+			conversationId: baseSessionId,
+			maxStepIdx: 8,
+		});
+		const t2ADone = (await t2APromise).find((e) => e.type === "done");
+		assert.equal(t2ADone?.type, "done");
+		if (t2ADone?.type !== "done") return;
+
+		// Simulate /reload + /tree rewind back to Turn 1 (where branch only has Turn 1, or even stops at Turn 1 assistant before its custom entry).
+		const reloaded = restoreWarmSessions([sessionEntries[0]!], sessionEntries);
+		sessions.warm = reloaded.warm;
+		sessions.checkpoints = reloaded.checkpoints;
+
+		driver.autoFinish = true;
+		driver.script = [{ type: "text", delta: "Turn 2B answer" }];
+		const t2BMessages = [...t1Messages, t1Done.message, user("Turn 2B alternate question")];
+		await collect(stream(model, context(t2BMessages)));
+
+		assert.equal(driver.requests.length, 3);
+		const forkedSessionId = driver.requests[2].conversationId;
+		assert.ok(forkedSessionId && forkedSessionId !== baseSessionId, "expected a forked sessionId on rewind");
+		assert.equal(driver.requests[2].prompt, "Turn 2B alternate question");
+		assert.equal(driver.requests[2].contextBlock, undefined);
+
+		// Verify the forked SQLite DB was truncated to step <= 3 while the original DB stayed at step 8.
+		assert.equal(lastStepIdx(dbPath), 8);
+		const forkedDbPath = conversationDbPath(tmpDir, forkedSessionId!)!;
+		assert.equal(lastStepIdx(forkedDbPath), 3);
+		const checkDb = new DatabaseSync(forkedDbPath, { readOnly: true });
+		const genCount = (checkDb.prepare("SELECT count(*) AS cnt FROM gen_metadata").get() as { cnt: number }).cnt;
+		const execCount = (checkDb.prepare("SELECT count(*) AS cnt FROM executor_metadata").get() as { cnt: number }).cnt;
+		const metaCascade = (checkDb.prepare("SELECT cascade_id FROM trajectory_meta LIMIT 1").get() as { cascade_id: string }).cascade_id;
+		const blobText = Buffer.from((checkDb.prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'").get() as { data: Uint8Array }).data).toString("utf8");
+		checkDb.close();
+		assert.equal(genCount, 1);
+		assert.equal(execCount, 1);
+		assert.equal(metaCascade, forkedSessionId);
+		assert.ok(blobText.includes(forkedSessionId!));
+		assert.ok(!blobText.includes(baseSessionId));
+
+		// Switching back to Branch A (Turn 2A) in /tree still reuses the intact baseSessionId at step 8!
+		await collect(stream(model, context([...t2AMessages, t2ADone.message, user("Turn 3A question on original branch")])));
+		assert.equal(driver.requests.length, 4);
+		assert.equal(driver.requests[3].conversationId, baseSessionId);
+		assert.equal(driver.requests[3].prompt, "Turn 3A question on original branch");
+	} finally {
+		roundTrips.failAll("test done");
+		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
 });

@@ -13,10 +13,21 @@ import {
 	type TranscriptContext,
 	type Usage,
 } from "@earendil-works/pi-ai";
+import { resolveSessionAtStep } from "./acp/step-usage.js";
 import type { AgyStepUsage, AgyUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "./driver-types.js";
 import { toAgyEffort, type AgyModelEntry } from "./models.js";
 import type { BridgeResult } from "./mcp-server.js";
-import { fingerprint, formatToolResult, persistentMessages, planTurn, warmAfterTurn, type WarmSession } from "./transcript.js";
+import {
+	fingerprint,
+	formatToolResult,
+	nonHistoryKeys,
+	persistentMessages,
+	planTurn,
+	splitWarmTranscript,
+	warmAfterTurn,
+	type TurnPlan,
+	type WarmSession,
+} from "./transcript.js";
 import { traceUsage } from "./usage-trace.js";
 import { quotaExhaustion, type UsageMeter } from "./quota.js";
 
@@ -352,25 +363,60 @@ async function consumeTurn(
 
 /** Per-extension ACP session continuity. `warm` is set only after a turn
  *  completes cleanly, and cleared while a turn runs. */
+export interface TurnPrefixSnapshot {
+	count: number;
+	hash: string;
+	keys: string[];
+}
+
 export interface AcpSessions {
 	warm?: WarmSession;
+	/** Historical warm checkpoints in chronological order, enabling `/tree`
+	 *  branch switching and rewind to any earlier completed turn. */
+	checkpoints?: WarmSession[];
+	/** Directory holding `<sessionId>.db` stores for step-boundary forking on rewind. */
+	conversationsDir?: () => string;
+	/** Invoked when a turn completes and records a new `WarmSession`. */
+	onWarm?: (warm: WarmSession) => void;
 	/** cwd of the in-flight turn, for continuations that complete it. */
 	turnCwd?: string;
-	/** Verified message prefix of the in-flight turn. Cleared if a context
-	 *  manager (e.g. realctx) rewrites or compacts earlier messages mid-turn. */
-	turnPrefix?: { count: number; hash: string };
+	/** Verified message prefix of the in-flight turn. */
+	turnPrefix?: TurnPrefixSnapshot;
 }
 
-function prefixSnapshot(messages: Message[]): { count: number; hash: string } {
+function prefixSnapshot(messages: Message[]): TurnPrefixSnapshot {
 	const persistent = persistentMessages(messages);
-	return { count: persistent.length, hash: fingerprint(persistent) };
+	return { count: persistent.length, hash: fingerprint(persistent), keys: nonHistoryKeys(persistent) };
 }
 
-function prefixIntact(messages: Message[], prefix: { count: number; hash: string } | undefined): boolean {
+function prefixIntact(messages: Message[], prefix: TurnPrefixSnapshot | undefined): boolean {
 	if (!prefix) return false;
-	const persistent = persistentMessages(messages);
-	if (persistent.length < prefix.count) return false;
-	return fingerprint(persistent.slice(0, prefix.count)) === prefix.hash;
+	return splitWarmTranscript(messages, prefix) !== null;
+}
+
+function selectTurnPlan(context: TranscriptContext, cwd: string, sessions: AcpSessions): TurnPlan {
+	const candidates: WarmSession[] = [];
+	if (sessions.warm) candidates.push(sessions.warm);
+	const history = sessions.checkpoints ?? [];
+	for (let i = history.length - 1; i >= 0; i--) {
+		const item = history[i];
+		if (item && item !== sessions.warm) candidates.push(item);
+	}
+	let bestWarm: Extract<TurnPlan, { kind: "warm" }> | undefined;
+	for (const candidate of candidates) {
+		const plan = planTurn(context, cwd, candidate);
+		if (plan.kind === "warm") {
+			if (!bestWarm || plan.deltaMessages < bestWarm.deltaMessages) {
+				bestWarm = plan;
+				if (bestWarm.deltaMessages === 1) break;
+			}
+		}
+	}
+	if (bestWarm) {
+		const sessionId = resolveSessionAtStep(sessions.conversationsDir?.(), bestWarm.sessionId, bestWarm.maxStepIdx);
+		return { ...bestWarm, sessionId };
+	}
+	return planTurn(context, cwd, candidates[0]);
 }
 
 export interface StreamSimpleDeps {
@@ -389,7 +435,10 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 		const onCompleted = (outcome: TurnOutcome, final: AssistantMessage): void => {
 			if (outcome.status !== "OK" || !outcome.conversationId || sessions.turnCwd === undefined) return;
 			if (!prefixIntact(context.messages, sessions.turnPrefix)) return;
-			sessions.warm = warmAfterTurn(context, final, outcome.conversationId, sessions.turnCwd);
+			const warm = warmAfterTurn(context, final, outcome.conversationId, sessions.turnCwd, outcome.maxStepIdx);
+			sessions.warm = warm;
+			sessions.checkpoints = [...(sessions.checkpoints ?? []), warm];
+			sessions.onWarm?.(warm);
 		};
 		void (async () => {
 			try {
@@ -413,7 +462,7 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 
 				const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 				const entry = deps.entries.find((candidate) => candidate.id === model.id);
-				const plan = planTurn(context, cwd, sessions.warm);
+				const plan = selectTurnPlan(context, cwd, sessions);
 				traceUsage("plan", plan.kind === "warm"
 					? { kind: plan.kind, sessionId: plan.sessionId, deltaMessages: plan.deltaMessages, delta: plan.input.contextBlock ? "transcript" : "user" }
 					: { kind: plan.kind, reason: plan.reason, messages: context.messages.length });

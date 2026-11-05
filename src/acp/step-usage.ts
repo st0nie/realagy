@@ -9,11 +9,11 @@
 //   zero for Gemini's implicit caching).
 // Every failure degrades to `undefined`: this is an internal format.
 
+import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
 import { agyDataDir } from "./setup.js";
-
 /** steps.step_type of a model (agent) response; 14 is user input. */
 const STEP_TYPE_AGENT = 15;
 /** node:sqlite is synchronous: a locked store must not stall pi's event loop. */
@@ -166,6 +166,105 @@ export function lastStepIdx(dbPath: string): number {
 	} finally {
 		try { db?.close(); } catch { /* already closed */ }
 	}
+}
+
+function replaceBufferToken(source: Uint8Array, fromText: string, toText: string): Buffer {
+	const buf = Buffer.from(source);
+	if (!fromText || fromText === toText) return buf;
+	return Buffer.from(buf.toString("latin1").split(fromText).join(toText), "latin1");
+}
+
+function pruneForkedTables(
+	db: InstanceType<SqliteModule["DatabaseSync"]>,
+	sessionId: string,
+	newSessionId: string,
+	maxStepIdx: number,
+): void {
+	db.prepare("DELETE FROM steps WHERE idx > ?").run(maxStepIdx);
+
+	try {
+		const genRows = db.prepare("SELECT idx, data FROM gen_metadata").all() as Array<{ idx: number | bigint; data: Uint8Array | null }>;
+		const delGen = db.prepare("DELETE FROM gen_metadata WHERE idx = ?");
+		for (const row of genRows) {
+			if (!(row.data instanceof Uint8Array)) continue;
+			const packed = parseProtoFields(row.data).get(2);
+			const firstStep = packed?.wire === 2 ? readVarint(packed.bytes, 0) : undefined;
+			if (firstStep && firstStep[0] > maxStepIdx) delGen.run(row.idx);
+		}
+	} catch { /* optional auxiliary table */ }
+
+	try {
+		const execRows = db.prepare("SELECT idx, data FROM executor_metadata").all() as Array<{ idx: number | bigint; data: Uint8Array | null }>;
+		const delExec = db.prepare("DELETE FROM executor_metadata WHERE idx = ?");
+		for (const row of execRows) {
+			if (!(row.data instanceof Uint8Array)) continue;
+			const endStep = parseProtoFields(row.data).get(3);
+			if (endStep?.wire === 0 && endStep.value > maxStepIdx) delExec.run(row.idx);
+		}
+	} catch { /* optional auxiliary table */ }
+
+	const newTrajectoryId = randomUUID();
+	let oldTrajectoryId = "";
+	try {
+		const metaRow = db.prepare("SELECT trajectory_id FROM trajectory_meta LIMIT 1").get() as { trajectory_id?: string | null } | undefined;
+		if (metaRow?.trajectory_id) oldTrajectoryId = metaRow.trajectory_id;
+		db.prepare("UPDATE trajectory_meta SET trajectory_id = ?, cascade_id = ?").run(newTrajectoryId, newSessionId);
+	} catch { /* optional metadata table */ }
+
+	try {
+		const blobRow = db.prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'").get() as { data?: Uint8Array | null } | undefined;
+		if (blobRow?.data instanceof Uint8Array) {
+			const withSession = replaceBufferToken(blobRow.data, sessionId, newSessionId);
+			const patched = oldTrajectoryId ? replaceBufferToken(withSession, oldTrajectoryId, newTrajectoryId) : withSession;
+			db.prepare("UPDATE trajectory_metadata_blob SET data = ? WHERE id = 'main'").run(patched);
+		}
+	} catch { /* optional metadata blob */ }
+}
+
+/** Fork `<sessionId>.db` into a new `<forkedSessionId>.db` truncated to `idx <= maxStepIdx`
+ *  so a `/tree` rewind to an earlier turn loads the exact ACP state at that turn
+ *  without mutating the later branch's store. Returns `undefined` if unavailable. */
+export function forkConversationAtStep(
+	dir: string,
+	sessionId: string,
+	maxStepIdx: number,
+	newSessionId = randomUUID(),
+): string | undefined {
+	const mod = loadSqlite();
+	const srcPath = conversationDbPath(dir, sessionId);
+	const dstPath = conversationDbPath(dir, newSessionId);
+	if (!mod || !srcPath || !dstPath || !fs.existsSync(srcPath) || maxStepIdx < 0) return undefined;
+	let db: InstanceType<SqliteModule["DatabaseSync"]> | undefined;
+	try {
+		fs.copyFileSync(srcPath, dstPath);
+		db = new mod.DatabaseSync(dstPath, { timeout: BUSY_TIMEOUT_MS } as ConstructorParameters<SqliteModule["DatabaseSync"]>[1]);
+		pruneForkedTables(db, sessionId, newSessionId, maxStepIdx);
+		return newSessionId;
+	} catch {
+		try {
+			db?.close();
+			db = undefined;
+			if (fs.existsSync(dstPath)) fs.unlinkSync(dstPath);
+		} catch { /* ignore cleanup failure */ }
+		return undefined;
+	} finally {
+		try { db?.close(); } catch { /* already closed */ }
+	}
+}
+
+/** Return `sessionId` when its SQLite store is still at `maxStepIdx`, or fork a
+ *  truncated copy when later turns have advanced `<sessionId>.db` past `maxStepIdx`. */
+export function resolveSessionAtStep(
+	dir: string | undefined,
+	sessionId: string,
+	maxStepIdx: number | undefined,
+): string {
+	if (!dir || maxStepIdx === undefined || maxStepIdx < 0) return sessionId;
+	const dbPath = conversationDbPath(dir, sessionId);
+	if (!dbPath || !fs.existsSync(dbPath)) return sessionId;
+	const currentMax = lastStepIdx(dbPath);
+	if (currentMax <= maxStepIdx) return sessionId;
+	return forkConversationAtStep(dir, sessionId, maxStepIdx) ?? sessionId;
 }
 
 export function summarizeSteps(steps: StepTokens[]): StepUsage | undefined {
