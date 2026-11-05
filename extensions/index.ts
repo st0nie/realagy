@@ -148,6 +148,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	pi.on("session_tree", (_event, ctx) => {
 		syncWarmFromSession(ctx);
 	});
+	pi.on("session_compact", () => {
+		pendingWarmEntry = null;
+		sessions.warm = undefined;
+		sessions.checkpoints = undefined;
+	});
 	pi.on("turn_end", () => {
 		if (!pendingWarmEntry) return;
 		const entry = pendingWarmEntry;

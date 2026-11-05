@@ -20,6 +20,14 @@ export interface AcpInput {
 	contextBlock?: { uri: string; text: string };
 }
 
+export interface WarmItem {
+	role: "user" | "assistant" | "toolResult";
+	key: string;
+	/** Normalized text of a `user` message, used for line-bounded prefix/suffix
+	 *  matching when an extension decorates only the active turn's prompt. */
+	userText?: string;
+}
+
 /** What a reusable ACP session is known to hold. */
 export interface WarmSession {
 	sessionId: string;
@@ -28,10 +36,10 @@ export interface WarmSession {
 	count: number;
 	/** Fingerprint of those messages. */
 	hash: string;
-	/** Per-message hashes of non-system, non-`<realctx-history>` messages in order,
-	 *  used to match the intact suffix after `realctx` folds early turns into
-	 *  `<realctx-history>` summaries. */
+	/** Per-message hashes of non-system, non-summary messages in order. */
 	keys?: string[];
+	/** Structured non-system message descriptors for extension-invariant matching. */
+	items?: WarmItem[];
 	/** Highest `steps.idx` in `~/.gemini/antigravity-cli/conversations/<sessionId>.db`
 	 *  when this turn completed. Used to fork a truncated store on `/tree` rewind. */
 	maxStepIdx?: number;
@@ -117,9 +125,27 @@ function serializeRange(messages: Message[], imageBase = 0): { text: string; ima
  *  from the end, which would cut off recent messages and the user's prompt. */
 export const MAX_TRANSCRIPT_BYTES = 160_000;
 
+const COMPACTION_SUMMARY_HEADER = "The conversation history before this point was compacted into the following summary:";
+const BRANCH_SUMMARY_HEADER = "The following is a summary of a branch that this conversation came back from:";
+
+function isCompactionSummary(message: Message): boolean {
+	if (message.role !== "user") return false;
+	return contentText(message.content).trimStart().startsWith(COMPACTION_SUMMARY_HEADER);
+}
+
+function isHistorySummaryText(text: string): boolean {
+	const trimmed = text.trimStart();
+	return (
+		trimmed.startsWith("<realctx-history") ||
+		trimmed.startsWith("<summary>") ||
+		trimmed.startsWith(COMPACTION_SUMMARY_HEADER) ||
+		trimmed.startsWith(BRANCH_SUMMARY_HEADER)
+	);
+}
+
 function isHistorySummary(message: Message): boolean {
 	if (message.role !== "user") return false;
-	return contentText(message.content).trimStart().startsWith("<realctx-history");
+	return isHistorySummaryText(contentText(message.content));
 }
 
 function utf8Bytes(text: string): number {
@@ -272,6 +298,47 @@ function splitAtPersistentCount(messages: Message[], count: number): { prefix: M
 }
 
 const REALCTX_USER_IMAGE_DROP = /\[#\d+ (?:dropped|summarized|superseded) · user images?\b/;
+const EPHEMERAL_USER_INLINE = /(?:^|\n+)\[pi-lens automated (?:check|context) — not a user request\][\s\S]*$/;
+
+function cleanUserBlockText(text: string): string {
+	return stripForgedRealctx(text.replace(EPHEMERAL_USER_INLINE, "")).trim();
+}
+
+/** Primary user prompt text. Pi stores a user's prompt in the first `{ type: "text" }`
+ *  block while extensions (`pi-lens`, `realctx` dropped-image notices, RAG hooks)
+ *  append extra `{ type: "text" }` blocks. */
+function primaryUserText(content: Message["content"]): string {
+	if (typeof content === "string") {
+		return cleanUserBlockText(content);
+	}
+	if (!Array.isArray(content)) return "";
+	for (const block of content) {
+		if (!block || typeof block !== "object") continue;
+		const candidate = block as { type?: string; text?: string };
+		if (candidate.type !== "text" || typeof candidate.text !== "string") continue;
+		const trimmed = candidate.text.trimStart();
+		if (EPHEMERAL_USER_PREFIX.test(trimmed) || REALCTX_USER_IMAGE_DROP.test(trimmed)) continue;
+		const cleaned = cleanUserBlockText(candidate.text);
+		if (cleaned) return cleaned;
+	}
+	return "";
+}
+
+function fullUserText(content: Message["content"]): string {
+	if (typeof content === "string") {
+		return cleanUserBlockText(content);
+	}
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((block): block is { type: "text"; text: string } => {
+			if (!block || typeof block !== "object" || block.type !== "text" || typeof block.text !== "string") return false;
+			const trimmed = block.text.trimStart();
+			return !EPHEMERAL_USER_PREFIX.test(trimmed) && !REALCTX_USER_IMAGE_DROP.test(trimmed);
+		})
+		.map((block) => cleanUserBlockText(block.text))
+		.filter(Boolean)
+		.join("\n");
+}
 
 function messageKey(message: Message): string {
 	if (message.role === "system") return JSON.stringify(["system", message.content, message.sections ?? null]);
@@ -279,18 +346,25 @@ function messageKey(message: Message): string {
 		return JSON.stringify(["toolResult", message.toolName, message.toolCallId, Boolean(message.isError)]);
 	}
 	if (message.role === "user") {
-		const raw = contentText(message.content);
-		const clean = stripForgedRealctx(raw).trim();
-		const hasBlocks = Array.isArray(message.content) && message.content.some((block) => block.type === "image");
-		const hasImage = hasBlocks || REALCTX_USER_IMAGE_DROP.test(raw);
-		return JSON.stringify(["user", clean, hasImage]);
+		return JSON.stringify(["user", primaryUserText(message.content)]);
 	}
 	const serialized = serializeMessage(message, 0);
-	return JSON.stringify([message.role, serialized.text]);
+	return JSON.stringify([message.role, serialized.text.trim()]);
 }
 
 function shortMessageHash(message: Message): string {
 	return createHash("sha256").update(messageKey(message)).digest("hex").slice(0, 16);
+}
+
+function toWarmItem(message: Exclude<Message, { role: "system" }>): WarmItem {
+	const item: WarmItem = {
+		role: message.role,
+		key: shortMessageHash(message),
+	};
+	if (message.role === "user") {
+		item.userText = fullUserText(message.content);
+	}
+	return item;
 }
 
 export function nonHistoryKeys(messages: Message[]): string[] {
@@ -302,62 +376,190 @@ export function nonHistoryKeys(messages: Message[]): string[] {
 	return out;
 }
 
+export function warmItemsForMessages(messages: Message[]): WarmItem[] {
+	const out: WarmItem[] = [];
+	for (const message of persistentMessages(messages)) {
+		if (message.role === "system" || isHistorySummary(message)) continue;
+		out.push(toWarmItem(message));
+	}
+	return out;
+}
+
 export function fingerprint(messages: Message[]): string {
 	const hash = createHash("sha256");
 	for (const message of messages) hash.update(messageKey(message)).update("\0");
 	return hash.digest("hex");
 }
 
-function matchKeySuffix(
-	body: ReadonlyArray<{ index: number; key: string }>,
-	targetKeys: readonly string[],
-	allowDropPrefix: boolean,
+function userTextsMatch(a: string, b: string): boolean {
+	if (a === b) return true;
+	if (!a || !b) return false;
+	const [longer, shorter] = a.length >= b.length ? [a, b] : [b, a];
+	return (
+		longer.startsWith(`${shorter}\n`) ||
+		longer.endsWith(`\n${shorter}`) ||
+		longer.includes(`\n${shorter}\n`)
+	);
+}
+
+function itemsMatch(expected: WarmItem, actual: WarmItem): boolean {
+	if (expected.role !== actual.role) return false;
+	if (expected.key === actual.key) return true;
+	if (expected.role === "user" && expected.userText !== undefined && actual.userText !== undefined) {
+		return userTextsMatch(expected.userText, actual.userText);
+	}
+	return false;
+}
+
+interface BodyEntry {
+	index: number;
+	item: WarmItem;
+	isSummary: boolean;
+	isCompaction: boolean;
+}
+
+function matchSequence(
+	body: ReadonlyArray<BodyEntry>,
+	lead: number,
+	target: ReadonlyArray<WarmItem>,
+	requireNoTrailingAssistant: boolean,
 ): number | null {
-	if (targetKeys.length === 0 || body.length === 0) return null;
-	const maxDrop = allowDropPrefix ? targetKeys.length - 1 : 0;
-	for (let drop = 0; drop <= maxDrop; drop++) {
-		const kept = targetKeys.length - drop;
-		if (body.length < kept) continue;
-		let matches = true;
-		for (let i = 0; i < kept; i++) {
-			if (body[i]?.key !== targetKeys[drop + i]) {
-				matches = false;
-				break;
+	let b = lead;
+	let matchedUserInRun = false;
+	for (let w = 0; w < target.length; w++) {
+		const expected = target[w];
+		if (!expected) continue;
+		const actual = body[b]?.item;
+		if (actual && itemsMatch(expected, actual)) {
+			matchedUserInRun = expected.role === "user";
+			b++;
+			continue;
+		}
+		if (expected.role === "user") {
+			const nextExpected = target[w + 1];
+			const nextMatches = nextExpected?.role === "user" && actual !== undefined && itemsMatch(nextExpected, actual);
+			if (matchedUserInRun || nextMatches) {
+				continue;
 			}
 		}
-		if (matches) {
-			const endEntry = body[kept - 1];
-			return endEntry ? endEntry.index + 1 : null;
+		return null;
+	}
+	if (requireNoTrailingAssistant) {
+		for (let i = b; i < body.length; i++) {
+			if (body[i]?.item.role === "assistant") return null;
+		}
+	}
+	const lastMatched = b > lead ? body[b - 1] : undefined;
+	return lastMatched ? lastMatched.index + 1 : null;
+}
+
+function countLeadingSummaries(body: ReadonlyArray<BodyEntry>): number {
+	let count = 0;
+	for (const entry of body) {
+		if (!entry.isSummary) break;
+		count++;
+	}
+	return count;
+}
+
+function countLeadingUsers(body: ReadonlyArray<BodyEntry>): number {
+	let count = 0;
+	for (const entry of body) {
+		if (entry.item.role !== "user") break;
+		count++;
+	}
+	return count;
+}
+
+function matchWarmItems(
+	body: ReadonlyArray<BodyEntry>,
+	warmItems: ReadonlyArray<WarmItem>,
+): number | null {
+	if (warmItems.length === 0 || body.length === 0) return null;
+	if (body[0]?.isCompaction && warmItems[0]?.key !== body[0].item.key) {
+		return null;
+	}
+
+	const maxSummaryLead = countLeadingSummaries(body);
+	for (let lead = 0; lead <= maxSummaryLead; lead++) {
+		const splitIdx = matchSequence(body, lead, warmItems, false);
+		if (splitIdx !== null) return splitIdx;
+	}
+
+	const maxUserLead = countLeadingUsers(body);
+	for (let drop = 2; drop <= warmItems.length - 2; drop++) {
+		if (warmItems[drop]?.role !== "user") continue;
+		const target = warmItems.slice(drop);
+		const maxLead = Math.min(drop - 1, maxUserLead, body.length - target.length);
+		for (let lead = 0; lead <= maxLead; lead++) {
+			const splitIdx = matchSequence(body, lead, target, lead === 0 && maxSummaryLead === 0);
+			if (splitIdx !== null) return splitIdx;
 		}
 	}
 	return null;
 }
 
-/** Split `messages` into the warm session's prefix and the new delta, allowing
- *  `realctx` to fold leading turns into `<realctx-history>` summaries while the
- *  remaining suffix of non-history messages stays intact. */
+function matchKeySuffix(
+	body: ReadonlyArray<BodyEntry>,
+	targetKeys: readonly string[],
+): number | null {
+	if (targetKeys.length === 0 || body.length === 0) return null;
+	if (body[0]?.isCompaction && targetKeys[0] !== body[0].item.key) {
+		return null;
+	}
+	const maxSummaryLead = countLeadingSummaries(body);
+	const maxUserLead = countLeadingUsers(body);
+	for (let drop = 0; drop < targetKeys.length; drop++) {
+		const kept = targetKeys.length - drop;
+		if (drop > 0 && (drop < 2 || kept < 2)) continue;
+		const maxLead = drop === 0 ? maxSummaryLead : Math.min(drop - 1, maxUserLead, body.length - kept);
+		for (let lead = 0; lead <= maxLead; lead++) {
+			if (body.length - lead < kept) continue;
+			let matches = true;
+			for (let i = 0; i < kept; i++) {
+				if (body[lead + i]?.item.key !== targetKeys[drop + i]) {
+					matches = false;
+					break;
+				}
+			}
+			if (matches) {
+				const endEntry = body[lead + kept - 1];
+				return endEntry ? endEntry.index + 1 : null;
+			}
+		}
+	}
+	return null;
+}
+
+/** Split `messages` into the warm session's prefix and the new delta,
+ *  tolerating extension prompt decorations, transient injected messages, and
+ *  context-compression summaries that replace older turns. */
 export function splitWarmTranscript(
 	messages: Message[],
-	warm: { count: number; hash: string; keys?: readonly string[] },
+	warm: { count: number; hash: string; keys?: readonly string[]; items?: readonly WarmItem[] },
 ): { prefix: Message[]; delta: Message[] } | null {
 	const direct = splitAtPersistentCount(messages, warm.count);
 	if (direct && fingerprint(direct.prefix) === warm.hash) {
 		return direct;
 	}
-	if (!warm.keys || warm.keys.length === 0) return null;
 
-	const body: Array<{ index: number; key: string }> = [];
-	let sawHistorySummary = false;
+	const body: BodyEntry[] = [];
 	for (let i = 0; i < messages.length; i++) {
 		const message = messages[i];
 		if (!message || isEphemeralMessage(message) || message.role === "system") continue;
-		if (body.length === 0 && isHistorySummary(message)) {
-			sawHistorySummary = true;
-			continue;
-		}
-		body.push({ index: i, key: shortMessageHash(message) });
+		body.push({
+			index: i,
+			item: toWarmItem(message),
+			isSummary: isHistorySummary(message),
+			isCompaction: isCompactionSummary(message),
+		});
 	}
-	const splitIdx = matchKeySuffix(body, warm.keys, sawHistorySummary);
+	let splitIdx: number | null = null;
+	if (warm.items && warm.items.length > 0) {
+		splitIdx = matchWarmItems(body, warm.items);
+	} else if (warm.keys && warm.keys.length > 0) {
+		splitIdx = matchKeySuffix(body, warm.keys);
+	}
 	if (splitIdx === null) return null;
 	return {
 		prefix: persistentMessages(messages.slice(0, splitIdx)),
@@ -435,6 +637,7 @@ export function warmAfterTurn(
 		count: messages.length,
 		hash: fingerprint(messages),
 		keys: nonHistoryKeys(messages),
+		items: warmItemsForMessages(messages),
 		systemPrompt: getCurrentSystemPrompt(context.messages),
 		tools: toolsKey(context),
 	};
@@ -450,6 +653,16 @@ export interface SessionEntryLike {
 	data?: Partial<WarmSession> | null;
 }
 
+function toWarmItemEntry(raw: unknown): WarmItem | null {
+	if (!raw || typeof raw !== "object") return null;
+	const candidate = raw as { role?: unknown; key?: unknown; userText?: unknown };
+	if (candidate.role !== "user" && candidate.role !== "assistant" && candidate.role !== "toolResult") return null;
+	if (typeof candidate.key !== "string" || !candidate.key) return null;
+	const item: WarmItem = { role: candidate.role, key: candidate.key };
+	if (typeof candidate.userText === "string") item.userText = candidate.userText;
+	return item;
+}
+
 function toWarmSession(data: Partial<WarmSession> | null | undefined): WarmSession | null {
 	if (!data) return null;
 	if (!data.sessionId || !data.cwd || !data.hash) return null;
@@ -463,6 +676,10 @@ function toWarmSession(data: Partial<WarmSession> | null | undefined): WarmSessi
 		tools: String(data.tools),
 	};
 	if (Array.isArray(data.keys)) warm.keys = data.keys.map((key) => String(key));
+	if (Array.isArray(data.items)) {
+		const items = data.items.map(toWarmItemEntry).filter((item): item is WarmItem => item !== null);
+		if (items.length > 0) warm.items = items;
+	}
 	if (data.maxStepIdx !== undefined && Number.isFinite(data.maxStepIdx)) {
 		warm.maxStepIdx = Number(data.maxStepIdx);
 	}

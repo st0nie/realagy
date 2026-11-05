@@ -435,8 +435,17 @@ test("mid-turn realctx history compression during tool reentry preserves warm re
 			stopReason: "stop",
 			timestamp: 1,
 		};
-		const currentUser = user("run checks");
-		const initial = [system(), oldTurnUser, oldTurnAsst, currentUser];
+		// Simulate pi-lens `append-to-last-user` injecting session-start guidance into currentUser on the first request:
+		const currentUserInjected: Message = {
+			role: "user",
+			content: [
+				{ type: "text", text: "run checks" },
+				{ type: "text", text: "[pi-lens automated context — not a user request]\n\n📌 pi-lens active" },
+			],
+			timestamp: 2,
+		};
+		const currentUserPlain = user("run checks");
+		const initial = [system(), oldTurnUser, oldTurnAsst, currentUserInjected];
 
 		const step1 = collect(stream(model, context(initial)));
 		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
@@ -446,10 +455,10 @@ test("mid-turn realctx history compression during tool reentry preserves warm re
 		if (step1Done?.type !== "done") return;
 
 		// While the tool runs, realctx historian replaces oldTurnUser + oldTurnAsst with a summary chunk,
-		// while keeping currentUser intact.
+		// and pi-lens no longer appends the transient guidance block to currentUser on reentry.
 		const historyChunk = user('<realctx-history part="h1" turns="1-1" replaced="2.0k tok">\nSummarized old turn\n</realctx-history>');
 		const result: Message = { role: "toolResult", toolCallId: "call-compact", toolName: "bash", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 3 };
-		const compactedMidTurn = [system(), historyChunk, currentUser, step1Done.message, result];
+		const compactedMidTurn = [system(), historyChunk, currentUserPlain, step1Done.message, result];
 
 		const handle = driver.activeHandle as FakeHandle;
 		handle.pushExternal({ type: "text", delta: "checks passed" });
@@ -604,4 +613,101 @@ test("persisted warm checkpoints survive reload and fork the SQLite store on /tr
 		roundTrips.failAll("test done");
 		fs.rmSync(tmpDir, { recursive: true, force: true });
 	}
+});
+
+test("universal extension invariance: arbitrary prompt decorators, transient messages, custom summaries, and sliding windows preserve warm sessions while manual /compact and edits diverge", async () => {
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const makeAsst = (text: string): Message => ({
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "stop",
+		timestamp: Date.now(),
+	});
+
+	// Turn 1: Arbitrary third-party RAG/linter extension prepends a header, appends a trailer,
+	// and injects a standalone transient reminder message (with no pi-lens/realctx markers).
+	const t1UserDecorated = user("[RAG Context: auth.ts]\nhow does login work?\n\n<linter-hint>0 errors</linter-hint>");
+	const t1Transient = user("CUSTOM EXTENSION REMINDER: be concise");
+	const t1Asst = makeAsst("Login verifies the token.");
+	const warm1 = warmAfterTurn(
+		context([system(), t1UserDecorated, t1Transient]),
+		t1Asst as Extract<Message, { role: "assistant" }>,
+		"acp-universal-1",
+		"/repo",
+	);
+
+	// On Turn 2, SessionManager restores the undecorated user prompt and drops the transient reminder,
+	// while the extension decorates Turn 2's prompt with an extra `{ type: "text" }` block.
+	const t1UserClean = user("how does login work?");
+	const t2UserDecorated: Message = {
+		role: "user",
+		content: [
+			{ type: "text", text: "what about logout?" },
+			{ type: "text", text: "<custom-skill-context>\nlogout clears cookies\n</custom-skill-context>" },
+		],
+		timestamp: Date.now(),
+	};
+	const plan2 = planTurn(context([system(), t1UserClean, t1Asst, t2UserDecorated]), "/repo", warm1);
+	assert.equal(plan2.kind, "warm");
+	if (plan2.kind !== "warm") return;
+	assert.equal(plan2.sessionId, "acp-universal-1");
+	assert.match(plan2.input.prompt, /^what about logout\?\n<custom-skill-context>/);
+
+	const t2Asst = makeAsst("Logout clears the session cookie.");
+	const warm2 = warmAfterTurn(
+		context([system(), t1UserClean, t1Asst, t2UserDecorated]),
+		t2Asst as Extract<Message, { role: "assistant" }>,
+		"acp-universal-1",
+		"/repo",
+	);
+	const t2UserClean = user("what about logout?");
+
+	// Turn 3A: Arbitrary summarizer extension folds Turn 1 into a custom summary message (not <realctx-history>).
+	const customSummary = user("<custom-extension-summary>\nUser asked about login.\n</custom-extension-summary>");
+	const plan3Summary = planTurn(
+		context([system(), customSummary, t2UserClean, t2Asst, user("and refresh tokens?")]),
+		"/repo",
+		warm2,
+	);
+	assert.equal(plan3Summary.kind, "warm");
+	if (plan3Summary.kind === "warm") {
+		assert.equal(plan3Summary.input.prompt, "and refresh tokens?");
+	}
+
+	// Turn 3B: Sliding-window extension drops Turn 1 completely without inserting a summary message.
+	const plan3Sliding = planTurn(
+		context([system(), t2UserClean, t2Asst, user("and refresh tokens?")]),
+		"/repo",
+		warm2,
+	);
+	assert.equal(plan3Sliding.kind, "warm");
+	if (plan3Sliding.kind === "warm") {
+		assert.equal(plan3Sliding.input.prompt, "and refresh tokens?");
+	}
+
+	// Turn 3C: In-place edit of Turn 1's user message still triggers history-diverged!
+	const plan3Edited = planTurn(
+		context([system(), user("how does OAuth work?"), t1Asst, t2UserClean, t2Asst, user("and refresh tokens?")]),
+		"/repo",
+		warm2,
+	);
+	assert.equal(plan3Edited.kind, "fresh");
+	if (plan3Edited.kind === "fresh") {
+		assert.equal(plan3Edited.reason, "history-diverged");
+	}
+
+	// Turn 3D: Manual Pi `/compact` summary forces a fresh session.
+	const piCompaction = user(
+		"The conversation history before this point was compacted into the following summary:\n\n<summary>\nCompacted summary\n</summary>",
+	);
+	const plan3Compacted = planTurn(
+		context([system(), piCompaction, t2UserClean, t2Asst, user("after manual compact")]),
+		"/repo",
+		warm2,
+	);
+	assert.equal(plan3Compacted.kind, "fresh");
 });
