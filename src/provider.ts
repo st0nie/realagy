@@ -16,7 +16,7 @@ import {
 import type { AgyStepUsage, AgyUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "./driver-types.js";
 import { toAgyEffort, type AgyModelEntry } from "./models.js";
 import type { BridgeResult } from "./mcp-server.js";
-import { formatToolResult, planTurn, warmAfterTurn, type WarmSession } from "./transcript.js";
+import { fingerprint, formatToolResult, persistentMessages, planTurn, warmAfterTurn, type WarmSession } from "./transcript.js";
 import { traceUsage } from "./usage-trace.js";
 import { quotaExhaustion, type UsageMeter } from "./quota.js";
 
@@ -356,6 +356,21 @@ export interface AcpSessions {
 	warm?: WarmSession;
 	/** cwd of the in-flight turn, for continuations that complete it. */
 	turnCwd?: string;
+	/** Verified message prefix of the in-flight turn. Cleared if a context
+	 *  manager (e.g. realctx) rewrites or compacts earlier messages mid-turn. */
+	turnPrefix?: { count: number; hash: string };
+}
+
+function prefixSnapshot(messages: Message[]): { count: number; hash: string } {
+	const persistent = persistentMessages(messages);
+	return { count: persistent.length, hash: fingerprint(persistent) };
+}
+
+function prefixIntact(messages: Message[], prefix: { count: number; hash: string } | undefined): boolean {
+	if (!prefix) return false;
+	const persistent = persistentMessages(messages);
+	if (persistent.length < prefix.count) return false;
+	return fingerprint(persistent.slice(0, prefix.count)) === prefix.hash;
 }
 
 export interface StreamSimpleDeps {
@@ -373,6 +388,7 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 		const blocks: BlockState = { partial: newAssistant(model), textIdx: null, thinkingIdx: null, started: false, usage: {} };
 		const onCompleted = (outcome: TurnOutcome, final: AssistantMessage): void => {
 			if (outcome.status !== "OK" || !outcome.conversationId || sessions.turnCwd === undefined) return;
+			if (!prefixIntact(context.messages, sessions.turnPrefix)) return;
 			sessions.warm = warmAfterTurn(context, final, outcome.conversationId, sessions.turnCwd);
 		};
 		void (async () => {
@@ -388,6 +404,9 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 				}
 				const active = results.length > 0 ? deps.driver.reentry() : null;
 				if (active) {
+					sessions.turnPrefix = prefixIntact(context.messages, sessions.turnPrefix)
+						? prefixSnapshot(context.messages)
+						: undefined;
 					await consumeTurn(stream, blocks, active, model, options, onCompleted, deps.meter);
 					return;
 				}
@@ -401,6 +420,7 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 				// Unknown until this turn completes cleanly.
 				sessions.warm = undefined;
 				sessions.turnCwd = cwd;
+				sessions.turnPrefix = prefixSnapshot(context.messages);
 				const request: DriverTurnRequest = {
 					cwd,
 					model: entry?.full ?? model.id,

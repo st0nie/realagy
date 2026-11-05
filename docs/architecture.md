@@ -34,9 +34,11 @@ Pi image results go back as ordinary MCP image blocks. agy stores them under its
 Every new user turn is planned from pi's current transcript (`src/transcript.ts`).
 
 - **Warm:** the last turn completed cleanly, and a SHA-256 fingerprint of the pi messages that session holds still matches, along with the cwd and active tool set. realagy reuses the ACP session and sends only the messages pi added since. Plain user messages go as ordinary prompt text. Anything else (other models' replies, tool results, updated pi system instructions) goes as a `pi://transcript-delta` resource. agy's native history stays an unchanged prompt prefix the provider can cache.
-- **Fresh:** after compaction, branch navigation, edits, a tool or cwd change, or a failed or aborted turn, realagy starts a new session and sends the whole transcript as `pi://transcript`.
+- **Fresh:** after compaction, branch navigation, edits, a tool or cwd change, or a failed or aborted turn, realagy starts a new session and sends the transcript as `pi://transcript`.
 
-If agy can no longer load a remembered session, the driver opens a new session and sends the full transcript, not the delta. Fingerprints leave out thinking, which is model-private. A continuation after a pi tool result always re-enters the running ACP turn.
+`agy acp` truncates a single `session/prompt` payload past 192 KB from the end, which would cut off recent turns and the user's latest prompt. `pi://transcript` and `pi://transcript-delta` therefore cap their serialized body at 160 KB: `<pi-system>`, any leading `<realctx-history>` summaries, and the newest messages are kept intact, while older middle messages collapse into a `<pi-transcript-omitted>` marker.
+
+If agy can no longer load a remembered session, the driver opens a new session and sends the full transcript, not the delta. Fingerprints leave out thinking (which is model-private), normalize `realctx`'s assistant-text tag stripping, and ignore transient one-request `[pi-lens automated …]` context messages so neither hygiene cleanup nor ephemeral diagnostic notices break warm reuse. A continuation after a pi tool result always re-enters the running ACP turn; if a context manager (such as `realctx`) rewrites or compacts earlier messages mid-turn during tool re-entries, the completed turn is not marked warm so the next user turn starts a fresh session with the compacted history.
 
 ## Usage, context, and quota
 

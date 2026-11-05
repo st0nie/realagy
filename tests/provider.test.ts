@@ -5,6 +5,7 @@ import { test, vi } from "vitest";
 import { createStreamSimple, POLL_TOOL_NAME, ToolRoundTrips } from "../src/provider.js";
 import type { DriverActivity, DriverSnapshot, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../src/driver-types.js";
 import { FALLBACK_MODELS, toPiModel } from "../src/models.js";
+import { freshInput, MAX_TRANSCRIPT_BYTES, planTurn, serializeBounded, warmAfterTurn } from "../src/transcript.js";
 
 class FakeHandle implements TurnHandle {
 	id = "turn-1";
@@ -283,6 +284,121 @@ test("steering messages queued during a tool call ride the MCP tool result and p
 		assert.equal(driver.requests[1].conversationId, "acp-warm");
 		assert.equal(driver.requests[1].prompt, "do I need to change compose?");
 		assert.equal(driver.requests[1].contextBlock, undefined);
+	} finally {
+		roundTrips.failAll("test done");
+	}
+});
+
+test("bounded transcript keeps system prompt, realctx-history summaries, and newest messages under the byte cap", () => {
+	const sys = "<pi-system>\nSystem rules\n</pi-system>";
+	const hist = user('<realctx-history part="h1" turns="1-5" replaced="12.0k tok">\nEarlier summary\n</realctx-history>');
+	const imgOld = { type: "image" as const, data: "b2xk", mimeType: "image/png" };
+	const imgNew = { type: "image" as const, data: "bmV3", mimeType: "image/png" };
+	const oldMsg: Message = { role: "user", content: [{ type: "text", text: "old ".repeat(400) }, imgOld], timestamp: 2 };
+	const midMsg = user("mid ".repeat(400));
+	const recentMsg: Message = { role: "user", content: [{ type: "text", text: "latest user question" }, imgNew], timestamp: 4 };
+
+	const bounded = serializeBounded(sys, [system(), hist, oldMsg, midMsg, recentMsg], 1_200);
+	assert.ok(Buffer.byteLength(bounded.text, "utf8") <= 1_200);
+	assert.match(bounded.text, /^<pi-system>\nSystem rules\n<\/pi-system>/);
+	assert.match(bounded.text, /<realctx-history part="h1"/);
+	assert.match(bounded.text, /<pi-transcript-omitted messages="2">/);
+	assert.match(bounded.text, /latest user question\n\[Attached image 1\]/);
+	assert.ok(!bounded.text.includes("old old old"));
+	assert.deepEqual(bounded.images, [{ data: "bmV3", mimeType: "image/png" }]);
+
+	const huge = freshInput(context([system(), hist, user("x".repeat(MAX_TRANSCRIPT_BYTES + 20_000)), user("tail prompt")]));
+	assert.ok(Buffer.byteLength(huge.contextBlock!.text, "utf8") <= MAX_TRANSCRIPT_BYTES);
+	assert.match(huge.contextBlock!.text, /<realctx-history part="h1"/);
+	assert.match(huge.contextBlock!.text, /tail prompt/);
+});
+
+test("warm session survives realctx assistant-tag stripping and ephemeral pi-lens context messages", () => {
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const turn1User = user("can we work with realctx historian?");
+	const transient1 = user("[pi-lens automated check — not a user request] Address 🔴 blockers before continuing");
+	const rawFinal = {
+		role: "assistant" as const,
+		content: [{
+			type: "text" as const,
+			text: 'Yes, it uses\n<realctx-history part="h1">\nsummary\n</realctx-history>\nand\n[#42 dropped · read a.ts · 3.1k tok]\nplaceholders.',
+		}],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: "stop" as const,
+		timestamp: 10,
+	};
+	const warm = warmAfterTurn(context([system(), turn1User, transient1]), rawFinal, "acp-session-1", "/repo");
+
+	// On the next turn, realctx strips forged tags/placeholders from the recorded assistant message
+	// and pi-lens removes its consumed one-request message.
+	const cleanedAssistant = {
+		...rawFinal,
+		content: [{
+			type: "text" as const,
+			text: "Yes, it uses\n\nand\n\nplaceholders.",
+		}],
+	};
+	const plan = planTurn(context([system(), turn1User, cleanedAssistant, user("great, let's adapt it")]), "/repo", warm);
+	assert.equal(plan.kind, "warm");
+	if (plan.kind !== "warm") return;
+	assert.equal(plan.sessionId, "acp-session-1");
+	assert.equal(plan.input.prompt, "great, let's adapt it");
+});
+
+test("mid-turn context compaction during tool reentry invalidates warm reuse for the next turn", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const roundTrips = new ToolRoundTrips(driver);
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const sessions = {};
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+	try {
+		const oldTurnUser = user("old question");
+		const oldTurnAsst: Message = {
+			role: "assistant",
+			content: [{ type: "text", text: "old answer" }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: "stop",
+			timestamp: 1,
+		};
+		const currentUser = user("run checks");
+		const initial = [system(), oldTurnUser, oldTurnAsst, currentUser];
+
+		const step1 = collect(stream(model, context(initial)));
+		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+		const parked = roundTrips.onToolCall("call-compact", "bash", { command: "npm test" }, new AbortController().signal);
+		const step1Done = (await step1).find((event) => event.type === "done");
+		assert.equal(step1Done?.type, "done");
+		if (step1Done?.type !== "done") return;
+
+		// While the tool runs, realctx historian replaces oldTurnUser + oldTurnAsst with a summary chunk.
+		const historyChunk = user('<realctx-history part="h1" turns="1-1" replaced="2.0k tok">\nSummarized old turn\n</realctx-history>');
+		const result: Message = { role: "toolResult", toolCallId: "call-compact", toolName: "bash", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 3 };
+		const compactedMidTurn = [system(), historyChunk, currentUser, step1Done.message, result];
+
+		const handle = driver.activeHandle as FakeHandle;
+		handle.pushExternal({ type: "text", delta: "checks passed" });
+		handle.complete({ status: "OK", response: "checks passed", finished: true, aborted: false, conversationId: "acp-pre-compaction" });
+
+		const step2Done = (await collect(stream(model, context(compactedMidTurn)))).find((event) => event.type === "done");
+		await parked;
+		assert.equal(step2Done?.type, "done");
+		if (step2Done?.type !== "done") return;
+
+		// Because history was compacted mid-turn, the next turn starts a fresh session with the compacted transcript.
+		driver.autoFinish = true;
+		driver.script = [{ type: "text", delta: "fresh reply" }];
+		await collect(stream(model, context([...compactedMidTurn, step2Done.message, user("next request")])));
+		assert.equal(driver.requests.length, 2);
+		assert.equal(driver.requests[1].conversationId, null);
+		assert.match(driver.requests[1].contextBlock?.text ?? "", /<realctx-history part="h1"/);
+		assert.match(driver.requests[1].contextBlock?.text ?? "", /next request/);
 	} finally {
 		roundTrips.failAll("test done");
 	}
