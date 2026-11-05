@@ -3,10 +3,10 @@ import { createAssistantMessageEventStream, type AssistantMessage, type Assistan
 import { calculateContextTokens } from "@earendil-works/pi-coding-agent";
 import { test } from "vitest";
 import { createStreamSimple, ToolRoundTrips, type AcpSessions } from "../src/provider.js";
-import { DELTA_PROMPT, FRESH_PROMPT, planTurn, warmAfterTurn } from "../src/transcript.js";
+import { DELTA_PROMPT, FRESH_PROMPT, planTurn, planTurnFrom, warmAfterTurn } from "../src/transcript.js";
 import { UsageMeter } from "../src/quota.js";
 import { FALLBACK_MODELS, toPiModel } from "../src/models.js";
-import type { DriverActivity, DriverSnapshot, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../src/driver-types.js";
+import type { DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../src/driver-types.js";
 
 const tool = (name: string) => ({ name, description: name, parameters: { type: "object", properties: {} } });
 const system = (prompt = "Test system", tools = ["read"]): Message =>
@@ -70,18 +70,17 @@ class Handle implements TurnHandle {
 }
 
 class ScriptDriver implements TurnDriver {
-	state = "ready" as const;
 	activeHandle: TurnHandle | null = null;
 	onTurnEnd: ((outcome: TurnOutcome) => void) | undefined;
 	requests: DriverTurnRequest[] = [];
 	constructor(public script: DriverActivity[], public outcome: Partial<TurnOutcome> = {}) {}
 	async run(request: DriverTurnRequest): Promise<TurnHandle> {
 		this.requests.push(request);
-		return new Handle(this.script, { status: "OK", response: "", finished: true, aborted: false, conversationId: "acp-1", ...this.outcome });
+		return new Handle(this.script, { status: "OK", response: "", aborted: false, conversationId: "acp-1", ...this.outcome });
 	}
 	reentry(): TurnHandle | null { return null; }
 	kickIdle(): void {}
-	snapshot(): DriverSnapshot { return { state: "ready", stats: { spawns: 0, turns: 0, reused: 0, recycles: 0, recycleReasons: {} }, lifecycle: [] }; }
+	async cancelActive(): Promise<void> {}
 	async close(): Promise<void> {}
 }
 
@@ -133,4 +132,32 @@ test("provider leaves unmeasured messages to pi and turns quota notices into err
 	assert.equal(failed.type, "error");
 	assert.match(meter.report(), /Quota exhausted/);
 	assert.equal(sessions.warm, undefined);
+});
+
+test("planTurnFrom picks the candidate with the smallest delta and matches planTurn", () => {
+	const turn1 = [system(), user("hello")];
+	const warm1 = warmAfterTurn(ctx(turn1), assistant("hi"), "s1", "/w");
+	const turn2 = [...turn1, assistant("hi"), user("q2")];
+	const warm2 = warmAfterTurn(ctx(turn2), assistant("a2"), "s2", "/w");
+	const now = ctx([...turn2, assistant("a2"), user("q3")]);
+
+	const best = planTurnFrom(now, "/w", [warm1, warm2]);
+	assert.equal(best.kind === "warm" && best.sessionId, "s2");
+	assert.equal(best.kind === "warm" && best.deltaMessages, 1);
+	assert.deepEqual(best, planTurn(now, "/w", warm2));
+	assert.deepEqual(planTurnFrom(now, "/w", [warm1]), planTurn(now, "/w", warm1));
+	assert.equal(planTurnFrom(now, "/other", [warm1, warm2]).kind === "fresh" && (planTurnFrom(now, "/other", [warm1, warm2]) as { reason: string }).reason, "cwd");
+	assert.deepEqual(planTurnFrom(now, "/w", []), planTurn(now, "/w", undefined));
+});
+
+test("prefix fingerprints skip transient messages exactly like the stored fingerprint", () => {
+	const lens = (text: string): Message => user(`[pi-lens automated check — not a user request] ${text}`);
+	const turn2 = [system(), user("hello"), assistant("hi"), user("q2")];
+	const { keys: _keys, items: _items, ...hashOnly } = warmAfterTurn(ctx(turn2), assistant("a2"), "s2", "/w");
+	// Only the count + fingerprint path can match a checkpoint without keys/items.
+	const now = ctx([system(), user("hello"), lens("old"), assistant("hi"), user("q2"), assistant("a2"), lens("new"), user("q3")]);
+	const plan = planTurn(now, "/w", hashOnly);
+	assert.equal(plan.kind, "warm");
+	assert.equal(plan.kind === "warm" && plan.deltaMessages, 2);
+	assert.equal(plan.kind === "warm" && plan.input.prompt.includes("q3"), true);
 });

@@ -128,13 +128,33 @@ export function tokensFromMetadata(metadata: Uint8Array, idx: number): StepToken
 	return tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite > 0 ? tokens : undefined;
 }
 
-/** Model-call steps with token stats after `afterIdx`, oldest first. */
-export function readStepTokens(dbPath: string, afterIdx = -1): StepTokens[] | undefined {
+type Database = InstanceType<SqliteModule["DatabaseSync"]>;
+
+/** Run `fn` on a short-lived connection; any failure (missing store, lock,
+ *  schema drift, no node:sqlite) yields undefined. */
+function withDb<T>(dbPath: string, readOnly: boolean, fn: (db: Database) => T): T | undefined {
 	const mod = loadSqlite();
 	if (!mod || !fs.existsSync(dbPath)) return undefined;
-	let db: InstanceType<SqliteModule["DatabaseSync"]> | undefined;
+	let db: Database | undefined;
 	try {
-		db = new mod.DatabaseSync(dbPath, { readOnly: true, timeout: BUSY_TIMEOUT_MS } as ConstructorParameters<SqliteModule["DatabaseSync"]>[1]);
+		db = new mod.DatabaseSync(dbPath, { readOnly, timeout: BUSY_TIMEOUT_MS } as ConstructorParameters<SqliteModule["DatabaseSync"]>[1]);
+		return fn(db);
+	} catch {
+		return undefined;
+	} finally {
+		try { db?.close(); } catch { /* already closed */ }
+	}
+}
+
+function maxIdx(db: Database): number {
+	const row = db.prepare("SELECT MAX(idx) AS idx FROM steps").get() as { idx: number | bigint | null } | undefined;
+	return row?.idx === null || row?.idx === undefined ? -1 : Number(row.idx);
+}
+
+/** Model-call steps with token stats after `afterIdx` (oldest first) and the
+ *  store's highest step index, read on one connection. */
+export function readStepState(dbPath: string, afterIdx = -1): { steps: StepTokens[]; maxIdx: number } | undefined {
+	return withDb(dbPath, true, (db) => {
 		const rows = db.prepare(
 			"SELECT idx, metadata FROM steps WHERE step_type = ? AND idx > ? AND metadata IS NOT NULL ORDER BY idx ASC",
 		).all(STEP_TYPE_AGENT, afterIdx) as Array<{ idx: number | bigint; metadata: Uint8Array | null }>;
@@ -144,28 +164,13 @@ export function readStepTokens(dbPath: string, afterIdx = -1): StepTokens[] | un
 			const tokens = tokensFromMetadata(row.metadata, Number(row.idx));
 			if (tokens) steps.push(tokens);
 		}
-		return steps;
-	} catch {
-		return undefined;
-	} finally {
-		try { db?.close(); } catch { /* already closed */ }
-	}
+		return { steps, maxIdx: maxIdx(db) };
+	});
 }
 
 /** Highest step index currently stored (−1 for an empty or missing store). */
 export function lastStepIdx(dbPath: string): number {
-	const mod = loadSqlite();
-	if (!mod || !fs.existsSync(dbPath)) return -1;
-	let db: InstanceType<SqliteModule["DatabaseSync"]> | undefined;
-	try {
-		db = new mod.DatabaseSync(dbPath, { readOnly: true, timeout: BUSY_TIMEOUT_MS } as ConstructorParameters<SqliteModule["DatabaseSync"]>[1]);
-		const row = db.prepare("SELECT MAX(idx) AS idx FROM steps").get() as { idx: number | bigint | null } | undefined;
-		return row?.idx === null || row?.idx === undefined ? -1 : Number(row.idx);
-	} catch {
-		return -1;
-	} finally {
-		try { db?.close(); } catch { /* already closed */ }
-	}
+	return withDb(dbPath, true, maxIdx) ?? -1;
 }
 
 function replaceBufferToken(source: Uint8Array, fromText: string, toText: string): Buffer {
@@ -175,7 +180,7 @@ function replaceBufferToken(source: Uint8Array, fromText: string, toText: string
 }
 
 function pruneForkedTables(
-	db: InstanceType<SqliteModule["DatabaseSync"]>,
+	db: Database,
 	sessionId: string,
 	newSessionId: string,
 	maxStepIdx: number,
@@ -223,33 +228,29 @@ function pruneForkedTables(
 
 /** Fork `<sessionId>.db` into a new `<forkedSessionId>.db` truncated to `idx <= maxStepIdx`
  *  so a `/tree` rewind to an earlier turn loads the exact ACP state at that turn
- *  without mutating the later branch's store. Returns `undefined` if unavailable. */
+ *  without mutating the later branch's store. The stores run in WAL mode, so the
+ *  copy is a `VACUUM INTO` snapshot (a file copy would miss steps still in the
+ *  `-wal` file). Returns `undefined` if unavailable. */
 export function forkConversationAtStep(
 	dir: string,
 	sessionId: string,
 	maxStepIdx: number,
-	newSessionId = randomUUID(),
+	newSessionId: string = randomUUID(),
 ): string | undefined {
-	const mod = loadSqlite();
 	const srcPath = conversationDbPath(dir, sessionId);
 	const dstPath = conversationDbPath(dir, newSessionId);
-	if (!mod || !srcPath || !dstPath || !fs.existsSync(srcPath) || maxStepIdx < 0) return undefined;
-	let db: InstanceType<SqliteModule["DatabaseSync"]> | undefined;
-	try {
-		fs.copyFileSync(srcPath, dstPath);
-		db = new mod.DatabaseSync(dstPath, { timeout: BUSY_TIMEOUT_MS } as ConstructorParameters<SqliteModule["DatabaseSync"]>[1]);
-		pruneForkedTables(db, sessionId, newSessionId, maxStepIdx);
-		return newSessionId;
-	} catch {
-		try {
-			db?.close();
-			db = undefined;
-			if (fs.existsSync(dstPath)) fs.unlinkSync(dstPath);
-		} catch { /* ignore cleanup failure */ }
-		return undefined;
-	} finally {
-		try { db?.close(); } catch { /* already closed */ }
+	if (!srcPath || !dstPath || maxStepIdx < 0 || fs.existsSync(dstPath)) return undefined;
+	const forked =
+		withDb(srcPath, true, (db) => db.prepare("VACUUM INTO ?").run(dstPath)) !== undefined &&
+		withDb(dstPath, false, (db) => {
+			pruneForkedTables(db, sessionId, newSessionId, maxStepIdx);
+			return true;
+		}) === true;
+	if (forked) return newSessionId;
+	for (const file of [dstPath, `${dstPath}-wal`, `${dstPath}-shm`, `${dstPath}-journal`]) {
+		try { fs.rmSync(file, { force: true }); } catch { /* ignore cleanup failure */ }
 	}
+	return undefined;
 }
 
 /** Return `sessionId` when its SQLite store is still at `maxStepIdx`, or fork a

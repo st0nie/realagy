@@ -9,21 +9,15 @@
 // read by `agy acp`) to "send-immediately" so user steering works as expected in Pi.
 
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
-export const QUEUED_MESSAGES_SEND_IMMEDIATELY = "send-immediately";
+const SEND_IMMEDIATELY = "send-immediately";
 
 export interface EnsureFileResult {
 	path: string;
 	updated: boolean;
 	value: string;
 	error?: string;
-}
-
-export interface EnsureFileOptions {
-	defaultValue?: string;
-	onlyIfDirExists?: boolean;
 }
 
 /**
@@ -37,14 +31,8 @@ export interface EnsureFileOptions {
  * - Writes via temp file and atomic rename.
  * - Traps any I/O exceptions so callers never crash on read-only or permission-denied files.
  */
-export function ensureQueuedMessagesInFile(
-	filePath: string,
-	opts: EnsureFileOptions | string = {},
-): EnsureFileResult {
-	const options: EnsureFileOptions =
-		typeof opts === "string" ? { defaultValue: opts } : opts;
-	const defaultValue = options.defaultValue ?? QUEUED_MESSAGES_SEND_IMMEDIATELY;
-	const onlyIfDirExists = options.onlyIfDirExists ?? false;
+export function ensureQueuedMessagesInFile(filePath: string): EnsureFileResult {
+	const defaultValue = SEND_IMMEDIATELY;
 
 	let resolvedPath = filePath;
 	try {
@@ -56,16 +44,11 @@ export function ensureQueuedMessagesInFile(
 	}
 
 	const dir = path.dirname(resolvedPath);
-	if (onlyIfDirExists && !fs.existsSync(dir)) {
-		return { path: resolvedPath, updated: false, value: "" };
-	}
 
 	let settings: Record<string, unknown> = {};
-	let fileExists = false;
 
 	try {
 		const raw = fs.readFileSync(resolvedPath, "utf8");
-		fileExists = true;
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(raw);

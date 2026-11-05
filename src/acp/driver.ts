@@ -1,82 +1,62 @@
-// AcpDriver: the ACP turn engine. Implements the same TurnDriver surface as
-// the stream-json driver (see src/driver-types.ts) so provider.ts and
-// the G9 round-trip store work unchanged.
+// AcpDriver: the ACP turn engine behind the provider (src/driver-types.ts).
 //
-// Engine differences vs stream-json, all verified live (docs/ACP-PROTOCOL-REFERENCE.md):
-//   - no process recycle on profile drift: one server process, sessions
-//     selected per turn via session/new / session/load
-//   - model/effort via session/set_config_option (configId "model", FULL slug
-//     with the effort tier baked in); mode via configId "mode"
-//   - config does NOT persist across server restarts: re-applied every turn
-//   - session/load replays history as full-text notification pairs BEFORE its
-//     response; the connection suppresses updates while loading
-//   - session/cancel is unimplemented on RC01 (-32601): abort = abortAll()
-//     teardown + kill, then session/load on the next turn. The method is
-//     probed once per connection; when upstream ships it, abort goes graceful
-//   - overall-timer pause uses remaining-budget semantics on G9 parks (never a
-//     fresh cap); every park carries its own timeout (BRIDGE_TIMEOUT_MS)
-//   - request_permission: skipPermissions turns answer the first allow option
-//     synchronously; otherwise an optional human handler (extension dialog)
-//     PARKS the request with the turn budget paused; no handler = deny
-//     fail-closed. Approvals-mode parity: a permissionPolicy override maps
-//     approvals.mode allow to the same synchronous auto path
+// One `agy acp` process hosts every turn; turns are serialized. Per turn:
+//   - session: reuse one the process already holds, reopen a persisted one
+//     (session/resume, else session/load), or create one. A remembered
+//     session whose conversation store is gone, or that fails to reopen, is
+//     replaced by a fresh session that receives the request's full fallback
+//     input instead of a delta it never saw the start of.
+//   - config: model + mode via session/set_config_option, re-applied every
+//     turn (config does not survive a server restart).
+//   - abort: ACP session/cancel notification; the prompt then ends
+//     "cancelled" and process and session survive. Only when agy ignores the
+//     cancel is the process torn down.
+//   - inactivity guard: no session/update for `inactivityMin` fails the turn;
+//     parked pi tool calls (bridge_call) pause the guard.
+//   - usage: exact per-model-call tokens from agy's conversation store at
+//     each bridge_call and at prompt end (src/acp/step-usage.ts).
 
+import fs from "node:fs";
 import { randomUUID } from "node:crypto";
-import type { UsageEstimate } from "./usage-estimate.js";
-import { AcpConnection, resolveAcpBinary, type AcpMcpServer, type AcpPermissionRequest } from "./connection.js";
-import type { AcpPermissionHandler } from "./connection.js";
+import { AcpConnection, type AcpExitInfo, type AcpMcpServer } from "./connection.js";
 import { mapStopReason, mapUpdate, TextAccumulator, type AcpEditDiff } from "./events.js";
-import { estimateTokens, synthesizeUsage } from "./usage-estimate.js";
-import { conversationDbPath, lastStepIdx, readStepTokens, siblingUsage, summarizeSteps, type StepTokens, type StepUsage } from "./step-usage.js";
+import { conversationDbPath, lastStepIdx, readStepState, siblingUsage, summarizeSteps, type StepTokens, type StepUsage } from "./step-usage.js";
 import { traceUsage } from "../usage-trace.js";
-import type {
-	AgyStepUsage,
-	AgyUsage,
-	DriverActivity,
-	DriverSnapshot,
-	DriverState,
-	DriverTurnRequest,
-	TurnDriver,
-	TurnHandle,
-	TurnOutcome,
-} from "../driver-types.js";
+import type { AgyStepUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../driver-types.js";
 
-const LIFECYCLE_LIMIT = 24;
+export type { AcpMcpServer } from "./connection.js";
+
+const DEFAULT_INACTIVITY_MIN = 5;
+/** How long a cancelled prompt may take to settle before teardown. */
+const CANCEL_GRACE_MS = 10_000;
 
 export interface AcpDriverOptions {
-	/** Config acp.bin value (may be empty). Env AGY_ACP_BIN wins. A function
-	 *  is resolved per connection: setup can install the binary and update
-	 *  config mid-session, and the next turn picks it up without a restart. */
+	/** agy binary. A function is resolved per spawn, so `/agy setup` can
+	 *  point the next spawn at a newly found binary. */
 	bin: string | (() => string);
-	/** Extra argv for the binary (tests: node + fake-server script). */
+	/** argv for the binary (tests: the fake-server script). Default `acp`. */
 	binArgs?: string[];
 	extraEnv?: Record<string, string>;
-	/** Bridge registration for session/new AND session/load. */
+	/** Bridge registration for every session/new, resume, and load. */
 	mcpServers?: () => AcpMcpServer[];
-	/** Client-side usage synthesis. Default "off": regex estimates must not
-	 *  become pi's context count; pi estimates unmeasured messages itself. */
-	usageEstimate?: UsageEstimate | (() => UsageEstimate);
 	/** Directory holding the server's `<sessionId>.db` conversation stores,
-	 *  read for exact per-model-call usage. undefined disables. */
+	 *  read for exact per-model-call usage and to detect lost sessions.
+	 *  undefined disables both. */
 	conversationsDir?: () => string | undefined;
-	/** Human gate for ACP request_permission on non-skip turns. Forwarded to
-	 *  the connection; the driver parks the turn budget around each call
-	 *  (dialog time does not eat the deadline). */
-	onPermissionRequest?: AcpPermissionHandler;
-	/** Park budget for one permission dialog (tests shrink it). */
-	permissionParkMs?: number;
-	/** Standing policy consulted when the turn is not skipPermissions:
-	 *  "auto" answers the first allow option synchronously, "deny" consults
-	 *  the human handler or fail-closes. Default deny. */
-	permissionPolicy?: () => "auto" | "deny";
+	/** Cancel-to-teardown grace period (tests shrink it). */
+	cancelGraceMs?: number;
 	log?: (msg: string, data?: unknown) => void;
 }
+
+type TurnInput = Pick<DriverTurnRequest, "prompt" | "images" | "contextBlock">;
 
 interface ActiveTurn {
 	id: string;
 	request: DriverTurnRequest;
 	/** The input actually sent: the request's, or its fallback after a lost session. */
-	input: { prompt: string; images?: Array<{ data: string; mimeType: string }>; contextBlock?: { uri: string; text: string } };
+	input: TurnInput;
+	/** Connection this turn runs on; teardown never touches another one. */
+	conn?: AcpConnection;
 	/** Conversation store of this session and the last step already reported. */
 	dbPath?: string;
 	stepCursor: number;
@@ -90,50 +70,28 @@ interface ActiveTurn {
 	resolve: (o: TurnOutcome) => void;
 	outcome: Promise<TurnOutcome>;
 	response: TextAccumulator;
-	/** Usage-synthesis counters: per-delta token sums (estimate mode) and
-	 *  delta counts (direct mode). Sums are taken per delta, never over the
-	 *  joined text, so a word split across chunks stays two words. */
-	textTokens: number;
-	thoughtTokens: number;
-	textDeltas: number;
-	thoughtDeltas: number;
-	/** Estimated once, not re-tokenized for every streaming delta. */
-	estimatedInputTokens: number;
 	contextUsage?: { used: number; size: number };
-	sawResult: boolean;
-	/** True once the prompt RPC was issued. Abort before this point has
-	 *  nothing to cancel: probing would risk a success-as-noop answer from a
-	 *  future cancel-capable server stranding the turn in the safety-net
-	 *  wait, so the driver tears down instead. */
+	/** True once the prompt RPC was issued: only then is there anything for
+	 *  session/cancel to end. */
 	promptStarted: boolean;
 	aborted: boolean;
-	abortedBy: "signal" | "timer" | null;
 	parks: number;
-	/** Wall-clock deadline of the overall timer; null while paused. */
-	overallDeadline: number | null;
-	overallRemainingMs: number | null;
-	overallTimer?: ReturnType<typeof setTimeout>;
 	idleTimer?: ReturnType<typeof setTimeout>;
-	/** toolCallId → tool name + args + optional native diff (diff rides on
-	 *  the pending tool_call frame; updates don't repeat it). */
+	cancelTimer?: ReturnType<typeof setTimeout>;
+	/** toolCallId → tool name + args + optional native diff (the diff rides
+	 *  on the pending tool_call frame; updates don't repeat it). */
 	toolCalls: Map<string, { name: string; args: Record<string, unknown>; diff?: AcpEditDiff; mcpServer?: string }>;
 }
 
-/** Recombine the provider's (base slug, effort) into the FULL ACP model slug.
- *  Fixed families (no effort) pass through unchanged. Verified against the
- *  run-5 catalog: session/set_config_option wants "gemini-3.8-flash-low"-style
- *  full slugs. */
+/** Recombine the provider's (base slug, effort) into the FULL ACP model slug
+ *  ("gemini-3.8-flash-low"). Fixed families pass through unchanged. */
 export function acpModelSlug(model: string, effort?: string): string {
 	if (!effort) return model;
 	if (/(?:^|-)(?:high|medium|low)$/.test(model)) return model;
 	return `${model}-${effort}`;
 }
 
-/** Map our config knobs onto ACP session modes. skipPermissions=false also
- *  fail-closes the in-connection permission handler (reject options), so the
- *  modes keep their server-side meaning. Known gap: the CLI's `--mode plan`
- *  has no ACP equivalent (review 4, finding 4) — plan + acp is refused at the
- *  command level and fails the turn visibly. */
+/** Map our knobs onto ACP session modes. */
 export function acpMode(mode: string, skipPermissions: boolean): string {
 	if (skipPermissions) return "yolo";
 	return mode === "plan" ? "default" : "auto_edit";
@@ -141,40 +99,24 @@ export function acpMode(mode: string, skipPermissions: boolean): string {
 
 export class AcpDriver implements TurnDriver {
 	#opts: AcpDriverOptions;
-	#state: DriverState = "idle";
 	#conn: AcpConnection | undefined;
+	/** Pending start of #conn: concurrent callers share one handshake. */
+	#starting: Promise<AcpConnection> | undefined;
 	#active: ActiveTurn | undefined;
 	#queueTail: Promise<void> = Promise.resolve();
-	#lifecycle: string[] = [];
 	#onTurnEnd: ((outcome: TurnOutcome) => void) | undefined;
-	#stats = {
-		spawns: 0,
-		turns: 0,
-		sessionsCreated: 0,
-		sessionsLoaded: 0,
-		kills: 0,
-	};
-	#serverVersion: string | undefined;
-	#lastSessionId: string | undefined;
 	/** Sessions held in memory by the current server process (reset on respawn). */
 	#liveSessions = new Set<string>();
-	#lastCancelSupported: boolean | null = null;
-	#agentInfo: { name?: string; title?: string } | undefined;
 
 	constructor(opts: AcpDriverOptions) {
 		this.#opts = opts;
-		this.#log("driver-created", { bin: typeof opts.bin === "function" ? "(resolved per turn)" : resolveAcpBinary(opts.bin) });
 	}
 
 	/** Read the account's live catalog through the official ACP session flow. */
 	async listModels(cwd: string): Promise<Array<{ modelId: string; name?: string }>> {
-		const conn = await this.#ensureConnection({ cwd, model: "", mode: "accept-edits", skipPermissions: true, prompt: "" });
+		const conn = await this.#ensureConnection(cwd);
 		const session = await conn.newSession(cwd);
 		return session.availableModels;
-	}
-
-	get state(): DriverState {
-		return this.#state;
 	}
 
 	get activeHandle(): TurnHandle | null {
@@ -186,8 +128,8 @@ export class AcpDriver implements TurnDriver {
 		this.#onTurnEnd = fn;
 	}
 
-	/** Inject a synthetic activity into the live turn (bridge inbox). Parks the
-	 *  turn: suspends the idle timer and pauses the overall deadline. */
+	/** Inject a synthetic activity into the live turn (bridge inbox). A
+	 *  bridge_call parks the turn: the inactivity guard pauses. */
 	pushExternal(activity: DriverActivity): void {
 		const t = this.#active;
 		if (!t || t.closed) return;
@@ -200,51 +142,19 @@ export class AcpDriver implements TurnDriver {
 			if (!this.#collectStepUsage(t) && t.lastStep) this.#emit(t, { type: "step_usage", usage: stripIdx(siblingUsage(t.lastStep)) });
 			t.parks += 1;
 			this.#clearIdle(t);
-			this.#pauseOverall(t);
 		}
 		this.#emit(t, activity);
-	}
-
-	/** Run the human permission dialog with the turn parked: same budget
-	 *  semantics as bridge parks (dialog time does not consume the deadline).
-	 *  The finally unparks the CAPTURED turn, never whatever is active at
-	 *  exit: the turn can close mid-dialog (abort, server death) and a new
-	 *  turn must not inherit this park's accounting. */
-	async #parkForPermission(req: AcpPermissionRequest): Promise<string | null | undefined> {
-		const t = this.#active;
-		const parked = t !== undefined && !t.closed;
-		if (parked) {
-			t.parks += 1;
-			this.#clearIdle(t);
-			this.#pauseOverall(t);
-		}
-		try {
-			return await this.#opts.onPermissionRequest!(req);
-		} finally {
-			if (parked && !t.closed && t.parks > 0) {
-				t.parks -= 1;
-				if (t.parks === 0) {
-					this.#armIdle(t);
-					this.#resumeOverall(t);
-					this.#log("unparked");
-				}
-			}
-		}
 	}
 
 	kickIdle(): void {
 		const t = this.#active;
 		if (!t || t.closed) return;
 		if (t.parks > 0) t.parks -= 1;
-		if (t.parks === 0) {
-			this.#armIdle(t);
-			this.#resumeOverall(t);
-			this.#log("unparked");
-		}
+		if (t.parks === 0) this.#armIdle(t);
 	}
 
-	/** Turns are serialized; a parked turn stays open and the continuation
-	 *  path uses reentry() (same contract as the stream-json driver). */
+	/** Turns are serialized; a parked turn stays open and its continuation
+	 *  uses reentry(). */
 	run(request: DriverTurnRequest): Promise<TurnHandle> {
 		let release!: () => void;
 		const prev = this.#queueTail;
@@ -252,7 +162,7 @@ export class AcpDriver implements TurnDriver {
 		return prev
 			.then(() => this.#runExclusive(request))
 			.then((handle) => {
-				void handle.outcome.catch(() => {}).then(() => release());
+				void handle.outcome.then(release, release);
 				return handle;
 			})
 			.catch((err) => {
@@ -265,105 +175,54 @@ export class AcpDriver implements TurnDriver {
 		return this.activeHandle;
 	}
 
+	async cancelActive(reason: string): Promise<void> {
+		const turn = this.#active;
+		if (!turn || turn.closed) return;
+		this.#log("cancel-active", { reason, sessionId: turn.sessionId });
+		this.#abortTurn(turn);
+		await turn.outcome;
+	}
+
 	#runExclusive(request: DriverTurnRequest): Promise<TurnHandle> {
-		// No shutdown latch here: pi fires session_shutdown on /new, /resume and
-		// /fork (not only process exit), so a closed driver must respawn on the
-		// next turn instead of rejecting forever. Regression 2026-09-07:
-		// /compact after a model switch failed with "ACP driver is shut down."
 		if (request.signal?.aborted) return Promise.reject(new Error("aborted before start"));
 
 		const turn = this.#createTurn(request);
 		this.#active = turn;
-		this.#state = "running";
-		this.#stats.turns += 1;
 		this.#log("turn-start", {
 			model: request.model,
 			effort: request.effort,
-			mode: request.mode,
 			conversation: request.conversationId ?? null,
 			images: request.images?.length ?? 0,
 			contextBlock: request.contextBlock ? true : undefined,
 		});
 
-		// Abort wiring first: a kill during session setup must still settle the
-		// turn (Gate D teardown applies from the first request).
+		// Abort wiring first: an abort during session setup must still settle
+		// the turn.
 		if (request.signal) {
-			const onAbort = () => void this.#abortTurn(turn);
-			if (request.signal.aborted) {
-				onAbort();
-			} else {
-				request.signal.addEventListener("abort", onAbort, { once: true });
-			}
+			const signal = request.signal;
+			const onAbort = () => this.#abortTurn(turn);
+			signal.addEventListener("abort", onAbort, { once: true });
+			void turn.outcome.then(() => signal.removeEventListener("abort", onAbort));
 		}
 
-		// Execute asynchronously: the handle returns as soon as the prompt is
-		// dispatched, and activities stream through next() (stream-json contract).
+		// Execute asynchronously: the handle returns at once, and activities
+		// stream through next().
 		void this.#executeTurn(turn).catch((err: unknown) => {
-			this.#failTurn(turn, `ACP turn failed: ${describe(err)}`);
+			this.#failTurn(turn, `Antigravity turn failed: ${describe(err)}`);
 		});
 		return Promise.resolve(this.#makeHandle(turn));
 	}
 
 	async #executeTurn(turn: ActiveTurn): Promise<void> {
 		const request = turn.request;
-		const conn = await this.#ensureConnection(request);
+		const conn = await this.#ensureConnection(request.cwd);
+		if (turn.closed) return;
+		turn.conn = conn;
 
-		// Session: reuse a session this server process already holds, load
-		// (resume) one it persisted, or create. A missing conversation must not
-		// fail the turn (9.4): the fresh session gets the request's complete
-		// fallback input instead of a delta it could not interpret.
-		let sessionMode: "new" | "reused" | "loaded" | "fallback" = "new";
-		try {
-			if (request.conversationId && this.#liveSessions.has(request.conversationId)) {
-				turn.sessionId = request.conversationId;
-				sessionMode = "reused";
-				this.#log("session-reuse", { sessionId: request.conversationId });
-			} else if (request.conversationId) {
-				this.#log("session-load", { sessionId: request.conversationId });
-				this.#stats.sessionsLoaded += 1;
-				await conn.loadSession(request.conversationId, request.cwd);
-				turn.sessionId = request.conversationId;
-				sessionMode = "loaded";
-			} else {
-				const created = await conn.newSession(request.cwd);
-				turn.sessionId = created.sessionId;
-				this.#stats.sessionsCreated += 1;
-				this.#log("session-new", { sessionId: created.sessionId });
-			}
-		} catch (err) {
-			if (turn.aborted) {
-				this.#settle(turn, {
-					conversationId: turn.sessionId,
-					status: "OK",
-					response: turn.response.text,
-					finished: true,
-					aborted: true,
-				});
-				return;
-			}
-			if (request.conversationId) {
-				this.#log("session-load-failed-creating-fresh", {
-					sessionId: request.conversationId,
-					message: err instanceof Error ? err.message : String(err),
-				});
-				try {
-					const created = await conn.newSession(request.cwd);
-					turn.sessionId = created.sessionId;
-					this.#stats.sessionsCreated += 1;
-					sessionMode = "fallback";
-				} catch (err2) {
-					this.#failTurn(turn, `ACP session failed: ${describe(err2)}`);
-					return;
-				}
-			} else {
-				this.#failTurn(turn, `ACP session failed: ${describe(err)}`);
-				return;
-			}
-		}
+		const sessionMode = await this.#openSession(turn, conn);
+		if (turn.closed || sessionMode === undefined) return;
 		if (conn === this.#conn) this.#liveSessions.add(turn.sessionId);
-		if (sessionMode === "fallback" && request.fallback) {
-			turn.input = { prompt: request.fallback.prompt, images: request.fallback.images, contextBlock: request.fallback.contextBlock };
-		}
+		if (sessionMode === "fallback" && request.fallback) turn.input = { ...request.fallback };
 		const dir = this.#opts.conversationsDir?.();
 		turn.dbPath = dir ? conversationDbPath(dir, turn.sessionId) : undefined;
 		turn.stepCursor = turn.dbPath ? lastStepIdx(turn.dbPath) : -1;
@@ -376,15 +235,13 @@ export class AcpDriver implements TurnDriver {
 			images: turn.input.images?.length ?? 0,
 			stepCursor: turn.stepCursor,
 		});
-		if (turn.closed) return;
 
-		// Config: model + mode. Model failure fails the turn (wrong-model turns
-		// are a parity break); mode failure is best-effort (auto policy makes
-		// the modes converge anyway).
+		// Config: a model failure fails the turn (a wrong-model turn is worse
+		// than none); a mode failure is logged and the turn proceeds.
 		try {
 			await conn.setConfigOption(turn.sessionId, "model", acpModelSlug(request.model, request.effort));
 		} catch (err) {
-			this.#failTurn(turn, `ACP model selection failed: ${describe(err)}`);
+			this.#failTurn(turn, `Antigravity model selection failed: ${describe(err)}`);
 			return;
 		}
 		try {
@@ -394,51 +251,81 @@ export class AcpDriver implements TurnDriver {
 		}
 		if (turn.closed) return;
 
-		// Timers: overall (turn deadline, pause-aware) + idle (inactivity).
-		this.#armOverall(turn);
 		this.#armIdle(turn);
-		// Optional client estimate (usageEstimate "estimate"/"direct"; default
-		// off). Exact counts come from step_usage, read from the server's
-		// conversation store as each model call finishes.
-		this.#emitLiveEstimate(turn);
-
-		// Prompt. Updates stream through the connection's onUpdate callback.
+		turn.promptStarted = true;
 		try {
-			// Nothing to cancel before the prompt RPC exists; see promptStarted.
-			turn.promptStarted = true;
 			const result = await conn.prompt(turn.sessionId, turn.input.prompt, turn.input.images, turn.input.contextBlock);
 			if (turn.closed) return;
-			turn.sawResult = true;
-			const usage = result.usage;
-			traceUsage("prompt-result", { sessionId: turn.sessionId, stopReason: result.stopReason, usage, usageUpdate: turn.contextUsage });
+			traceUsage("prompt-result", { sessionId: turn.sessionId, stopReason: result.stopReason, usage: result.usage, usageUpdate: turn.contextUsage });
 			// Exact per-call steps first; the turn-cumulative total is only a
 			// fallback for messages no step measurement covered.
-			this.#collectStepUsage(turn);
-			if (usage && !turn.stepUsageSeen) this.#emit(turn, { type: "usage", usage });
+			const maxStepIdx = this.#collectStepUsage(turn);
+			if (result.usage && !turn.stepUsageSeen) this.#emit(turn, { type: "usage", usage: result.usage });
 			const mapped = mapStopReason(result.stopReason);
-			const endStepIdx = turn.dbPath ? lastStepIdx(turn.dbPath) : -1;
+			const aborted = mapped.aborted || turn.aborted;
 			this.#settle(turn, {
 				conversationId: turn.sessionId,
-				status: mapped.status,
+				status: aborted ? "OK" : mapped.status,
 				response: turn.response.text,
-				usage,
-				error: mapped.error,
-				finished: true,
-				aborted: mapped.aborted,
-				maxStepIdx: endStepIdx >= 0 ? endStepIdx : undefined,
-			});
+				usage: result.usage,
+				error: aborted ? undefined : mapped.error,
+				aborted,
+				...(maxStepIdx !== undefined && maxStepIdx >= 0 ? { maxStepIdx } : {}),
+			}, { collected: true });
 		} catch (err) {
 			if (turn.closed) return;
-			const aborted = turn.aborted;
-			this.#settle(turn, {
-				conversationId: turn.sessionId,
-				status: aborted ? "OK" : "ERROR",
-				response: turn.response.text,
-				error: aborted ? undefined : `ACP prompt failed: ${describe(err)}`,
-				finished: true,
-				aborted,
-			});
+			if (turn.aborted) this.#settleAborted(turn);
+			else this.#failTurn(turn, `Antigravity prompt failed: ${describe(err)}`);
 		}
+	}
+
+	/** Pick the turn's session. undefined = the turn already settled. */
+	async #openSession(turn: ActiveTurn, conn: AcpConnection): Promise<"new" | "reused" | "resumed" | "loaded" | "fallback" | undefined> {
+		const id = turn.request.conversationId;
+		try {
+			if (id && this.#liveSessions.has(id)) {
+				turn.sessionId = id;
+				this.#log("session-reuse", { sessionId: id });
+				return "reused";
+			}
+			if (id && this.#storeMissing(id)) {
+				// session/load of an unknown id silently yields an empty session:
+				// never hand it a delta.
+				this.#log("session-lost", { sessionId: id });
+			} else if (id) {
+				const mode = await conn.reopenSession(id, turn.request.cwd);
+				turn.sessionId = id;
+				this.#log(`session-${mode}`, { sessionId: id });
+				return mode;
+			}
+		} catch (err) {
+			if (turn.closed) return undefined;
+			if (turn.aborted) {
+				this.#settleAborted(turn);
+				return undefined;
+			}
+			this.#log("session-reopen-failed", { sessionId: id, message: describe(err) });
+		}
+		if (turn.closed) return undefined;
+		try {
+			const created = await conn.newSession(turn.request.cwd);
+			turn.sessionId = created.sessionId;
+			this.#log("session-new", { sessionId: created.sessionId });
+			return id ? "fallback" : "new";
+		} catch (err) {
+			if (turn.closed) return undefined;
+			if (turn.aborted) this.#settleAborted(turn);
+			else this.#failTurn(turn, `Antigravity session failed: ${describe(err)}`);
+			return undefined;
+		}
+	}
+
+	/** True when the conversation store is known and has no `<id>.db`. */
+	#storeMissing(sessionId: string): boolean {
+		const dir = this.#opts.conversationsDir?.();
+		if (!dir) return false;
+		const dbPath = conversationDbPath(dir, sessionId);
+		return !dbPath || !fs.existsSync(dbPath);
 	}
 
 	#makeHandle(turn: ActiveTurn): TurnHandle {
@@ -460,15 +347,15 @@ export class AcpDriver implements TurnDriver {
 
 	#emit(turn: ActiveTurn, activity: DriverActivity): void {
 		if (turn.closed) return;
-		if (turn.wake.length > 0) turn.wake.shift()!();
 		turn.buffer.push(activity);
+		turn.wake.shift()?.();
 	}
 
-	#onConnectionUpdate(sessionId: string | null, update: unknown): void {
+	#onConnectionUpdate(conn: AcpConnection, sessionId: string | null, update: unknown): void {
 		const turn = this.#active;
-		if (!turn || turn.closed) return;
+		if (!turn || turn.closed || turn.conn !== conn) return;
 		if (sessionId !== null && sessionId !== turn.sessionId) return;
-		if (turn.idleTimer) turn.idleTimer.refresh();
+		turn.idleTimer?.refresh();
 		if (typeof update === "object" && update !== null && !Array.isArray(update)) {
 			const frame = update as Record<string, unknown>;
 			if (frame.sessionUpdate === "usage_update" && Number.isSafeInteger(frame.used) && Number.isSafeInteger(frame.size)
@@ -477,6 +364,7 @@ export class AcpDriver implements TurnDriver {
 				turn.contextUsage = contextUsage;
 				traceUsage("usage-update", { sessionId: turn.sessionId, used: contextUsage.used, size: contextUsage.size });
 				this.#emit(turn, { type: "context_usage", contextUsage });
+				return;
 			}
 		}
 		const mapped = mapUpdate(update);
@@ -484,25 +372,14 @@ export class AcpDriver implements TurnDriver {
 		switch (mapped.kind) {
 			case "text": {
 				const emit = turn.response.append(mapped.delta);
-				if (emit) {
-					turn.textDeltas += 1;
-					turn.textTokens += estimateTokens(emit);
-					this.#emitLiveEstimate(turn);
-					this.#emit(turn, { type: "text", delta: emit });
-				}
+				if (emit) this.#emit(turn, { type: "text", delta: emit });
 				return;
 			}
-			case "thought": {
-				if (!mapped.delta) return;
-				turn.thoughtDeltas += 1;
-				turn.thoughtTokens += estimateTokens(mapped.delta);
-				this.#emitLiveEstimate(turn);
-				this.#emit(turn, { type: "thought", delta: mapped.delta });
+			case "thought":
+				if (mapped.delta) this.#emit(turn, { type: "thought", delta: mapped.delta });
 				return;
-			}
 			case "tool_start": {
-				const entry = { name: mapped.name, args: mapped.args, diff: mapped.diff, mcpServer: mapped.mcpServer };
-				turn.toolCalls.set(mapped.toolCallId, entry);
+				turn.toolCalls.set(mapped.toolCallId, { name: mapped.name, args: mapped.args, diff: mapped.diff, mcpServer: mapped.mcpServer });
 				this.#emit(turn, { type: "tool_start", name: mapped.name, args: mapped.args, mcpServer: mapped.mcpServer, toolCallId: mapped.toolCallId });
 				return;
 			}
@@ -512,24 +389,25 @@ export class AcpDriver implements TurnDriver {
 					// The server can finish an approved tool under a different id.
 					// Adopt only when exactly one call is pending: with concurrent
 					// tools, guessing would attach an edit diff to the wrong file.
-					// Residual: an unrelated done with an unknown id still pairs
-					// with the pending entry; strictly better than guessing ANY id.
 					entry = turn.toolCalls.values().next().value;
 					turn.toolCalls.clear();
 				}
 				turn.toolCalls.delete(mapped.toolCallId);
-				const name = entry?.name ?? "tool";
-				const args = entry?.args ?? {};
-				// Native diff from the stored tool_call frame; the update's own
-				// diff (future builds) wins when present.
-				this.#emit(turn, { type: "tool_done", name, args, output: mapped.output, diff: mapped.diff ?? entry?.diff, mcpServer: mapped.mcpServer ?? entry?.mcpServer, toolCallId: mapped.toolCallId });
+				this.#emit(turn, {
+					type: "tool_done",
+					name: entry?.name ?? "tool",
+					args: entry?.args ?? {},
+					output: mapped.output,
+					diff: mapped.diff ?? entry?.diff,
+					mcpServer: mapped.mcpServer ?? entry?.mcpServer,
+					toolCallId: mapped.toolCallId,
+				});
 				return;
 			}
 			case "tool_error": {
 				const entry = turn.toolCalls.get(mapped.toolCallId);
 				turn.toolCalls.delete(mapped.toolCallId);
-				const name = entry?.name ?? "tool";
-				this.#emit(turn, { type: "tool_error", name, message: mapped.message, mcpServer: mapped.mcpServer ?? entry?.mcpServer, toolCallId: mapped.toolCallId });
+				this.#emit(turn, { type: "tool_error", name: entry?.name ?? "tool", message: mapped.message, mcpServer: mapped.mcpServer ?? entry?.mcpServer, toolCallId: mapped.toolCallId });
 				return;
 			}
 			case "replay_user":
@@ -537,149 +415,101 @@ export class AcpDriver implements TurnDriver {
 		}
 	}
 
-	#onConnectionExit(conn: AcpConnection, info: { stderrTail: string }): void {
-		if (this.#conn !== conn) {
-			// A replaced connection reporting its death late (RC01's signal
-			// handler intercepts SIGTERM and can outlive its replacement by
-			// seconds): its turn is long gone and the new connection owns the
-			// driver state. Clobbering #conn here would orphan the live one.
-			this.#log("stale-connection-exited", { tail: info.stderrTail.slice(-200) });
-			return;
+	#onConnectionExit(conn: AcpConnection, info: AcpExitInfo): void {
+		if (this.#conn === conn) {
+			this.#conn = undefined;
+			this.#liveSessions.clear();
 		}
 		const turn = this.#active;
-		this.#conn = undefined;
-		this.#state = "dead";
-		// Teardown exits (abort kill, shutdown, idle recycle) are deliberate:
-		// their stderr tail must never reach the UI. Only a live turn dying
-		// mid-flight is user-reportable, and it surfaces as a normal turn
-		// error, not as raw console noise.
-		const turnActive = Boolean(turn && !turn.closed && !turn.aborted && !turn.sawResult);
-		this.#log("connection-exited", { expected: !turnActive, tail: info.stderrTail.slice(-200) });
-		if (!turn || turn.closed) return;
-		if (turn.aborted || turn.sawResult) {
-			this.#settle(turn, {
-				conversationId: turn.sessionId,
-				status: turn.response.text.length > 0 || turn.sawResult ? "OK" : "UNKNOWN",
-				response: turn.response.text,
-				finished: true,
-				aborted: turn.aborted,
-			});
+		this.#log("connection-exited", { code: info.code, signal: info.signal, ownsTurn: turn?.conn === conn });
+		// A replaced connection reporting its death late must not touch the
+		// turn that now runs on its successor.
+		if (!turn || turn.closed || turn.conn !== conn) return;
+		if (turn.aborted) {
+			this.#settleAborted(turn);
 			return;
 		}
-		this.#failTurn(turn, "Antigravity session exited unexpectedly; it restarts on the next turn");
+		this.#failTurn(turn, `Antigravity CLI exited mid-turn (${info.reason}); it restarts on the next turn`);
 	}
 
-	#ensureConnection(request: DriverTurnRequest): Promise<AcpConnection> {
+	/** The live connection, spawning one if needed. Concurrent callers share a
+	 *  pending start, so no request ever precedes the initialize handshake. */
+	#ensureConnection(cwd: string): Promise<AcpConnection> {
+		if (this.#starting) return this.#starting;
 		if (this.#conn?.alive) return Promise.resolve(this.#conn);
-		this.#state = "starting";
-		this.#stats.spawns += 1;
-		const conn = new AcpConnection({
-			bin: resolveAcpBinary(typeof this.#opts.bin === "function" ? this.#opts.bin() : this.#opts.bin),
+		const bin = typeof this.#opts.bin === "function" ? this.#opts.bin() : this.#opts.bin;
+		const conn: AcpConnection = new AcpConnection({
+			bin,
 			binArgs: this.#opts.binArgs,
 			extraEnv: this.#opts.extraEnv,
-			cwd: request.cwd,
+			cwd,
 			mcpServers: this.#opts.mcpServers,
 			log: (msg, data) => this.#log(msg, data),
-			// Fail-closed permissions: skipPermissions answers allow; a standing
-			// policy override (approvals.mode allow) may widen that; everything
-			// else goes to the human handler or denies.
-			permissions: () =>
-				this.#active?.request.skipPermissions
-					? "auto"
-					: (this.#opts.permissionPolicy?.() ?? "deny"),
-			onPermissionRequest: this.#opts.onPermissionRequest
-				? (req) => this.#parkForPermission(req)
-				: undefined,
-			permissionParkMs: this.#opts.permissionParkMs,
-			onUpdate: (sessionId, update) => this.#onConnectionUpdate(sessionId, update),
+			// Fail-closed: only skipPermissions turns approve agy's requests.
+			permissions: () => (this.#active?.request.skipPermissions ? "auto" : "deny"),
+			onUpdate: (sessionId, update) => this.#onConnectionUpdate(conn, sessionId, update),
 			onExit: (info) => this.#onConnectionExit(conn, info),
 		});
 		this.#conn = conn;
 		this.#liveSessions.clear();
-		this.#log("spawn", { bin: resolveAcpBinary(typeof this.#opts.bin === "function" ? this.#opts.bin() : this.#opts.bin) });
-		return conn
-			.start()
-			.then(() => {
-				this.#serverVersion = conn.serverVersion();
-				const info = conn.agentInfo as { name?: unknown; title?: unknown } | undefined;
-				this.#agentInfo = {
-					name: typeof info?.name === "string" ? info.name : undefined,
-					title: typeof info?.title === "string" ? info.title : undefined,
-				};
-				this.#state = "ready";
+		this.#log("spawn", { bin });
+		const starting = conn.start().then(
+			() => {
+				if (this.#starting === starting) this.#starting = undefined;
 				return conn;
-			})
-			.catch((err) => {
-				// A server that spawned but failed the handshake (init timeout,
-				// auth hang) must not leak: it is detached, so it outlives pi.
-				this.#state = "dead";
-				this.#conn = undefined;
+			},
+			(err: unknown) => {
+				if (this.#starting === starting) this.#starting = undefined;
+				// A server that spawned but failed the handshake must not leak:
+				// it runs in its own process group and would outlive pi.
+				if (this.#conn === conn) this.#conn = undefined;
 				conn.kill();
 				this.#log("start-failed", { message: describe(err) });
-				throw err;
-			});
+				throw new Error(`Cannot start the Antigravity CLI (${bin}): ${describe(err)}. Run /agy setup.`);
+			},
+		);
+		this.#starting = starting;
+		return starting;
 	}
 
-	/** Gate D abort. RC01 has no session/cancel: probe it once per connection,
-	 *  then either wait for the cancelled result or tear down. */
-	async #abortTurn(turn: ActiveTurn): Promise<void> {
-		if (turn.closed) return;
+	/** Abort: ACP cancel once the prompt runs (process and session survive);
+	 *  before that, settle at once and let the setup steps stop at their next
+	 *  check. Teardown only if the cancelled prompt does not settle in time. */
+	#abortTurn(turn: ActiveTurn): void {
+		if (turn.closed || turn.aborted) return;
 		turn.aborted = true;
-		turn.abortedBy = "signal";
-		const conn = this.#conn;
-		// No session yet (killed during setup), no live connection, or a server
-		// already known not to implement cancel: teardown directly.
-		if (!conn?.alive || turn.sessionId === "" || !turn.promptStarted || this.#cancelUnsupported()) {
-			this.#teardownAbort(turn);
+		const conn = turn.conn;
+		if (!turn.promptStarted || !conn?.alive) {
+			this.#settleAborted(turn);
 			return;
 		}
-		try {
-			const probe = await conn.cancel(turn.sessionId);
-			conn.cancelSupported = probe.supported;
-			this.#lastCancelSupported = probe.supported;
-			if (!probe.supported) {
-				this.#log("cancel-unsupported", { build: this.#serverVersion });
-				this.#teardownAbort(turn);
-				return;
-			}
-			// Cancel accepted: the prompt result (stopReason cancelled) settles
-			// the turn through the normal path. Safety net below in case the
-			// server never answers.
-			const started = this.#nowMs();
-			const check = setInterval(() => {
-				if (turn.closed) {
-					clearInterval(check);
-					return;
-				}
-				if (this.#nowMs() - started > 10_000) {
-					clearInterval(check);
-					this.#teardownAbort(turn);
-				}
-			}, 250);
-		} catch (err) {
-			this.#log("cancel-failed", { message: describe(err) });
-			this.#teardownAbort(turn);
+		this.#log("cancel", { sessionId: turn.sessionId });
+		conn.cancel(turn.sessionId);
+		turn.cancelTimer = setTimeout(() => {
+			if (turn.closed) return;
+			this.#log("cancel-timeout", { sessionId: turn.sessionId });
+			this.#teardown(turn);
+			this.#settleAborted(turn);
+		}, this.#opts.cancelGraceMs ?? CANCEL_GRACE_MS);
+		turn.cancelTimer.unref?.();
+	}
+
+	/** Kill the turn's own connection, never a successor's. */
+	#teardown(turn: ActiveTurn): void {
+		const conn = turn.conn;
+		if (!conn) return;
+		this.#log("teardown", { sessionId: turn.sessionId });
+		if (this.#conn === conn) {
+			this.#conn = undefined;
+			this.#liveSessions.clear();
 		}
-	}
-
-	#cancelUnsupported(): boolean {
-		return this.#conn?.cancelSupported === false;
-	}
-
-	/** Gate D teardown: reject everything pending, kill the process. The turn
-	 *  settles through the connection-exit path as aborted. */
-	#teardownAbort(turn: ActiveTurn): void {
-		this.#stats.kills += 1;
-		this.#log("teardown-abort", { sessionId: turn.sessionId });
-		turn.aborted = true;
-		this.#conn?.abortAll("abort: connection torn down");
-		this.#conn?.kill();
+		conn.kill();
 	}
 
 	#createTurn(request: DriverTurnRequest): ActiveTurn {
 		let resolve!: (o: TurnOutcome) => void;
 		const outcome = new Promise<TurnOutcome>((r) => (resolve = r));
-		const turn: ActiveTurn = {
+		return {
 			id: randomUUID().slice(0, 8),
 			request,
 			input: { prompt: request.prompt, images: request.images, contextBlock: request.contextBlock },
@@ -692,106 +522,25 @@ export class AcpDriver implements TurnDriver {
 			resolve,
 			outcome,
 			response: new TextAccumulator(),
-			textTokens: 0,
-			thoughtTokens: 0,
-			textDeltas: 0,
-			thoughtDeltas: 0,
-			estimatedInputTokens: estimateTokens(request.contextBlock?.text ? `${request.prompt}\n${request.contextBlock.text}` : request.prompt),
-			sawResult: false,
-		promptStarted: false,
+			promptStarted: false,
 			aborted: false,
-			abortedBy: null,
 			parks: 0,
-			overallDeadline: null,
-			overallRemainingMs: null,
 			toolCalls: new Map(),
 		};
-		return turn;
-	}
-
-	// --- timers ----------------------------------------------------------------
-
-	#overallBudgetMs(turn: ActiveTurn): number {
-		return (turn.request.timeoutMin ?? 10) * 60_000;
-	}
-
-	#idleBudgetMs(turn: ActiveTurn): number {
-		return (turn.request.inactivityMin ?? 5) * 60_000;
-	}
-
-	#nowMs(): number {
-		return Date.now();
-	}
-
-	#armOverall(turn: ActiveTurn): void {
-		const budget = this.#overallBudgetMs(turn);
-		if (turn.overallTimer) clearTimeout(turn.overallTimer);
-		// Parked before timers armed (setup-time park): the turn is PAUSED from
-		// birth. Keep the pause invariant (deadline === null) and store the full
-		// budget; kickIdle() resumes the timer on unpark. A stale non-null
-		// deadline here would make the next #pauseOverall recompute the
-		// remaining budget against a wall-clock instant that never ran.
-		if (turn.parks > 0) {
-			turn.overallDeadline = null;
-			turn.overallRemainingMs = budget;
-			return;
-		}
-		turn.overallRemainingMs = null;
-		this.#startOverallTimer(turn, budget);
-	}
-
-	#startOverallTimer(turn: ActiveTurn, ms: number): void {
-		// 0 disables the deadline (config turnTimeoutMin: 0). setTimeout(fn, 0)
-		// would fire instantly and kill every turn, guard or not.
-		if (ms <= 0) return;
-		// The deadline lives HERE, not just in the callers: the running branch
-		// of #armOverall never assigns it, and #pauseOverall keys off
-		// `deadline !== null` to do anything at all. Without this line every
-		// post-arm park is a silent no-op and the timer ticks through the park.
-		turn.overallDeadline = this.#nowMs() + ms;
-		turn.overallTimer = setTimeout(() => {
-			if (turn.closed) return;
-			turn.abortedBy = "timer";
-			this.#log("timeout", { sessionId: turn.sessionId });
-			this.#conn?.abortAll("turn deadline");
-			this.#conn?.kill();
-			this.#failTurn(turn, `ACP turn exceeded the ${(this.#overallBudgetMs(turn) / 60_000) | 0}m deadline`);
-		}, ms);
-	}
-
-	/** Pause WITHOUT resetting the deadline (remaining-budget semantics: the
-	 *  overall timer is a turn deadline, not an inactivity guard). */
-	#pauseOverall(turn: ActiveTurn): void {
-		if (turn.overallDeadline === null) return;
-		if (turn.overallTimer) clearTimeout(turn.overallTimer);
-		turn.overallTimer = undefined;
-		turn.overallRemainingMs = Math.max(0, turn.overallDeadline - this.#nowMs());
-		// Null the deadline: a nested park (parks > 1) must not recompute the
-		// remaining budget against a stale wall-clock instant — parked time does
-		// not consume budget.
-		turn.overallDeadline = null;
-	}
-
-	#resumeOverall(turn: ActiveTurn): void {
-		if (turn.overallRemainingMs === null) return;
-		const remaining = turn.overallRemainingMs;
-		turn.overallRemainingMs = null;
-		this.#startOverallTimer(turn, remaining);
 	}
 
 	#armIdle(turn: ActiveTurn): void {
-		if (turn.idleTimer) clearTimeout(turn.idleTimer);
-		if (turn.parks > 0) return; // parked: idle timer resumes on unpark
-		const idleMs = this.#idleBudgetMs(turn);
-		// 0 disables the stall guard (config inactivityTimeoutMin: 0).
-		if (idleMs <= 0) return;
+		this.#clearIdle(turn);
+		if (turn.parks > 0 || turn.closed) return; // parked: resumes on unpark
+		const idleMin = turn.request.inactivityMin ?? DEFAULT_INACTIVITY_MIN;
+		if (idleMin <= 0) return;
 		turn.idleTimer = setTimeout(() => {
 			if (turn.closed) return;
 			this.#log("stall", { sessionId: turn.sessionId });
-			this.#conn?.abortAll("idle stall");
-			this.#conn?.kill();
-			this.#failTurn(turn, `ACP stalled for ${(idleMs / 60_000) | 0}m with no output`);
-		}, idleMs);
+			this.#teardown(turn);
+			this.#failTurn(turn, `Antigravity produced no output for ${formatMinutes(idleMin)}; the turn was stopped`);
+		}, idleMin * 60_000);
+		turn.idleTimer.unref?.();
 	}
 
 	#clearIdle(turn: ActiveTurn): void {
@@ -801,162 +550,79 @@ export class AcpDriver implements TurnDriver {
 
 	// --- settling ----------------------------------------------------------------
 
-	#settle(turn: ActiveTurn, outcome: TurnOutcome): void {
+	#settle(turn: ActiveTurn, outcome: TurnOutcome, opts: { collected?: boolean } = {}): void {
 		if (turn.closed) return;
 		const flushed = turn.response.flush();
-		if (flushed) {
-			turn.textDeltas += 1;
-			turn.textTokens += estimateTokens(flushed);
-			this.#emit(turn, { type: "text", delta: flushed });
-		}
+		if (flushed) this.#emit(turn, { type: "text", delta: flushed });
 		outcome.response = turn.response.text;
-		if (turn.promptStarted) this.#collectStepUsage(turn);
+		// Tokens spent by an aborted or failed prompt are still reported.
+		if (turn.promptStarted && !opts.collected) this.#collectStepUsage(turn);
 		if (turn.contextUsage) outcome.contextUsage = turn.contextUsage;
-		// Gate B stopgap: synthesize usage on clean turns while the server sends
-		// none. Runs BEFORE close so the usage activity drains through the
-		// normal #nextActivity loop (provider maps it onto partial.usage).
-		if (outcome.status === "OK" && !outcome.aborted && outcome.usage === undefined) {
-			const usage = this.#syntheticUsage(turn);
-			if (usage) {
-				outcome.usage = usage;
-				this.#emit(turn, { type: "usage", usage });
-			}
-		}
 		turn.closed = true;
-		if (turn.overallTimer) clearTimeout(turn.overallTimer);
-		if (turn.idleTimer) clearTimeout(turn.idleTimer);
-		this.#active = undefined;
-		this.#state = this.#conn?.alive ? "ready" : "dead";
-		if (outcome.conversationId) this.#lastSessionId = outcome.conversationId;
+		this.#clearIdle(turn);
+		if (turn.cancelTimer) clearTimeout(turn.cancelTimer);
+		if (this.#active === turn) this.#active = undefined;
 		for (const wake of turn.wake) wake();
 		turn.wake = [];
-		if (outcome.aborted && turn.abortedBy === null) turn.abortedBy = "signal";
 		turn.resolve(outcome);
 		try {
 			this.#onTurnEnd?.(outcome);
-		} catch {
-			/* listener errors must not break settling */
+		} catch (err) {
+			this.#log("turn-end-listener-failed", { message: describe(err) });
 		}
+	}
+
+	#settleAborted(turn: ActiveTurn): void {
+		this.#settle(turn, { conversationId: turn.sessionId || undefined, status: "OK", response: "", aborted: true });
 	}
 
 	#failTurn(turn: ActiveTurn, message: string): void {
 		this.#settle(turn, {
-			conversationId: turn.sessionId,
+			conversationId: turn.sessionId || undefined,
 			status: "ERROR",
-			response: turn.response.text,
+			response: "",
 			error: message,
-			finished: true,
 			aborted: turn.aborted,
 		});
 	}
 
-	/** Usage synthesis mode, resolved per turn (follows live config). */
-	#usageMode(): UsageEstimate {
-		const opt = this.#opts.usageEstimate;
-		return (typeof opt === "function" ? opt() : opt) ?? "off";
-	}
-
 	/** Emit exact usage for model calls the server persisted since the last
-	 *  report. Missing or unreadable stores silently report nothing. */
-	#collectStepUsage(turn: ActiveTurn): boolean {
-		if (!turn.dbPath || turn.closed) return false;
-		const steps = readStepTokens(turn.dbPath, turn.stepCursor);
-		const usage = steps ? summarizeSteps(steps) : undefined;
-		if (!usage) return false;
+	 *  report. Returns the store's highest step index (undefined when the
+	 *  store is unreadable); a missing store silently reports nothing. */
+	#collectStepUsage(turn: ActiveTurn): number | undefined {
+		if (!turn.dbPath || turn.closed) return undefined;
+		const state = readStepState(turn.dbPath, turn.stepCursor);
+		if (!state) return undefined;
+		const usage = summarizeSteps(state.steps);
+		if (!usage) return state.maxIdx;
 		turn.stepCursor = usage.lastIdx;
-		turn.lastStep = steps!.at(-1);
+		turn.lastStep = state.steps.at(-1);
 		turn.stepUsageSeen = true;
-		traceUsage("step-usage", { sessionId: turn.sessionId, steps: steps!.map(({ idx, input, output, cacheRead, cacheWrite }) => ({ idx, input, output, cacheRead, cacheWrite })), contextTokens: usage.contextTokens, usageUpdate: turn.contextUsage?.used });
-		this.#emit(turn, { type: "step_usage", usage: stripIdx(usage) });
-		return true;
-	}
-
-	/** Update Pi's partial usage before the next visible text/thought delta.
-	 *  This is not provider-reported billing or an exact context-window count. */
-	#emitLiveEstimate(turn: ActiveTurn): void {
-		const usage = this.#syntheticUsage(turn);
-		if (usage) this.#emit(turn, { type: "usage", usage });
-	}
-
-	#syntheticUsage(turn: ActiveTurn): AgyUsage | undefined {
-		const mode = this.#usageMode();
-		if (mode === "off") return undefined;
-		// Superseded only by EXACT PromptResponse.usage. Diagnostic usage-shaped
-		// frames (context windows, occupancy) must not silence the estimates:
-		// the connection outlives turns and no exact data ever replaces them
-		// on ACP 1.1.1 (peer review 2026-09-23).
-		if (this.#conn?.exactUsageSeen) return undefined;
-		return synthesizeUsage({
-			mode,
-			prompt: turn.request.prompt,
-			contextText: turn.request.contextBlock?.text,
-			inputTokens: turn.estimatedInputTokens,
-			textTokens: turn.textTokens,
-			thoughtTokens: turn.thoughtTokens,
-			textDeltas: turn.textDeltas,
-			thoughtDeltas: turn.thoughtDeltas,
+		traceUsage("step-usage", {
+			sessionId: turn.sessionId,
+			steps: state.steps.map(({ idx, input, output, cacheRead, cacheWrite }) => ({ idx, input, output, cacheRead, cacheWrite })),
+			contextTokens: usage.contextTokens,
+			usageUpdate: turn.contextUsage?.used,
 		});
+		this.#emit(turn, { type: "step_usage", usage: stripIdx(usage) });
+		return state.maxIdx;
 	}
 
 	#log(msg: string, data?: unknown): void {
-		const line = `${new Date().toISOString().slice(11, 19)} ${msg}${data !== undefined ? ` ${JSON.stringify(data)}` : ""}`;
-		this.#lifecycle.push(line);
-		if (this.#lifecycle.length > LIFECYCLE_LIMIT) this.#lifecycle.shift();
 		this.#opts.log?.(msg, data);
 	}
 
-	// --- TurnDriver surface ----------------------------------------------------
-
-	async close(reason: "recycle" | "shutdown", cause?: string): Promise<void> {
-		this.#log(`close:${reason}${cause ? `:${cause}` : ""}`);
+	/** Settle the active turn as an error and stop the process. The next
+	 *  turn respawns it (pi replaces extensions on /new, /resume, /reload). */
+	async close(): Promise<void> {
+		this.#log("close");
 		const turn = this.#active;
-		if (turn && !turn.closed) {
-			this.#settle(turn, {
-				conversationId: turn.sessionId,
-				status: "ERROR",
-				response: turn.response.text,
-				error: `ACP driver ${reason === "recycle" ? "recycled" : "shut down"} mid-turn${cause ? ` (${cause})` : ""}`,
-				finished: true,
-				aborted: false,
-			});
-		}
-		this.#conn?.abortAll(`driver ${reason}`);
-		this.#conn?.kill();
+		if (turn && !turn.closed) this.#failTurn(turn, "Antigravity driver shut down mid-turn");
+		const conn = this.#conn;
 		this.#conn = undefined;
-		this.#state = "dead";
-	}
-
-	snapshot(): DriverSnapshot {
-		return {
-			state: this.#state,
-			pid: this.#conn?.pid,
-			conversationId: this.#active?.sessionId ?? this.#lastSessionId,
-			stats: {
-				spawns: this.#stats.spawns,
-				turns: this.#stats.turns,
-				reused: 0,
-				recycles: this.#stats.kills,
-				lastRecycleReason: undefined,
-				recycleReasons: {},
-			},
-			lifecycle: [...this.#lifecycle],
-			engine: "acp",
-			acp: {
-				sessionId: this.#active?.sessionId ?? this.#lastSessionId,
-				prompts: this.#stats.turns,
-				sessionsCreated: this.#stats.sessionsCreated,
-				sessionsLoaded: this.#stats.sessionsLoaded,
-				kills: this.#stats.kills,
-				cancelSupported: this.#conn?.cancelSupported ?? this.#lastCancelSupported,
-				serverVersion: this.#serverVersion,
-				// Connections beyond the first are server restarts (Gate D kills,
-				// stale-exit replacements) = reconnects.
-				reconnects: Math.max(0, this.#stats.spawns - 1),
-				agentName: this.#agentInfo?.name,
-				agentTitle: this.#agentInfo?.title,
-				usageSeen: this.#conn?.usageSeen ?? false,
-			},
-		};
+		this.#starting = undefined;
+		this.#liveSessions.clear();
+		conn?.kill();
 	}
 }
 
@@ -965,8 +631,9 @@ function describe(err: unknown): string {
 	return String(err);
 }
 
-// re-exported for the extension's doctor (server version display)
-export type { AcpMcpServer } from "./connection.js";
+function formatMinutes(min: number): string {
+	return min >= 1 ? `${Math.round(min)} min` : `${Math.round(min * 60)} s`;
+}
 
 function stripIdx({ lastIdx: _lastIdx, ...usage }: StepUsage): AgyStepUsage {
 	return usage;

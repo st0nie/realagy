@@ -69,6 +69,6 @@ test("AcpDriver lists all families and sends GPT's full medium model slug", asyn
 		const modelConfig = requests(capture).find((request) => request.method === "session/set_config_option" && (request.params as { configId?: string }).configId === "model")!;
 		assert.equal(modelConfig.params.value, "gpt-oss-120b-medium");
 	} finally {
-		await driver.close("shutdown");
+		await driver.close();
 	}
 });

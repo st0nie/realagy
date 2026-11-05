@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { bridgedPiTools } from "../src/bridge-catalog.js";
+import http from "node:http";
+import { bridgedPiTools, bridgeInputSchema } from "../src/bridge-catalog.js";
 import { startMcpServer, TOKEN_HEADER } from "../src/mcp-server.js";
 
 test("bridge includes active pi builtins and rejects internal/inactive tools", () => {
@@ -35,6 +36,50 @@ test("loopback MCP requires its token and lists/calls pi tools", async () => {
 		const called = await call(2, "tools/call", { name: "bash", arguments: { command: "printf ok" } });
 		assert.equal(called.status, 200);
 		assert.match(await called.text(), /bash:printf ok/);
+	} finally {
+		await close();
+	}
+});
+
+test("bridge input schemas are normalized once per tool definition", () => {
+	const parameters = { type: "object", properties: { mode: { const: "fast" } } };
+	const schema = bridgeInputSchema(parameters);
+	assert.deepEqual(schema, { type: "object", properties: { mode: { enum: ["fast"] } } });
+	assert.equal(bridgeInputSchema(parameters), schema, "cached per parameters object");
+	assert.deepEqual(parameters.properties.mode, { const: "fast" }, "pi's definition is never mutated");
+	assert.deepEqual(bridgeInputSchema(undefined), { type: "object", properties: {}, additionalProperties: true });
+	assert.deepEqual(bridgeInputSchema({ size: 1n }), { type: "object", properties: {}, additionalProperties: true });
+});
+
+test("loopback MCP decodes request bodies whose multi-byte characters span network chunks", async () => {
+	let received: unknown;
+	const started = await startMcpServer({
+		listTools: () => [{ name: "echo", description: "echo", inputSchema: { type: "object" } }],
+		onToolCall: async (_id, _name, args) => {
+			received = args.text;
+			return { content: [{ type: "text", text: "ok" }] };
+		},
+	});
+	assert.equal(started.ok, true);
+	if (!started.ok) return;
+	const { port, token, close } = started.handle;
+	try {
+		const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "echo", arguments: { text: "héllo 中文" } } }));
+		const split = body.indexOf(Buffer.from("中")) + 1; // inside the 3-byte character
+		const status = await new Promise<number>((resolve, reject) => {
+			const req = http.request({
+				host: "127.0.0.1", port, path: "/mcp", method: "POST",
+				headers: { "content-type": "application/json", accept: "application/json, text/event-stream", [TOKEN_HEADER]: token },
+			}, (res) => {
+				res.resume();
+				res.on("end", () => resolve(res.statusCode ?? 0));
+			});
+			req.on("error", reject);
+			req.write(body.subarray(0, split));
+			setTimeout(() => req.end(body.subarray(split)), 50);
+		});
+		assert.equal(status, 200);
+		assert.equal(received, "héllo 中文");
 	} finally {
 		await close();
 	}

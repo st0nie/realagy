@@ -8,7 +8,7 @@ import { calculateContextTokens, AgentSession, SessionManager } from "@earendil-
 import { test, vi } from "vitest";
 import { conversationDbPath, lastStepIdx } from "../src/acp/step-usage.js";
 import { createStreamSimple, POLL_TOOL_NAME, ToolRoundTrips, type AcpSessions } from "../src/provider.js";
-import type { DriverActivity, DriverSnapshot, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../src/driver-types.js";
+import type { DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../src/driver-types.js";
 import { FALLBACK_MODELS, toPiModel } from "../src/models.js";
 import {
 	freshInput,
@@ -32,6 +32,10 @@ class FakeHandle implements TurnHandle {
 		this.outcome = new Promise((resolve) => { this.#resolve = resolve; });
 	}
 
+	get closed(): boolean {
+		return this.#closed;
+	}
+
 	async next(): Promise<DriverActivity | null> {
 		if (this.#activities.length > 0) return this.#activities.shift()!;
 		if (this.#closed) return null;
@@ -44,7 +48,7 @@ class FakeHandle implements TurnHandle {
 		this.#wake.shift()?.();
 	}
 
-	complete(outcome: TurnOutcome = { status: "OK", response: "", finished: true, aborted: false }): void {
+	complete(outcome: TurnOutcome = { status: "OK", response: "", aborted: false }): void {
 		this.#closed = true;
 		this.#resolve(outcome);
 		for (const wake of this.#wake.splice(0)) wake();
@@ -52,7 +56,6 @@ class FakeHandle implements TurnHandle {
 }
 
 class FakeDriver implements TurnDriver {
-	state = "ready" as const;
 	activeHandle: TurnHandle | null = null;
 	onTurnEnd: ((outcome: TurnOutcome) => void) | undefined;
 	requests: DriverTurnRequest[] = [];
@@ -70,8 +73,12 @@ class FakeDriver implements TurnDriver {
 
 	reentry(): TurnHandle | null { return this.activeHandle; }
 	kickIdle(): void {}
-	snapshot(): DriverSnapshot {
-		return { state: this.state, stats: { spawns: 0, turns: 0, reused: 0, recycles: 0, recycleReasons: {} }, lifecycle: [] };
+	cancels: string[] = [];
+	async cancelActive(reason: string): Promise<void> {
+		const active = this.activeHandle;
+		if (!(active instanceof FakeHandle) || active.closed) return;
+		this.cancels.push(reason);
+		active.complete({ status: "OK", response: "", aborted: true });
 	}
 	async close(): Promise<void> { this.activeHandle = null; }
 }
@@ -129,7 +136,7 @@ test("provider preserves context occupancy separately from cumulative usage", as
 	const driver = new FakeDriver();
 	driver.script = [
 		{ type: "context_usage", contextUsage: { used: 54357, size: 1000000 } },
-		{ type: "usage", usage: { input_tokens: 693513, output_tokens: 3731, total_tokens: 697244, cache_read_tokens: 633966 } },
+		{ type: "usage", usage: { input_tokens: 693513, output_tokens: 3731, total_tokens: 697244, cache_read_tokens: 633000, cache_write_tokens: 966 } },
 		{ type: "text", delta: "OK" },
 	];
 	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
@@ -139,7 +146,8 @@ test("provider preserves context occupancy separately from cumulative usage", as
 	assert.equal(done.message.usage.totalTokens, 54357);
 	assert.equal(calculateContextTokens(done.message.usage), 54357);
 	assert.equal(done.message.usage.input, 59547);
-	assert.equal(done.message.usage.input + done.message.usage.output + done.message.usage.cacheRead, 697244);
+	assert.equal(done.message.usage.cacheWrite, 966);
+	assert.equal(done.message.usage.input + done.message.usage.output + done.message.usage.cacheRead + done.message.usage.cacheWrite, 697244);
 	assert.equal((done.message.usage as typeof done.message.usage & { agyCumulativeTotalTokens?: number }).agyCumulativeTotalTokens, 697244);
 	const sessionManager = SessionManager.inMemory();
 	sessionManager.appendMessage(user("Reply"));
@@ -150,6 +158,28 @@ test("provider preserves context occupancy separately from cumulative usage", as
 	const usage = AgentSession.prototype.getContextUsage.call(receiver as unknown as AgentSession);
 	assert.equal(usage?.tokens, 54357);
 	assert.equal(usage?.percent, 54357 / 1000000 * 100);
+});
+
+test("a new pi turn cancels a turn left parked on unanswered tool calls instead of queueing behind it", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const roundTrips = new ToolRoundTrips(driver);
+	const streamSimple = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips });
+	const first = collect(streamSimple(model, context([system(), user("Run bash")])));
+	await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+	void roundTrips.onToolCall("call-1", "bash", { command: "sleep 1" }, new AbortController().signal);
+	const firstDone = (await first).find((event) => event.type === "done");
+	assert.equal(firstDone?.type === "done" && firstDone.reason, "toolUse");
+	const parked = driver.activeHandle as FakeHandle;
+
+	// pi's loop ended after the toolUse message; the user sends a new prompt.
+	driver.autoFinish = true;
+	const second = await collect(streamSimple(model, context([system(), user("Run bash"), user("never mind")])));
+	assert.deepEqual(driver.cancels, ["superseded by a new pi turn"]);
+	assert.equal(parked.closed, true);
+	assert.equal(driver.requests.length, 2);
+	assert.ok(second.some((event) => event.type === "done"));
 });
 
 test("MCP call becomes a genuine pi toolUse and its toolResult resumes ACP", async () => {
@@ -281,7 +311,7 @@ test("steering messages queued during a tool call ride the MCP tool result and p
 
 		const handle = driver.activeHandle as FakeHandle;
 		handle.pushExternal({ type: "text", delta: "all done" });
-		handle.complete({ status: "OK", response: "all done", finished: true, aborted: false, conversationId: "acp-warm" });
+		handle.complete({ status: "OK", response: "all done", aborted: false, conversationId: "acp-warm" });
 		const result2: Message = { role: "toolResult", toolCallId: "call-2", toolName: "bash", content: [{ type: "text", text: "9 passed" }], isError: false, timestamp: 4 };
 		const afterCall2 = [...afterSteer, step2Done.message, result2];
 		const step3Done = (await collect(stream(model, context(afterCall2)))).find((event) => event.type === "done");
@@ -462,7 +492,7 @@ test("mid-turn realctx history compression during tool reentry preserves warm re
 
 		const handle = driver.activeHandle as FakeHandle;
 		handle.pushExternal({ type: "text", delta: "checks passed" });
-		handle.complete({ status: "OK", response: "checks passed", finished: true, aborted: false, conversationId: "acp-warm-midturn" });
+		handle.complete({ status: "OK", response: "checks passed", aborted: false, conversationId: "acp-warm-midturn" });
 
 		const step2Done = (await collect(stream(model, context(compactedMidTurn)))).find((event) => event.type === "done");
 		await parked;
@@ -542,7 +572,6 @@ test("persisted warm checkpoints survive reload and fork the SQLite store on /tr
 		(driver.activeHandle as FakeHandle).complete({
 			status: "OK",
 			response: "Turn 1 answer",
-			finished: true,
 			aborted: false,
 			conversationId: baseSessionId,
 			maxStepIdx: 3,
@@ -563,7 +592,6 @@ test("persisted warm checkpoints survive reload and fork the SQLite store on /tr
 		(driver.activeHandle as FakeHandle).complete({
 			status: "OK",
 			response: "Turn 2A answer",
-			finished: true,
 			aborted: false,
 			conversationId: baseSessionId,
 			maxStepIdx: 8,

@@ -1,53 +1,30 @@
-// Engine-agnostic turn-driver contract.
-//
-// Both turn engines (stream-json driver in `driver.ts`, ACP driver in
-// `acp/driver.ts`) implement `TurnDriver`, and everything above them — the
-// provider's stream loop, the G9 round-trip store, the extension wiring —
-// depends on this interface only. Types live here so the stream module can be
-// deleted (phase 4) without breaking imports.
-//
-// The ACP driver implements the same surface with protocol-native mechanics:
-// no process recycle on profile drift, teardown-based abort (Gate D), and
-// `session/load` resume. See docs/ACP-ADOPTION-PLAN.md section 9.
+// Turn-driver contract between the provider (src/provider.ts) and the ACP
+// driver (src/acp/driver.ts). The provider's stream loop, the MCP round-trip
+// store, and the extension wiring depend on this interface only, so tests can
+// substitute a scripted driver.
 
-export type DriverState = "idle" | "starting" | "ready" | "running" | "dead";
-
-export interface DriverProfile {
+export interface DriverTurnRequest {
 	cwd: string;
+	/** Base model slug (effort tier separate) or the exact ACP model id. */
 	model: string;
 	effort?: string;
 	mode: string;
 	skipPermissions: boolean;
-	/** Custom agy agent (stream-json `--agent`). ACP has no agent slot in the
-	 *  protocol (RC01) and ignores it; the /agy agent command refuses to set
-	 *  one while the ACP engine is active. */
-	agent?: string;
-}
-
-export interface DriverTurnRequest extends DriverProfile {
-	/** Existing conversation/session to resume. Stream-json: agy conversation id via
-	 *  `--conversation`. ACP: sessionId via `session/load` (falls back to
-	 *  `session/new` when the server no longer knows it). */
+	/** ACP session to continue: reused when live in the current process,
+	 *  otherwise resumed (or loaded); a lost session falls back to a new one. */
 	conversationId?: string | null;
 	prompt: string;
-	/** Image blocks riding with the prompt. ACP forwards them as typed
-	 *  content blocks (probe 2026-09-03: 64x64 two-tone PNG answered
-	 *  correctly); on stream-json the provider stages them to files, so the
-	 *  driver itself ignores this field. */
+	/** Image blocks riding with the prompt, as typed ACP content blocks. */
 	images?: Array<{ data: string; mimeType: string }>;
-	/** ACP only: pi-side context delivered as a native `embeddedContext`
-	 *  resource block instead of inline prompt text (G1 on ACP). Stream-json
-	 *  embeds the digest in the prompt string and ignores this. */
+	/** Pi-side context delivered as an embedded `resource` block. */
 	contextBlock?: { uri: string; text: string };
-	/** ACP only: the complete input to send instead when `conversationId`
-	 *  cannot be reused or loaded and a fresh session is created. Without it a
-	 *  delta prompt would reach a session that never saw the earlier turns. */
+	/** The complete input to send instead when `conversationId` cannot be
+	 *  continued and a fresh session is created. Without it a delta prompt
+	 *  would reach a session that never saw the earlier turns. */
 	fallback?: { prompt: string; images?: Array<{ data: string; mimeType: string }>; contextBlock?: { uri: string; text: string } };
 	signal?: AbortSignal;
-	/** Overall turn cap in minutes (default 10). Fractional values are valid
-	 *  (tests use sub-minute caps). 0 disables the cap. */
-	timeoutMin?: number;
-	/** Stdout-inactivity cap in minutes (default 5). 0 disables the cap. */
+	/** Inactivity cap in minutes (default 5; parked tool calls pause it).
+	 *  Fractional values are valid. 0 disables the cap. */
 	inactivityMin?: number;
 }
 
@@ -56,6 +33,7 @@ export type AgyUsage = {
 	output_tokens?: number;
 	thinking_tokens?: number;
 	cache_read_tokens?: number;
+	cache_write_tokens?: number;
 	total_tokens?: number;
 };
 
@@ -74,67 +52,46 @@ export type AgyStepUsage = {
 
 export type DriverActivity =
 	| { type: "text"; delta: string }
-	/** Stream-json emits a token count only; ACP carries the actual thought text in
-	 *  `delta`. The provider renders whichever is present. */
-	| { type: "thought"; tokens?: number; delta?: string }
-	| { type: "tool_start"; stepId?: number; name: string; args: Record<string, unknown>; mcpServer?: string; /** ACP only: the protocol toolCallId (stream-json carries numeric stepId instead). */ toolCallId?: string }
+	| { type: "thought"; delta: string }
+	/** agy's native tool lifecycle (agy runs these itself; pi renders no card). */
+	| { type: "tool_start"; toolCallId: string; name: string; args: Record<string, unknown>; mcpServer?: string }
 	| {
 			type: "tool_done";
-			stepId?: number;
+			toolCallId: string;
 			name: string;
 			args: Record<string, unknown>;
 			mcpServer?: string;
-			/** ACP only: the protocol toolCallId; pairs done/error with their start. */
-			toolCallId?: string;
 			output?: string;
-			durationSeconds?: number;
-			/** ACP only: the server's native edit diff from `tool_call`
-			 *  content[] ({type:"diff", path, oldText?, newText}). Stream-json never
-			 *  sets it; the provider renders it without any git subprocess. */
+			/** The server's native edit diff from `tool_call` content[]. */
 			diff?: { path: string; oldText?: string; newText: string };
 	  }
-	| { type: "tool_error"; stepId?: number; name: string; message: string; mcpServer?: string; toolCallId?: string }
-	/** Turn-cumulative PromptResponse.usage, or a client-side estimate. */
+	| { type: "tool_error"; toolCallId: string; name: string; message: string; mcpServer?: string }
+	/** Turn-cumulative PromptResponse.usage. */
 	| { type: "usage"; usage: AgyUsage }
 	| { type: "context_usage"; contextUsage: AgyContextUsage }
 	/** Exact usage of the model calls completed since the previous one, read
 	 *  from the server's conversation store. */
 	| { type: "step_usage"; usage: AgyStepUsage }
-	/** Synthetic: injected by the provider when the MCP bridge receives a call
-	 *  (G9). Parks the turn: output is expected to stall while pi executes the
-	 *  tool, so the driver suspends its idle/overall timers. */
+	/** Injected by the round-trip store when the MCP bridge receives a pi tool
+	 *  call. Parks the turn: output is expected to stall while pi executes
+	 *  the tool, so the driver suspends its inactivity guard. */
 	| { type: "bridge_call"; callId: string; name: string; args: Record<string, unknown> };
 
 export interface TurnOutcome {
 	conversationId?: string;
-	status: "OK" | "ERROR" | "UNKNOWN";
+	status: "OK" | "ERROR";
 	response: string;
 	error?: string;
 	usage?: AgyUsage;
 	contextUsage?: AgyContextUsage;
-	finished: boolean;
 	aborted: boolean;
-	/** The model demonstrably produced output this turn: an agent_response
-	 *  or tool step was observed, or the settled response/usage is non-empty.
-	 *  Stream-json sets it on every outcome; ACP leaves it undefined.
-	 *  false + status OK is agy's silent over-cap drop signature (issue #2:
-	 *  prompts past ~25KB are discarded with SUCCESS, no error). */
-	modelOutputSeen?: boolean;
-	/** Stream-json only: a result frame arrived for this turn. Undefined on
-	 *  ACP. A deadline kill or process exit before the result frame means the
-	 *  turn never committed. */
-	sawResult?: boolean;
-	/** Stream-json only: the turn ended via the overall/inactivity deadline
-	 *  guard (not a user abort, not a process crash). With sawResult false on
-	 *  a resumed conversation this marks the conversation as poisoned. */
-	deadline?: "timeout" | "stall";
-	/** ACP only: highest `steps.idx` in `<conversationId>.db` when this turn settled. */
+	/** Highest `steps.idx` in `<conversationId>.db` when this turn settled. */
 	maxStepIdx?: number;
 }
 
 export interface TurnHandle {
 	id: string;
-	/** Resolves when the turn settles (result event, exit, abort, recycle). */
+	/** Resolves when the turn settles (result, exit, abort, close). */
 	outcome: Promise<TurnOutcome>;
 	/** Pull the next activity. Resolves null once the activity stream closes. */
 	next(): Promise<DriverActivity | null>;
@@ -142,54 +99,16 @@ export interface TurnHandle {
 	pushExternal(activity: DriverActivity): void;
 }
 
-export interface DriverSnapshot {
-	state: DriverState;
-	pid?: number;
-	conversationId?: string;
-	stats: {
-		spawns: number;
-		turns: number;
-		reused: number;
-		recycles: number;
-		lastRecycleReason?: string;
-		recycleReasons: Record<string, number>;
-	};
-	lifecycle: string[];
-	/** Present on ACP snapshots; absent on stream-json. */
-	engine?: "acp";
-	acp?: {
-		sessionId?: string;
-		prompts: number;
-		sessionsCreated: number;
-		sessionsLoaded: number;
-		kills: number;
-		/** null = never probed on this server process. */
-		cancelSupported: boolean | null;
-		serverVersion?: string;
-		/** Connections beyond the first this driver process made = server
-		 *  restarts (Gate D kills + stale-exit replacements). */
-		reconnects: number;
-		/** From the initialize handshake agentInfo block. */
-		agentName?: string;
-		agentTitle?: string;
-		/** Gate B watch: true once this server process sent usage/token fields
-		 *  in any session/update frame. /agy doctor surfaces it when true and
-		 *  stays silent otherwise. */
-		usageSeen: boolean;
-	};
-}
-
-/** The engine contract. Everything above the driver depends on this interface
- *  only; `StreamDriver` and `AcpDriver` both implement it. */
 export interface TurnDriver {
-	readonly state: DriverState;
 	readonly activeHandle: TurnHandle | null;
+	/** Start a turn. Turns are serialized: this waits for the previous one. */
 	run(request: DriverTurnRequest): Promise<TurnHandle>;
 	/** Re-attach to the active turn (pi toolUse continuation). */
 	reentry(): TurnHandle | null;
-	/** Resume turn timers after a parked G9 round-trip settles. */
+	/** Resume the inactivity guard after a parked pi tool call settles. */
 	kickIdle(): void;
+	/** Abort the active turn (if any) and resolve once it has settled. */
+	cancelActive(reason: string): Promise<void>;
 	set onTurnEnd(fn: ((outcome: TurnOutcome) => void) | undefined);
-	snapshot(): DriverSnapshot;
-	close(reason: "recycle" | "shutdown", cause?: string): Promise<void>;
+	close(): Promise<void>;
 }

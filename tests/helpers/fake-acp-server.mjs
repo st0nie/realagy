@@ -5,11 +5,17 @@ const capture = process.argv[2];
 const record = (message) => fs.appendFileSync(capture, JSON.stringify(message) + "\n");
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
 const result = (id, value) => send({ jsonrpc: "2.0", id, result: value });
+const fail = (id, code, message) => send({ jsonrpc: "2.0", id, error: { code, message } });
+const update = (sessionId, value) => send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: value } });
 
-// FAKE_ACP_DB_DIR: persist one agent step per prompt like agy_acp_server's
-// conversation store (steps.metadata field 9 = token usage).
+// FAKE_ACP_DB_DIR: persist one agent step per prompt like agy's conversation
+// store (steps.metadata field 9 = token usage).
 const dbDir = process.env.FAKE_ACP_DB_DIR;
+// FAKE_ACP_RESUME: advertise and answer session/resume, as agy 1.5 does.
+const canResume = Boolean(process.env.FAKE_ACP_RESUME);
 let sessionCount = 0;
+/** sessionId → request id of a prompt waiting for session/cancel. */
+const hanging = new Map();
 const varint = (n) => { const out = []; while (n > 127) { out.push((n & 127) | 128); n = Math.floor(n / 128); } out.push(n); return out; };
 const field = (n, value) => [...varint(n * 8), ...varint(value)];
 const bytesField = (n, bytes) => [...varint(n * 8 + 2), ...varint(bytes.length), ...bytes];
@@ -31,7 +37,12 @@ rl.on("line", async (line) => {
 	record(request);
 	const { id, method, params } = request;
 	if (method === "initialize") {
-		result(id, { protocolVersion: 1, agentInfo: { name: "fake", version: "1" }, authMethods: [] });
+		result(id, {
+			protocolVersion: 1,
+			agentInfo: { name: "fake", version: "1" },
+			agentCapabilities: { loadSession: true, sessionCapabilities: canResume ? { resume: {}, load: {} } : { load: {} } },
+			authMethods: [],
+		});
 		return;
 	}
 	if (method === "session/new") {
@@ -49,8 +60,19 @@ rl.on("line", async (line) => {
 		});
 		return;
 	}
-	if (method === "session/load" && params.sessionId === "missing") {
-		send({ jsonrpc: "2.0", id, error: { code: -32002, message: "session not found" } });
+	if ((method === "session/load" || method === "session/resume") && params.sessionId === "missing") {
+		fail(id, -32603, `Failed to read session ${params.sessionId}`);
+		return;
+	}
+	if (method === "session/resume" && !canResume) {
+		fail(id, -32601, "Method not found: session/resume");
+		return;
+	}
+	if (method === "session/load") {
+		// Like agy: the history replays as notifications before the response.
+		update(params.sessionId, { sessionUpdate: "user_message_chunk", content: { type: "text", text: "old prompt" } });
+		update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "REPLAYED" } });
+		result(id, {});
 		return;
 	}
 	if (method === "session/set_config_option") {
@@ -58,18 +80,33 @@ rl.on("line", async (line) => {
 		return;
 	}
 	if (method === "session/prompt") {
+		const text = params.prompt.map((block) => block.text ?? block.resource?.text ?? "").join("\n");
+		if (text.includes("[exit]")) {
+			process.stderr.write("fatal: fake server crashed\n");
+			process.exit(3);
+		}
+		if (text.includes("[hang]") || text.includes("[silent-cancel]")) {
+			update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "partial" } });
+			if (text.includes("[hang]")) hanging.set(params.sessionId, id);
+			return;
+		}
 		if (dbDir) await writeStep(params.sessionId, { input: 1200, output: 80, cacheRead: 8800 });
-		send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update: { sessionUpdate: "usage_update", used: 321, size: 1000 } } });
-		send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update: { sessionUpdate: "usage_update", used: -1, size: 0 } } });
-		send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "other-session", update: { sessionUpdate: "usage_update", used: 999, size: 1000 } } });
-		send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "think" } } } });
-		send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "OK" } } } });
+		update(params.sessionId, { sessionUpdate: "usage_update", used: 321, size: 1000 });
+		update(params.sessionId, { sessionUpdate: "usage_update", used: -1, size: 0 });
+		update("other-session", { sessionUpdate: "usage_update", used: 999, size: 1000 });
+		update(params.sessionId, { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "think" } });
+		update(params.sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "OK" } });
 		result(id, { stopReason: "end_turn" });
 		return;
 	}
 	if (method === "session/cancel") {
-		send({ jsonrpc: "2.0", id, error: { code: -32601, message: "not implemented" } });
+		// A notification, as in ACP. agy never answers the request form either.
+		const pending = hanging.get(params.sessionId);
+		if (id === undefined && pending !== undefined) {
+			hanging.delete(params.sessionId);
+			result(pending, { stopReason: "cancelled" });
+		}
 		return;
 	}
-	result(id, {});
+	if (id !== undefined) result(id, {});
 });

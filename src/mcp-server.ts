@@ -57,19 +57,21 @@ export async function startMcpServer(deps: McpBridgeDeps): Promise<McpStartResul
 				res.writeHead(403, { "content-type": "application/json" }).end('{"error":"forbidden"}');
 				return;
 			}
-			let body = "";
+			// Decode once the body is complete: a multi-byte character split
+			// across network chunks must not turn into U+FFFD.
+			const chunks: Buffer[] = [];
 			let bytes = 0;
-			for await (const chunk of req) {
+			for await (const chunk of req as AsyncIterable<Buffer>) {
 				bytes += chunk.length;
 				if (bytes > MAX_BODY_BYTES) {
 					res.writeHead(413, { connection: "close" }).end();
 					return;
 				}
-				body += chunk;
+				chunks.push(chunk);
 			}
 			let parsed: object;
 			try {
-				parsed = JSON.parse(body) as object;
+				parsed = JSON.parse(Buffer.concat(chunks, bytes).toString("utf8")) as object;
 			} catch {
 				res.writeHead(400).end("invalid json");
 				return;

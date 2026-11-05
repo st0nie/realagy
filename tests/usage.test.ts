@@ -5,7 +5,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "vitest";
 import { AcpDriver } from "../src/acp/driver.js";
-import { lastStepIdx, readStepTokens, siblingUsage, summarizeSteps, tokensFromMetadata } from "../src/acp/step-usage.js";
+import { forkConversationAtStep, lastStepIdx, readStepState, siblingUsage, summarizeSteps, tokensFromMetadata } from "../src/acp/step-usage.js";
 import { fetchCliUsage, parseCliUsage, quotaExhaustion, UsageMeter } from "../src/quota.js";
 import type { DriverActivity, TurnHandle } from "../src/driver-types.js";
 
@@ -50,13 +50,35 @@ test("step usage reads agent-step token stats after a cursor", () => {
 	assert.equal(tokensFromMetadata(Uint8Array.from([1, 2, 3]), 0), undefined);
 	assert.equal(lastStepIdx(db), 3);
 	assert.equal(lastStepIdx(path.join(tmp(), "missing.db")), -1);
-	const all = summarizeSteps(readStepTokens(db)!)!;
+	const all = summarizeSteps(readStepState(db)!.steps)!;
 	assert.equal(all.steps, 2);
 	assert.equal(all.input, 300_100);
 	assert.equal(all.cacheRead, 1_500_000);
 	assert.equal(all.contextTokens, 300_000 + 50 + 1_500_000);
-	assert.deepEqual(readStepTokens(db, 1)!.map((step) => step.idx), [3]);
-	assert.deepEqual(readStepTokens(db, 3), []);
+	assert.deepEqual(readStepState(db, 1)!.steps.map((step) => step.idx), [3]);
+	assert.deepEqual(readStepState(db, 3), { steps: [], maxIdx: 3 });
+	assert.equal(readStepState(path.join(tmp(), "missing.db")), undefined);
+});
+
+test("forking a WAL-mode conversation store keeps steps that are still in the -wal file", () => {
+	const dir = tmp();
+	const writer = new DatabaseSync(path.join(dir, "src.db"));
+	try {
+		writer.exec("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;");
+		writer.exec("CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB)");
+		const insert = writer.prepare("INSERT INTO steps VALUES (?, ?, ?)");
+		for (let idx = 0; idx < 6; idx++) insert.run(idx, idx % 2 ? 15 : 14, idx % 2 ? metadata(10, 1, 0) : null);
+		// The writer stays open: every step is still only in src.db-wal.
+		assert.equal(forkConversationAtStep(dir, "src", 3, "fork"), "fork");
+		assert.equal(lastStepIdx(path.join(dir, "fork.db")), 3);
+		assert.equal(readStepState(path.join(dir, "fork.db"))!.steps.length, 2);
+		assert.equal(lastStepIdx(path.join(dir, "src.db")), 5, "the source branch is untouched");
+		assert.equal(forkConversationAtStep(dir, "src", 3, "fork"), undefined, "never overwrites an existing store");
+		assert.equal(forkConversationAtStep(dir, "absent", 3, "other"), undefined);
+		assert.equal(fs.existsSync(path.join(dir, "other.db")), false);
+	} finally {
+		writer.close();
+	}
 });
 
 async function drain(handle: TurnHandle): Promise<DriverActivity[]> {
@@ -105,7 +127,7 @@ test("AcpDriver reports exact step usage, reuses live sessions, and falls back w
 		assert.equal((await third.outcome).conversationId, "session-2");
 		assert.deepEqual(wire().filter((request) => request.method === "session/prompt").at(-1)!.params.prompt, [{ type: "text", text: "full" }]);
 	} finally {
-		await driver.close("shutdown");
+		await driver.close();
 	}
 });
 

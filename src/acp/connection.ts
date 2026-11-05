@@ -1,29 +1,27 @@
 // ACP connection: owns the `agy acp` process (Antigravity CLI), the JSON-RPC
-// session over its stdio, and the protocol methods the driver needs. One connection hosts
-// one session at a time (the driver's model), but the transport supports more.
+// session over its stdio, and the protocol methods the driver needs.
 //
-// Protocol facts encoded here were verified live against
-// agy_acp_server_20260818_01_RC01 (docs/ACP-PROTOCOL-REFERENCE.md):
-//   - initialize: {protocolVersion:1, clientCapabilities{fs:false,terminal:false}}
-//   - authenticate takes `methodId`; auth errors are -32000 with remediation in
-//     data.message; credentials live in agy's own store (shared with the CLI)
-//   - session/set_config_option takes `configId` (model value = FULL slug with
-//     the effort tier baked in, e.g. gemini-3.8-flash-low)
-//   - session/cancel returns -32601 on RC01 (not implemented) — the driver
-//     treats that as "cancel unsupported" and falls back to teardown+kill
-//   - session/request_permission: skipPermissions turns answer the first
-//     allow option synchronously; otherwise a wired human handler PARKS the
-//     request (the JSON-RPC reply waits for the decision), and everything
-//     else fail-closes to the first reject option
-//   - session/load replays history as notifications BEFORE its response; the
-//     driver suppresses updates while the load is in flight
+// Protocol facts encoded here, verified live against `agy acp` 1.5.x:
+//   - initialize: {protocolVersion:1, no fs/terminal client capabilities};
+//     clientInfo.name "zed" makes agy include Claude and GPT in its catalog;
+//     agentCapabilities.sessionCapabilities advertises resume/load/close
+//   - auth errors are -32000 (ACP auth_required); credentials live in agy's
+//     own store, shared with the CLI
+//   - session/set_config_option takes `configId` ("model" value = FULL slug
+//     with the effort tier baked in, e.g. gemini-3.8-flash-low; "mode")
+//   - session/cancel is a NOTIFICATION: the running prompt then resolves with
+//     stopReason "cancelled" and the session stays usable (sent as a request,
+//     agy cancels but never answers it)
+//   - session/resume restores a session without replaying its history and
+//     fails for unknown ids; session/load replays the history as
+//     notifications BEFORE its response (dropped here) and silently returns
+//     an empty session for unknown ids
+//   - session/request_permission is answered from the turn's policy
 //   - mcpServers entries: {name, type:"http", url, headers:[]} — headers is a
 //     LIST; a dead URL is accepted at session time (lazy connect)
+//   - agy exits by itself when its stdin closes
 
 import { spawn, type ChildProcess } from "node:child_process";
-import os from "node:os";
-import path from "node:path";
-import { frameCarriesUsage } from "./events.js";
 import type { AgyUsage } from "../driver-types.js";
 import { redactText } from "../redact.js";
 import { JsonRpcResponseError, JsonRpcSession } from "./jsonrpc.js";
@@ -40,8 +38,20 @@ export interface AcpSessionInfo {
 	availableModels: Array<{ modelId: string; name?: string }>;
 }
 
-/** Auth failed (-32000 family). Message carries the remediation the server
- *  provided plus the /agy login pointer. */
+/** Why the process went away. `reason` is redacted and user-presentable. */
+export interface AcpExitInfo {
+	code: number | null;
+	signal: string | null;
+	reason: string;
+}
+
+/** Answer to `session/request_permission`. */
+export interface PermissionResponse {
+	outcome: { outcome: "selected"; optionId: string } | { outcome: "cancelled" };
+}
+
+/** Auth failed (-32000). The message carries the remediation the server
+ *  provided plus the sign-in pointer. */
 export class AcpAuthError extends Error {
 	constructor(message: string) {
 		super(message);
@@ -52,89 +62,45 @@ export class AcpAuthError extends Error {
 export interface AcpConnectionOptions {
 	/** Process working directory for the spawned server. */
 	cwd: string;
-	/** Resolved server binary (or node executable when binArgs carries the
+	/** Resolved server binary (or the node executable when binArgs carries the
 	 *  fake-server script for tests). */
 	bin: string;
+	/** argv for the binary; default `["acp"]`. */
 	binArgs?: string[];
 	extraEnv?: Record<string, string>;
 	log: (msg: string, data?: unknown) => void;
-	/** Verified `session/update` payloads (post-suppression). */
-	onUpdate: (sessionId: string | null, update: unknown) => void;	/** Process exit. Fires exactly once. */
-	onExit: (info: { code: number | null; signal: string | null; stderrTail: string }) => void;
-	/** mcpServers entries for session/new AND session/load (run 6: load takes
-	 *  the same param). Evaluated lazily per call. */
+	/** Live `session/update` payloads (load replays are dropped). */
+	onUpdate: (sessionId: string | null, update: unknown) => void;
+	/** Process exit or spawn failure. Fires exactly once. */
+	onExit: (info: AcpExitInfo) => void;
+	/** mcpServers entries for session/new, session/resume, and session/load.
+	 *  Evaluated lazily per call. */
 	mcpServers?: () => AcpMcpServer[];
 	/** Permission policy for session/request_permission, evaluated per request:
-	 *  "auto" selects the first allow option; "deny" consults the human
-	 *  handler (parking) or fail-closes to the first reject option. Absent =
-	 *  deny (fail closed). */
+	 *  "auto" selects the first allow option, "deny" the first reject option.
+	 *  Absent = deny (fail closed). */
 	permissions?: () => "auto" | "deny";
-	/** Human gate for "deny"-policy turns. The request is PARKED: the JSON-RPC
-	 *  reply waits until the handler settles. The returned optionId is
-	 *  validated against the server's options; undefined/null deny. Absent =
-	 *  synchronous deny (fail closed). */
-	onPermissionRequest?: AcpPermissionHandler;
-	/** Park budget for one permission dialog. Tests shrink it. */
-	permissionParkMs?: number;
 }
 
 const INIT_TIMEOUT_MS = 30_000;
 const SESSION_OP_TIMEOUT_MS = 20_000;
-
-/** Arguments for the ACP server: `agy acp`. Custom binArgs are test/wrapper
- *  inputs and replace the default. */
-export function acpServerArgs(binArgs?: string[]): string[] {
-	return [...(binArgs ?? ["acp"])];
-}
-
-/** Human-decision budget for one parked permission request. Mirrors the
- *  approval-gate park budget (APPROVAL_PARK_TIMEOUT_MS): the dialog must
- *  deny by itself, never hold the agy prompt open forever. */
-const PERMISSION_PARK_MS = 480_000;
-
-/** One session/request_permission option block (the subset we consume). */
-export interface AcpPermissionOption {
-	optionId?: string;
-	kind?: string;
-	name?: string;
-}
-
-/** Payload handed to the permission handler when the server asks for a human
- *  decision. Options are server-defined data; the handler returns the chosen
- *  optionId, or undefined/null to deny. */
-export interface AcpPermissionRequest {
-	sessionId?: string;
-	options: AcpPermissionOption[];
-	toolCall?: { toolCallId?: string; kind?: string; title?: string };
-}
-
-export type AcpPermissionHandler = (req: AcpPermissionRequest) => Promise<string | null | undefined>;
-
+const STDERR_TAIL_CHARS = 8192;
+/** SIGTERM → SIGKILL escalation for a torn-down process group. */
+const KILL_GRACE_MS = 750;
+/** After `exit`, how long to wait for `close` (stdio drained) before
+ *  finishing anyway: a descendant may still hold the pipes open. */
+const CLOSE_GRACE_MS = 250;
 
 export class AcpConnection {
 	#opts: AcpConnectionOptions;
 	#child: ChildProcess | undefined;
 	#rpc: JsonRpcSession | undefined;
 	#stderrTail = "";
-	#usageSeen = false;
-	/** Set ONLY by a parsed PromptResponse.usage; this gates estimate
-	 *  suppression. #usageSeen stays diagnostic: any usage-shaped frame trips
-	 *  it, and the connection outlives turns. */
-	#exactUsageSeen = false;
 	#exited = false;
 	#killed = false;
 	#suppressUpdates = false;
-	#updateSessionId: string | null = null;
-	agentInfo: Record<string, unknown> | undefined;
-	/** Last known mode/model config echo from set_config_option results. */
-	lastConfigOptions: unknown = undefined;
-	/** Parked permission dialogs: each entry settles its own request with a
-	 *  deny. #finish drains the set so a dying connection never leaves the
-	 *  server's request hanging. */
-	#permissionPending = new Set<() => void>();
-	/** allow_always / reject_always answers, keyed by toolCall kind|title for
-	 *  the life of this connection: identical requests skip the dialog. */
-	#permissionMemory = new Map<string, string>();
+	#canResume = false;
+	#serverVersion: string | undefined;
 
 	constructor(opts: AcpConnectionOptions) {
 		this.#opts = opts;
@@ -148,39 +114,23 @@ export class AcpConnection {
 		return this.#child?.pid;
 	}
 
-	get stderrTail(): string {
-		// Redacted at the boundary: the raw tail stays internal, every consumer
-		// (doctor display, driver exit logs, failure messages) sees redacted text.
-		return redactText(this.#stderrTail);
+	get serverVersion(): string | undefined {
+		return this.#serverVersion;
 	}
 
-	/** Gate B watch: latched true once any session/update frame carried
-	 *  usage/token fields. /agy doctor surfaces it the day upstream starts
-	 *  sending token counts; silent until then. */
-	get usageSeen(): boolean {
-		return this.#usageSeen;
+	/** True when the server advertised `session/resume`. */
+	get canResume(): boolean {
+		return this.#canResume;
 	}
 
-	/** True once the server sent real per-turn usage (PromptResponse.usage). */
-	get exactUsageSeen(): boolean {
-		return this.#exactUsageSeen;
-	}
-
-	/** While true, session/update notifications are dropped: they are the
-	 *  full-text history replay that precedes a session/load response, never
-	 *  live generation (run 6). */
-	set updateSuppression(flag: boolean) {
-		this.#suppressUpdates = flag;
-	}
-
-	/** Spawn the server and perform the initialize handshake. Idempotent per
-	 *  instance: call once. */
+	/** Spawn the server and perform the initialize handshake. Call once per
+	 *  instance. */
 	async start(): Promise<void> {
-		if (this.#child) return;
-		const args = acpServerArgs(this.#opts.binArgs);
-		const child = spawn(this.#opts.bin, args, {
+		if (this.#child) throw new Error("ACP connection already started");
+		const child = spawn(this.#opts.bin, this.#opts.binArgs ?? ["acp"], {
 			cwd: this.#opts.cwd,
 			stdio: ["pipe", "pipe", "pipe"],
+			// Own process group: teardown kills agy and any helpers it spawned.
 			detached: process.platform !== "win32",
 			windowsHide: true,
 			...(this.#opts.extraEnv ? { env: { ...process.env, ...this.#opts.extraEnv } } : {}),
@@ -193,96 +143,78 @@ export class AcpConnection {
 		// (server died mid-handshake) is uncaught and kills pi.
 		child.stdin?.on("error", (err) => {
 			this.#opts.log("stdin-error", { message: redactText(err.message) });
-			if (!this.#exited && !this.#killed) this.#finish(redactText(err.message));
+			this.#finish(`stdin closed: ${err.message}`, null, null);
 		});
 
 		const rpc = new JsonRpcSession({
 			send: (frame) => this.#write(frame),
 			onRequest: (method, params) => this.#onServerRequest(method, params),
 			onNotification: (method, params) => this.#onNotification(method, params),
-			onParseError: (line) => this.#opts.log("parse-error", { line }),
+			onParseError: (line) => this.#opts.log("parse-error", { line: redactText(line) }),
 			onOverflow: (detail) => {
 				// The session already aborted its pending requests with the typed
-				// reason; finish so later events are ignored, then take the whole
-				// process GROUP down: a flooder is broken or hostile, and the
-				// binary may be a wrapper script with live descendants.
+				// reason. A flooder is broken or hostile: take the whole group down.
 				this.#opts.log("frame-overflow", { detail });
-				this.#finish(`stdout frame overflow: ${detail}`);
-				const child = this.#child;
-				try {
-					if (child?.pid && process.platform !== "win32") {
-						process.kill(-child.pid, "SIGKILL");
-					} else {
-						child?.kill("SIGKILL");
-					}
-				} catch {
-					/* already gone */
-				}
+				this.#finish(`stdout frame overflow: ${detail}`, null, null);
+				this.#signalGroup("SIGKILL");
 			},
 		});
 		this.#rpc = rpc;
 
 		child.stdout?.on("data", (chunk: string) => rpc.feed(chunk));
 		child.stderr?.on("data", (chunk: string) => {
-			this.#stderrTail = (this.#stderrTail + chunk).slice(-8192);
+			this.#stderrTail = (this.#stderrTail + chunk).slice(-STDERR_TAIL_CHARS);
 		});
 		child.on("error", (err) => {
 			this.#opts.log("spawn-error", { message: redactText(err.message) });
-			this.#finish(redactText(err.message));
+			this.#finish(`cannot run ${this.#opts.bin}: ${err.message}`, null, null);
 		});
+		let closeTimer: ReturnType<typeof setTimeout> | undefined;
+		const exited = (code: number | null, signal: NodeJS.Signals | null): void => {
+			if (closeTimer) clearTimeout(closeTimer);
+			this.#finish(exitReason(code, signal), code, signal);
+		};
 		child.on("exit", (code, signal) => {
-			this.#opts.log("exit", { code: code ?? signal ?? "?" });
-			// The reason rides into pending-request rejections, so it must be
-			// redacted here (server stderr can carry auth material).
-			this.#finish(redactText(this.#stderrTail.trim()));
+			this.#opts.log("exit", { code, signal });
+			// Wait briefly for the stdio streams to drain so the last stderr
+			// line (often the actual error) is part of the exit reason.
+			closeTimer = setTimeout(() => exited(code, signal), CLOSE_GRACE_MS);
+			closeTimer.unref?.();
 		});
+		child.on("close", (code, signal) => exited(code, signal));
 
 		const result = (await this.request(
 			"initialize",
 			{
 				protocolVersion: 1,
 				clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-				// Identify as a Zed-family client so the ACP server includes
-				// third-party models (Claude, GPT-OSS) in its model catalog.
-				// Without clientInfo the server filters to Gemini-only.
-				// Verified live 2026-07-08: with clientInfo.name="zed", the
-				// catalog includes claude-opus-5-5-*, claude-sonnet-5-5-*,
-				// gpt-oss-120b-medium alongside the Gemini families.
+				// Without a Zed-family clientInfo agy filters its catalog to Gemini.
 				clientInfo: { name: "zed", title: "realagy", version: "2.0.0" },
 			},
 			INIT_TIMEOUT_MS,
 		)) as Record<string, unknown> | undefined;
-		const info = result?.agentInfo;
-		if (typeof info === "object" && info !== null) this.agentInfo = info as Record<string, unknown>;
-		this.#opts.log("initialized", { version: this.serverVersion() });
+		const info = record(result?.agentInfo);
+		this.#serverVersion = typeof info.version === "string" ? info.version : undefined;
+		const capabilities = record(result?.agentCapabilities);
+		const sessionCaps = record(capabilities.sessionCapabilities ?? capabilities.session_capabilities);
+		this.#canResume = typeof sessionCaps.resume === "object" && sessionCaps.resume !== null;
+		this.#opts.log("initialized", { version: this.#serverVersion, resume: this.#canResume });
 	}
-
-	serverVersion(): string | undefined {
-		const v = this.agentInfo?.version;
-		return typeof v === "string" ? v : undefined;
-	}
-
-	/** True once the server answered -32601 for session/cancel on THIS
-	 *  process (probed lazily by the driver; never assumed). */
-	cancelSupported: boolean | null = null;
 
 	async newSession(cwd: string): Promise<AcpSessionInfo> {
-		const result = (await this.guarded(
+		const result = (await this.request(
 			"session/new",
-			{ cwd, mcpServers: this.#mcpServers(), ...this.#antigravityMeta() },
+			{ cwd, mcpServers: this.#mcpServers(), ...antigravityMeta() },
 			SESSION_OP_TIMEOUT_MS,
-		)) as Record<string, unknown>;
-		const sessionId = result.sessionId;
+		)) as Record<string, unknown> | undefined;
+		const sessionId = result?.sessionId;
 		if (typeof sessionId !== "string" || sessionId.length === 0) {
 			throw new Error("ACP session/new returned no sessionId");
 		}
-		this.#updateSessionId = sessionId;
-		this.lastConfigOptions = result.configOptions;
-		const rawModels = (result.models as { availableModels?: unknown } | undefined)?.availableModels;
+		const rawModels = record(result?.models).availableModels;
 		const availableModels = Array.isArray(rawModels)
 			? rawModels.flatMap((value) => {
-					if (!value || typeof value !== "object") return [];
-					const model = value as { modelId?: unknown; name?: unknown };
+					const model = record(value);
 					return typeof model.modelId === "string"
 						? [{ modelId: model.modelId, ...(typeof model.name === "string" ? { name: model.name } : {}) }]
 						: [];
@@ -291,34 +223,29 @@ export class AcpConnection {
 		return { sessionId, availableModels };
 	}
 
-	async loadSession(sessionId: string, cwd: string): Promise<void> {
-		this.#updateSessionId = sessionId;
-		this.updateSuppression = true;
+	/** Reopen a persisted session: `session/resume` when advertised (no
+	 *  history replay), else `session/load` with its replay dropped. */
+	async reopenSession(sessionId: string, cwd: string): Promise<"resumed" | "loaded"> {
+		const params = { sessionId, cwd, mcpServers: this.#mcpServers(), ...antigravityMeta() };
+		if (this.#canResume) {
+			await this.request("session/resume", params, SESSION_OP_TIMEOUT_MS);
+			return "resumed";
+		}
+		this.#suppressUpdates = true;
 		try {
-			// History replay arrives as notifications BEFORE this resolves; the
-			// suppression flag drops it (never live text).
-			const result = (await this.request(
-				"session/load",
-				{ sessionId, cwd, mcpServers: this.#mcpServers(), ...this.#antigravityMeta() },
-				SESSION_OP_TIMEOUT_MS,
-			)) as Record<string, unknown> | undefined;
-			this.lastConfigOptions = result?.configOptions;
+			await this.request("session/load", params, SESSION_OP_TIMEOUT_MS);
+			return "loaded";
 		} finally {
-			this.updateSuppression = false;
+			this.#suppressUpdates = false;
 		}
 	}
 
 	async setConfigOption(sessionId: string, configId: string, value: string): Promise<void> {
-		const result = (await this.guarded(
-			"session/set_config_option",
-			{ sessionId, configId, value },
-			SESSION_OP_TIMEOUT_MS,
-		)) as Record<string, unknown> | undefined;
-		this.lastConfigOptions = result?.configOptions;
+		await this.request("session/set_config_option", { sessionId, configId, value }, SESSION_OP_TIMEOUT_MS);
 	}
 
-	/** No request timeout on purpose: the driver's overall/idle timers govern
-	 *  the turn and fire abortAll on breach. */
+	/** No request timeout on purpose: the driver's inactivity guard governs
+	 *  the turn. */
 	async prompt(
 		sessionId: string,
 		text: string,
@@ -330,174 +257,66 @@ export class AcpConnection {
 		if (contextBlock) {
 			blocks.push({
 				type: "resource",
-				resource: {
-					uri: contextBlock.uri,
-					mimeType: "text/markdown",
-					text: contextBlock.text,
-				},
+				resource: { uri: contextBlock.uri, mimeType: "text/markdown", text: contextBlock.text },
 			});
 		}
-		blocks.push(...images.map((i) => ({ type: "image", data: i.data, mimeType: i.mimeType })));
+		for (const image of images) blocks.push({ type: "image", data: image.data, mimeType: image.mimeType });
 		blocks.push({ type: "text", text });
-		const result = (await this.request("session/prompt", {
-			sessionId,
-			prompt: blocks,
-		})) as Record<string, unknown> | undefined;
+		const result = (await this.request("session/prompt", { sessionId, prompt: blocks })) as Record<string, unknown> | undefined;
 		const stopReason = result?.stopReason;
 		if (typeof stopReason !== "string") {
 			throw new Error("ACP session/prompt returned no stopReason");
 		}
-		// Optional, unstable ACP PromptResponse.usage: absent on 1.1.1 but
-		// parsed for the day the server forwards its SDK usage_metadata. Never
-		// infer exact counts from a context-window usage_update ({used,size}).
+		// Turn-cumulative usage over all of the prompt's internal model calls.
 		const usage = parseAcpTurnUsage(result?.usage);
-		if (usage) {
-			this.#usageSeen = true;
-			this.#exactUsageSeen = true;
-		}
 		return { stopReason, ...(usage ? { usage } : {}) };
 	}
 
-	/** Probe-and-cancel. Returns supported:false when the server does not
-	 *  implement session/cancel (-32601 on RC01); other errors propagate as
-	 *  translated Errors. Protocol probing stays inside the connection layer. */
-	async cancel(sessionId: string): Promise<{ supported: boolean }> {
-		try {
-			await this.request("session/cancel", { sessionId }, SESSION_OP_TIMEOUT_MS);
-			return { supported: true };
-		} catch (err) {
-			if (err instanceof JsonRpcResponseError && err.code === -32601) return { supported: false };
-			throw translateError("session/cancel", err);
-		}
+	/** Ask the server to end the running prompt (ACP notification). */
+	cancel(sessionId: string): void {
+		if (!this.alive) return;
+		this.#rpc?.notify("session/cancel", { sessionId });
 	}
 
-	async closeSession(sessionId: string): Promise<void> {
-		await this.guarded("session/close", { sessionId }, SESSION_OP_TIMEOUT_MS);
-	}
-
-	/** Protocol-level permission answering: policy "auto" selects the first
-	 *  allow option synchronously; "deny" consults the parked human handler
-	 *  (#answerPermission) or fail-closes. See there for the full matrix. */
 	#onServerRequest(method: string, params: unknown): Promise<unknown> {
 		if (method === "session/request_permission") {
-			return this.#answerPermission(params as AcpPermissionRequest);
+			return Promise.resolve(this.#answerPermission(record(params)));
 		}
 		// fs/* and terminal/* are declined: our client capabilities are off and
-		// agy keeps executing its own tools (plan §8 capability posture).
+		// agy executes its own tools.
 		this.#opts.log("unsupported-server-request", { method });
 		return Promise.reject(new Error(`client capability not enabled: ${method}`));
 	}
 
-	/** Answer session/request_permission. "auto" (skipPermissions turns)
-	 *  selects the first allow option synchronously. Otherwise a wired handler
-	 *  parks the request — the reply waits for the human — while every other
-	 *  path fail-closes synchronously: no handler, esc, throw, timeout,
-	 *  connection death. A chosen *_always option is remembered per connection
-	 *  for identical later requests (same toolCall kind+title). */
-	#answerPermission(params: AcpPermissionRequest): Promise<unknown> {
-		const options = Array.isArray(params?.options) ? params.options : [];
-		const allow = options.find((o) => typeof o.kind === "string" && o.kind.startsWith("allow"));
-	const denyId = options.find((o) => typeof o.kind === "string" && o.kind.startsWith("reject"))?.optionId;
+	/** "auto" selects the first allow option (any option as a last resort);
+	 *  "deny" selects the first reject option, or cancels when none exists. */
+	#answerPermission(params: Record<string, unknown>): PermissionResponse {
+		const options = (Array.isArray(params.options) ? params.options : []).map(record);
 		const policy = this.#opts.permissions?.() ?? "deny";
-		if (policy === "auto") {
-			const chosen = (allow ?? options[0])?.optionId;
-			this.#opts.log("permission", { optionId: chosen, policy });
-			return Promise.resolve({ outcome: { outcome: "selected", optionId: chosen } });
-		}
-		const handler = this.#opts.onPermissionRequest;
-		if (!handler) {
-			this.#opts.log("permission", { optionId: denyId, policy });
-			return Promise.resolve(
-				denyId !== undefined
-					? { outcome: { outcome: "selected", optionId: denyId } }
-					: { outcome: { outcome: "cancelled" } },
-			);
-		}
-		// Always-memory needs a stable identity: the title. Without one, every
-		// untitled call would collapse onto one key and inherit its answer.
-		const memKey = params?.toolCall?.title ? `${params.toolCall.kind ?? ""}|${params.toolCall.title}` : undefined;
-		const remembered = memKey !== undefined ? this.#permissionMemory.get(memKey) : undefined;
-		if (remembered !== undefined && options.some((o) => o.optionId === remembered)) {
-			this.#opts.log("permission", { optionId: remembered, policy: "memory" });
-			return Promise.resolve({ outcome: { outcome: "selected", optionId: remembered } });
-		}
-		const parkMs = this.#opts.permissionParkMs ?? PERMISSION_PARK_MS;
-		return new Promise((resolve) => {
-			let timer: NodeJS.Timeout | undefined;
-			// First settle wins: a late dialog answer after a timeout/deny must
-			// not re-log or record an always-memory from a dead request.
-			let settled = false;
-			const settle = (optionId: string | undefined, why: string): void => {
-				if (settled) return;
-				settled = true;
-				if (timer) clearTimeout(timer);
-				this.#permissionPending.delete(settleDeny);
-				this.#opts.log("permission", { optionId, policy: why });
-				// undefined optionId (no reject option on the table) cancels
-				// instead of selecting nothing.
-				resolve(
-					optionId !== undefined
-						? { outcome: { outcome: "selected", optionId } }
-						: { outcome: { outcome: "cancelled" } },
-				);
-			};
-			const settleDeny = (): void => settle(denyId, "dialog-deny");
-			timer = setTimeout(() => {
-				this.#opts.log("permission-timeout", { parkMs });
-				settleDeny();
-			}, parkMs);
-			this.#permissionPending.add(settleDeny);
-			Promise.resolve()
-				.then(() => handler(params))
-				.then((picked) => {
-					if (settled) return;
-					const chosen = picked != null ? options.find((o) => o.optionId === picked) : undefined;
-					if (!chosen?.optionId) {
-						settle(denyId, "dialog-deny");
-						return;
-					}
-					if (chosen.kind === "allow_always" || chosen.kind === "reject_always") {
-						if (memKey !== undefined) this.#permissionMemory.set(memKey, chosen.optionId);
-					}
-					settle(chosen.optionId, "dialog");
-				})
-				.catch((err: unknown) => {
-					this.#opts.log("permission-error", { message: err instanceof Error ? err.message : String(err) });
-					settle(denyId, "dialog-error");
-				});
-		});
+		const kindStarts = (prefix: string) => options.find((o) => typeof o.kind === "string" && o.kind.startsWith(prefix));
+		const chosen = policy === "auto" ? (kindStarts("allow") ?? options[0]) : kindStarts("reject");
+		const optionId = typeof chosen?.optionId === "string" ? chosen.optionId : undefined;
+		this.#opts.log("permission", { optionId, policy });
+		return optionId !== undefined
+			? { outcome: { outcome: "selected", optionId } }
+			: { outcome: { outcome: "cancelled" } };
 	}
 
 	#onNotification(method: string, params: unknown): void {
 		if (method === "session/update") {
-			// Latched before the suppression gate: history-replay frames are the
-			// server's payloads too, and they are the cheapest signal source.
-			if (!this.#usageSeen && frameCarriesUsage(params)) this.#usageSeen = true;
 			if (this.#suppressUpdates) return; // load replay: history, not live text
-			const p = typeof params === "object" && params !== null ? (params as Record<string, unknown>) : {};
-			const sessionId = typeof p.sessionId === "string" ? p.sessionId : this.#updateSessionId;
+			const p = record(params);
+			// No sessionId: the driver attributes it to the running turn.
+			const sessionId = typeof p.sessionId === "string" ? p.sessionId : null;
 			this.#opts.onUpdate(sessionId, p.update);
-			return;
-		}
-		if (method === "auth_required") {
-			this.#opts.log("auth-required", params);
 			return;
 		}
 		this.#opts.log("notification", { method });
 	}
 
-	/** Wrap a request: -32000 family becomes AcpAuthError with the remediation
-	 *  the server provided. */
-	private async guarded(method: string, params: unknown, timeoutMs: number): Promise<unknown> {
-		try {
-			return await this.request(method, params, timeoutMs);
-		} catch (err) {
-			throw translateError(method, err);
-		}
-	}
-
+	/** Send a request; failures arrive translated (see translateError). */
 	async request(method: string, params?: unknown, timeoutMs?: number): Promise<unknown> {
-		if (!this.#rpc || !this.alive) throw new Error("ACP connection is not running");
+		if (!this.#rpc || !this.alive) throw new Error(`Antigravity CLI is not running (request: ${method})`);
 		try {
 			return await this.#rpc.request(method, params, timeoutMs);
 		} catch (err) {
@@ -508,16 +327,10 @@ export class AcpConnection {
 	#mcpServers(): AcpMcpServer[] {
 		try {
 			return this.#opts.mcpServers?.() ?? [];
-		} catch {
+		} catch (err) {
+			this.#opts.log("mcp-servers-failed", { message: err instanceof Error ? err.message : String(err) });
 			return [];
 		}
-	}
-
-	/** agy keeps its native tools alongside pi's (agy acp ignores tool
-	 *  allowlists). Expose pi tools directly, not through agy's lazy
-	 *  call_mcp_tool / read_resource helper loop. */
-	#antigravityMeta(): Record<string, unknown> {
-		return { _meta: { antigravity: { eagerMcpServers: ["pi-bridge"] } } };
 	}
 
 	#write(frame: string): void {
@@ -527,18 +340,20 @@ export class AcpConnection {
 			return;
 		}
 		try {
-			stdin.write(frame + "\n");
+			stdin.write(`${frame}\n`);
 		} catch (err) {
 			this.#opts.log("write-failed", { message: err instanceof Error ? err.message : String(err) });
 			this.abortAll("connection closed");
 		}
 	}
 
-	/** Gate D teardown: reject every pending request, then kill the process.
-	 *  Nothing is ever written to the dying transport; no promise survives. */
+	/** Reject every pending request; nothing is written afterwards. */
 	abortAll(reason: string): void {
 		this.#rpc?.abortAll(reason);
 	}
+
+	/** Teardown: reject everything pending, then terminate the process group
+	 *  (SIGTERM, then SIGKILL after a grace period). */
 	kill(): void {
 		if (this.#killed) return;
 		this.#killed = true;
@@ -546,39 +361,59 @@ export class AcpConnection {
 		const child = this.#child;
 		if (!child || this.#exited) return;
 		this.#opts.log("kill", { pid: child.pid ?? "?" });
+		this.#signalGroup("SIGTERM");
+		if (process.platform === "win32") return;
+		// unref: the escalation must never keep pi's event loop alive.
+		setTimeout(() => {
+			if (!this.#exited) this.#signalGroup("SIGKILL");
+		}, KILL_GRACE_MS).unref?.();
+	}
+
+	#signalGroup(signal: NodeJS.Signals): void {
+		const child = this.#child;
 		try {
-			if (child.pid && process.platform !== "win32") {
-				process.kill(-child.pid, "SIGTERM");
-				setTimeout(() => {
-					try {
-						if (!this.#exited && child.pid) process.kill(-child.pid, "SIGKILL");
-					} catch {
-						/* already gone */
-					}
-				}, 750);
-			} else {
-				child.kill("SIGTERM");
-			}
+			if (child?.pid && process.platform !== "win32") process.kill(-child.pid, signal);
+			else child?.kill(signal);
 		} catch {
 			/* already gone */
 		}
 	}
 
-	#finish(reason: string): void {
+	#finish(reason: string, code: number | null, signal: string | null): void {
 		if (this.#exited) return;
 		this.#exited = true;
-		// Pending permission dialogs must not outlive the connection: deny them
-		// so their replies race the teardown instead of hanging the server.
-		const pendings = [...this.#permissionPending];
-		this.#permissionPending.clear();
-		for (const deny of pendings) deny();
-		this.abortAll(`connection exited: ${reason || "process gone"}`);
-		this.#opts.onExit({ code: null, signal: null, stderrTail: redactText(this.#stderrTail) });
+		const detail = lastLine(this.#stderrTail);
+		const full = redactText(detail ? `${reason}: ${detail}` : reason);
+		this.abortAll(`Antigravity CLI exited (${full})`);
+		this.#opts.onExit({ code, signal, reason: full });
 	}
 }
 
-/** ACP's optional (unstable) per-turn PromptResponse.usage, not the
- *  session/usage_update context-window occupancy notification. */
+function record(value: unknown): Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+}
+
+/** agy keeps its native tools alongside pi's (agy acp ignores tool
+ *  allowlists). Expose pi tools directly, not through agy's lazy
+ *  call_mcp_tool / read_resource helper loop. */
+function antigravityMeta(): Record<string, unknown> {
+	return { _meta: { antigravity: { eagerMcpServers: ["pi-bridge"] } } };
+}
+
+function exitReason(code: number | null, signal: string | null): string {
+	if (signal) return `killed by ${signal}`;
+	return code === null ? "process exited" : `exit code ${code}`;
+}
+
+/** Last non-empty stderr line, capped: the actual error is usually there. */
+function lastLine(text: string): string {
+	const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+	const last = lines.at(-1) ?? "";
+	return last.length > 300 ? `${last.slice(0, 300)}…` : last;
+}
+
+/** ACP's per-turn PromptResponse.usage (cumulative over the prompt's model
+ *  calls), not the session/update usage_update context occupancy. */
 export function parseAcpTurnUsage(value: unknown): AgyUsage | undefined {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
 	const u = value as Record<string, unknown>;
@@ -589,6 +424,7 @@ export function parseAcpTurnUsage(value: unknown): AgyUsage | undefined {
 	const total = count(u.totalTokens);
 	const thought = count(u.thoughtTokens);
 	const cacheRead = count(u.cachedReadTokens);
+	const cacheWrite = count(u.cachedWriteTokens);
 	if (input === undefined || output === undefined || total === undefined) return undefined;
 	return {
 		input_tokens: input,
@@ -596,6 +432,7 @@ export function parseAcpTurnUsage(value: unknown): AgyUsage | undefined {
 		total_tokens: total,
 		...(thought === undefined ? {} : { thinking_tokens: thought }),
 		...(cacheRead === undefined ? {} : { cache_read_tokens: cacheRead }),
+		...(cacheWrite === undefined ? {} : { cache_write_tokens: cacheWrite }),
 	};
 }
 
@@ -603,22 +440,13 @@ export function translateError(method: string, err: unknown): Error {
 	if (err instanceof AcpAuthError) return err;
 	if (err instanceof JsonRpcResponseError) {
 		if (err.code === -32000) {
-			const detail = typeof err.data === "object" && err.data !== null ? (err.data as { message?: unknown }).message : undefined;
-			const detailText = typeof detail === "string" ? `: ${detail}` : `: ${err.message}`;
-			return new AcpAuthError(`ACP authentication required for ${method}${detailText}. Run /agy login to sign in.`);
+			const detail = record(err.data).message;
+			const detailText = typeof detail === "string" ? detail : err.message;
+			return new AcpAuthError(`Antigravity sign-in required (${method}: ${detailText}). Sign in with \`agy\` in a terminal, then run /agy setup.`);
 		}
-		// Typed protocol errors survive: callers probe .code (-32601 cancel-
-		// unsupported, -32602 param shape). The method prefix is lost — describe()
-		// callers that need it log the method at the call site.
+		// Typed protocol errors survive: callers may branch on .code.
 		return err;
 	}
 	if (err instanceof Error) return err;
 	return new Error(`ACP ${method} failed: ${String(err)}`);
-}
-
-/** Resolve the agy binary: AGY_BIN > configured path > `agy` on PATH. `~`
- *  expands to the home directory (spawn does not expand it). */
-export function resolveAcpBinary(configBin: string): string {
-	const raw = process.env.AGY_BIN?.trim() || (configBin.length > 0 ? configBin : "agy");
-	return raw === "~" || raw.startsWith("~/") ? path.join(os.homedir(), raw.slice(1)) : raw;
 }

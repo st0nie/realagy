@@ -26,5 +26,5 @@ try {
   }
  }
 } finally {
- await driver.close("shutdown");
+ await driver.close();
 }

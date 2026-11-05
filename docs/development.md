@@ -15,7 +15,11 @@ Protocol tests run against `tests/helpers/fake-acp-server.mjs` instead of agy. I
 | Variable | Effect |
 | --- | --- |
 | `FAKE_ACP_DB_DIR` | Writes one agent step per prompt to `<dir>/<sessionId>.db`, the way agy's conversation store does |
-| session id `missing` | `session/load` fails, which exercises the fresh-session fallback |
+| `FAKE_ACP_RESUME` | Advertises `sessionCapabilities.resume` and answers `session/resume`; without it `session/load` replays a canned history first |
+| session id `missing` | `session/load` and `session/resume` fail, which exercises the fresh-session fallback |
+| prompt text containing `[hang]` | The prompt never ends on its own; a `session/cancel` notification ends it with `stopReason: "cancelled"` |
+| prompt text containing `[silent-cancel]` | Like `[hang]`, but `session/cancel` is ignored, which exercises the teardown safety net |
+| prompt text containing `[exit]` | The server writes a stderr line and exits with code 3 mid-prompt |
 
 ## Live smokes
 
@@ -28,7 +32,7 @@ npm run smoke:live -- gpt-oss-120b
 REALAGY_TRACE_USAGE=/tmp/trace.jsonl pi      # turn plans, usage_update, step tokens; counts only
 ```
 
-`scripts/probe-*.mts` cover context usage and image delivery.
+`scripts/probe-context-usage.mts` checks that pi's context count matches agy's occupancy.
 
 ## Conventions
 
@@ -44,5 +48,7 @@ REALAGY_TRACE_USAGE=/tmp/trace.jsonl pi      # turn plans, usage_update, step to
 
 - An aborted `npm install` leaves a corrupt `node_modules`, and `tsc`/`vitest` then die with "Bus error". Delete `node_modules` and run `bun install`.
 - `node:sqlite` prints an ExperimentalWarning on Node 22. `src/acp/step-usage.ts` silences it for that one `require`, because it would corrupt pi's TUI.
-- The conversation store is agy's internal format. Every read degrades to "no measurement" rather than failing a turn.
+- The conversation store is agy's internal format. Every read degrades to "no measurement" rather than failing a turn. The stores are in WAL mode: never copy a `.db` file by itself (use `VACUUM INTO`).
+- ACP `session/cancel` is a notification. Sent as a request, agy cancels the prompt but never answers the request.
+- `session/load` of an unknown session id succeeds with an empty session. Check that `<sessionId>.db` exists before trusting a load.
 - `agy --print /usage` takes about 10 s. Run it only from `/agy usage`, never on a turn's path or in the background.

@@ -19,7 +19,7 @@ import { toAgyEffort, type AgyModelEntry } from "./models.js";
 import type { BridgeResult } from "./mcp-server.js";
 import {
 	formatToolResult,
-	planTurn,
+	planTurnFrom,
 	warmAfterTurn,
 	type TurnPlan,
 	type WarmSession,
@@ -73,8 +73,9 @@ export class ToolRoundTrips {
 
 	constructor(private readonly driver: TurnDriver) {}
 
-	get pendingIds(): string[] {
-		return [...this.#pending.keys()];
+	/** True while the bridge waits for pi's result of this call. */
+	isPending(callId: string): boolean {
+		return this.#pending.has(callId);
 	}
 
 	onToolCall = (callId: string, name: string, args: Record<string, unknown>, signal: AbortSignal): Promise<BridgeResult> => {
@@ -173,7 +174,7 @@ interface UsageState {
 	step?: AgyStepUsage;
 	/** Latest ACP usage_update occupancy received during this message. */
 	occupancy?: number;
-	/** Turn-cumulative PromptResponse.usage (or a client estimate). */
+	/** Turn-cumulative PromptResponse.usage. */
 	cumulative?: AgyUsage;
 }
 
@@ -205,10 +206,12 @@ function syncUsage(target: Usage, state: UsageState): void {
 		target.totalTokens = state.step.contextTokens;
 	} else if (state.occupancy !== undefined) {
 		if (state.cumulative) {
-			// ACP inputTokens includes cachedReadTokens; pi counts them separately.
-			target.input = Math.max(0, (state.cumulative.input_tokens ?? 0) - (state.cumulative.cache_read_tokens ?? 0));
-			target.output = (state.cumulative.output_tokens ?? 0) + (state.cumulative.thinking_tokens ?? 0);
-			target.cacheRead = state.cumulative.cache_read_tokens ?? 0;
+			// ACP inputTokens includes the cached read/write tokens; pi counts them separately.
+			const c = state.cumulative;
+			target.cacheRead = c.cache_read_tokens ?? 0;
+			target.cacheWrite = c.cache_write_tokens ?? 0;
+			target.input = Math.max(0, (c.input_tokens ?? 0) - target.cacheRead - target.cacheWrite);
+			target.output = (c.output_tokens ?? 0) + (c.thinking_tokens ?? 0);
 		}
 		target.totalTokens = state.occupancy;
 	}
@@ -379,21 +382,9 @@ function selectTurnPlan(context: TranscriptContext, cwd: string, sessions: AcpSe
 		const item = history[i];
 		if (item && item !== sessions.warm) candidates.push(item);
 	}
-	let bestWarm: Extract<TurnPlan, { kind: "warm" }> | undefined;
-	for (const candidate of candidates) {
-		const plan = planTurn(context, cwd, candidate);
-		if (plan.kind === "warm") {
-			if (!bestWarm || plan.deltaMessages < bestWarm.deltaMessages) {
-				bestWarm = plan;
-				if (bestWarm.deltaMessages === 1) break;
-			}
-		}
-	}
-	if (bestWarm) {
-		const sessionId = resolveSessionAtStep(sessions.conversationsDir?.(), bestWarm.sessionId, bestWarm.maxStepIdx);
-		return { ...bestWarm, sessionId };
-	}
-	return planTurn(context, cwd, candidates[0]);
+	const plan = planTurnFrom(context, cwd, candidates);
+	if (plan.kind !== "warm") return plan;
+	return { ...plan, sessionId: resolveSessionAtStep(sessions.conversationsDir?.(), plan.sessionId, plan.maxStepIdx) };
 }
 
 export interface StreamSimpleDeps {
@@ -419,7 +410,7 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 		void (async () => {
 			try {
 				const results = context.messages.filter((message): message is Extract<Message, { role: "toolResult" }> =>
-					message.role === "toolResult" && deps.roundTrips.pendingIds.includes(message.toolCallId),
+					message.role === "toolResult" && deps.roundTrips.isPending(message.toolCallId),
 				);
 				for (let i = 0; i < results.length; i++) {
 					const result = results[i];
@@ -432,6 +423,10 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					await consumeTurn(stream, blocks, active, model, options, onCompleted, deps.meter);
 					return;
 				}
+				// A turn still parked on pi tool calls that this context does not
+				// answer is orphaned (pi's loop ended after its toolUse message):
+				// end it now instead of queueing behind it until its timeout.
+				await deps.driver.cancelActive("superseded by a new pi turn");
 
 				const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 				const entry = deps.entries.find((candidate) => candidate.id === model.id);
@@ -456,7 +451,6 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					...(plan.input.contextBlock ? { contextBlock: plan.input.contextBlock } : {}),
 					...(plan.kind === "warm" ? { fallback: plan.fallback } : {}),
 					signal: options?.signal,
-					timeoutMin: 0,
 					inactivityMin: 5,
 				};
 				const replacement = await options?.onPayload?.(request, model);

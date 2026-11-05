@@ -1,9 +1,8 @@
 // ACP `session/update` payload → DriverActivity mapping + stopReason mapping.
 //
-// Pure functions, no I/O: unit-tested against the captured probe transcripts
-// (probe-logs/acp-traffic-run5.jsonl, run6-restart-load-tools.jsonl).
+// Pure functions, no I/O.
 //
-// Shapes verified live against agy_acp_server 20260818_01_RC01:
+// Shapes verified live against `agy acp`:
 //   session/update params = { sessionId, update: { sessionUpdate: <discriminator>, ... } }
 //   - agent_message_chunk  { content: { type: "text", text } }         (pure deltas)
 //   - agent_thought_chunk  { content: { type: "text", text } }          (thought TEXT)
@@ -12,15 +11,14 @@
 //   - tool_call_update     { toolCallId, status: completed|failed, rawOutput? }
 //   - plan                 { entries: [...] }
 //   - available_commands_update { availableCommands: [...] }
-// Usage: ABSENT on RC01 (Gate B) — mapped defensively should a future build add it.
+// Token usage arrives in the session/prompt result and as usage_update
+// frames; both are handled by the driver, not here.
 
-import { StreamSanitizer, sanitizeSystemMessage } from "../stream-sanitizer.js";
-
-export { StreamSanitizer, sanitizeSystemMessage };
+import { StreamSanitizer } from "../stream-sanitizer.js";
 
 /** Map one `update` object to a driver-level event, or null when the update
- *  carries nothing the driver consumes (plan/commands are doctor/phase-2
- *  material; user_message_chunk is load replay and must never reach pi as
+ *  carries nothing the driver consumes (plans and command lists are not
+ *  rendered; user_message_chunk is load replay and must never reach pi as
  *  live text). */
 /** Native edit diff carried in tool_call content[] (run 6: edits arrive AS
  *  DIFFS: {type:"diff", path, newText, optional oldText}). The provider
@@ -72,7 +70,7 @@ export function mapUpdate(update: unknown): MappedUpdate {
 			const id = stringField(u.toolCallId);
 			if (!id) return null;
 			if (u.status === "failed") {
-				// RC01 echo (run 6, finding 7): after an allow, the APPROVED call
+				// agy echo: after an allow, the APPROVED call
 				// id reports failed with this sentinel while the real work runs
 				// under a different id that reports its own lifecycle. Track
 				// effects, not ids: drop the echo instead of rendering a bogus
@@ -99,8 +97,8 @@ export function mapUpdate(update: unknown): MappedUpdate {
 			return null; // in_progress or unknown status: nothing to render yet
 		}
 		default:
-			// plan / available_commands_update / current_mode_update: consumed by
-			// the driver snapshot / future phases, not mapped to activities.
+			// plan / available_commands_update / current_mode_update /
+			// config_option_update / session_info_update: nothing pi renders.
 			return null;
 	}
 }
@@ -184,9 +182,9 @@ export function toolName(title: unknown, kind: unknown): string {
 }
 
 /** Map a `session/prompt` result stopReason to a TurnOutcome shape.
- *  Verified live: `end_turn`. Schema enumerates cancelled / max_tokens /
- *  max_turn_requests / refusal. `cancelled` is unreachable on RC01 (no
- *  cancel method) but mapped for the day upstream ships it. */
+ *  Verified live: `end_turn`, and `cancelled` after a session/cancel
+ *  notification. The schema also enumerates max_tokens / max_turn_requests /
+ *  refusal. */
 export function mapStopReason(stopReason: unknown): {
 	status: "OK" | "ERROR";
 	aborted: boolean;
@@ -208,8 +206,8 @@ export function mapStopReason(stopReason: unknown): {
 	}
 }
 
-/** Defensive accumulation with the cumulative-resend port. RC01 streams pure
- *  deltas (verified: mid-token splits across the run-5 stress streams), so on
+/** Defensive accumulation with the cumulative-resend port. agy streams pure
+ *  deltas (verified: mid-token splits across stress streams), so on
  *  a compliant server the resend branch stays inert; it exists because the
  *  same backend's private protocol exhibited exactly this failure mode.
  *
@@ -277,21 +275,4 @@ export class TextAccumulator {
 	get text(): string {
 		return this.#sanitizedAcc;
 	}
-}
-
-const USAGE_KEY = /usage|tokens?/i;
-
-/** Gate B watch: true when a server payload carries usage/token fields.
- *  Key-name based so future shapes (usage blocks, _meta.tokenCount, top-level
- *  token totals) all trip it. String values are exempt so auth-style "token"
- *  args inside tool-call frames cannot false-positive the latch; depth-capped
- *  so the walk stays cheap on every frame until it latches. */
-export function frameCarriesUsage(value: unknown, depth = 0): boolean {
-	if (depth > 8 || typeof value !== "object" || value === null) return false;
-	if (Array.isArray(value)) return value.some((v) => frameCarriesUsage(v, depth + 1));
-	for (const [key, v] of Object.entries(value)) {
-		if (USAGE_KEY.test(key) && (typeof v === "number" || typeof v === "object")) return true;
-		if (frameCarriesUsage(v, depth + 1)) return true;
-	}
-	return false;
 }

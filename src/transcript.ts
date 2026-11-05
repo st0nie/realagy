@@ -285,17 +285,6 @@ export function persistentMessages(messages: Message[]): Message[] {
 	return messages.filter((message) => !isEphemeralMessage(message));
 }
 
-function splitAtPersistentCount(messages: Message[], count: number): { prefix: Message[]; delta: Message[] } | null {
-	const prefix: Message[] = [];
-	let idx = 0;
-	while (idx < messages.length && prefix.length < count) {
-		const message = messages[idx];
-		if (message && !isEphemeralMessage(message)) prefix.push(message);
-		idx++;
-	}
-	if (prefix.length < count) return null;
-	return { prefix, delta: messages.slice(idx) };
-}
 
 const REALCTX_USER_IMAGE_DROP = /\[#\d+ (?:dropped|summarized|superseded) · user images?\b/;
 const EPHEMERAL_USER_INLINE = /(?:^|\n+)\[pi-lens automated (?:check|context) — not a user request\][\s\S]*$/;
@@ -352,14 +341,14 @@ function messageKey(message: Message): string {
 	return JSON.stringify([message.role, serialized.text.trim()]);
 }
 
-function shortMessageHash(message: Message): string {
-	return createHash("sha256").update(messageKey(message)).digest("hex").slice(0, 16);
+function shortHash(key: string): string {
+	return createHash("sha256").update(key).digest("hex").slice(0, 16);
 }
 
-function toWarmItem(message: Exclude<Message, { role: "system" }>): WarmItem {
+function toWarmItem(message: Exclude<Message, { role: "system" }>, key = messageKey(message)): WarmItem {
 	const item: WarmItem = {
 		role: message.role,
-		key: shortMessageHash(message),
+		key: shortHash(key),
 	};
 	if (message.role === "user") {
 		item.userText = fullUserText(message.content);
@@ -371,7 +360,7 @@ export function nonHistoryKeys(messages: Message[]): string[] {
 	const out: string[] = [];
 	for (const message of persistentMessages(messages)) {
 		if (message.role === "system" || isHistorySummary(message)) continue;
-		out.push(shortMessageHash(message));
+		out.push(shortHash(messageKey(message)));
 	}
 	return out;
 }
@@ -531,29 +520,20 @@ function matchKeySuffix(
 	return null;
 }
 
-/** Split `messages` into the warm session's prefix and the new delta,
+/** Split the transcript into the warm session's prefix and the new delta,
  *  tolerating extension prompt decorations, transient injected messages, and
  *  context-compression summaries that replace older turns. */
-export function splitWarmTranscript(
-	messages: Message[],
+function splitWarmTranscript(
+	index: TranscriptIndex,
 	warm: { count: number; hash: string; keys?: readonly string[]; items?: readonly WarmItem[] },
 ): { prefix: Message[]; delta: Message[] } | null {
-	const direct = splitAtPersistentCount(messages, warm.count);
-	if (direct && fingerprint(direct.prefix) === warm.hash) {
+	const messages = index.messages;
+	const direct = index.splitAtPersistentCount(warm.count);
+	if (direct && index.prefixHash(warm.count) === warm.hash) {
 		return direct;
 	}
 
-	const body: BodyEntry[] = [];
-	for (let i = 0; i < messages.length; i++) {
-		const message = messages[i];
-		if (!message || isEphemeralMessage(message) || message.role === "system") continue;
-		body.push({
-			index: i,
-			item: toWarmItem(message),
-			isSummary: isHistorySummary(message),
-			isCompaction: isCompactionSummary(message),
-		});
-	}
+	const body = index.body();
 	let splitIdx: number | null = null;
 	if (warm.items && warm.items.length > 0) {
 		splitIdx = matchWarmItems(body, warm.items);
@@ -571,26 +551,123 @@ export function toolsKey(context: TranscriptContext): string {
 	return getCurrentTools(context.messages).map((tool) => tool.name).sort((a, b) => a.localeCompare(b)).join(",");
 }
 
+interface PersistentEntry {
+	index: number;
+	message: Message;
+	key?: string;
+}
+/** Per-turn memo of everything planning derives from the transcript, shared
+ *  by every warm-session candidate: message keys, prefix fingerprints, the
+ *  match body, the tool/system keys, and the full fresh input. Planning stays
+ *  linear in transcript size however many checkpoints are compared. */
+class TranscriptIndex {
+	readonly context: TranscriptContext;
+	readonly messages: Message[];
+	#persistent: PersistentEntry[] | undefined;
+	/** prefixHashes[k] = fingerprint of the first k persistent messages. */
+	#prefixHashes: string[] | undefined;
+	#body: BodyEntry[] | undefined;
+	#fresh: AcpInput | undefined;
+	#tools: string | undefined;
+	#systemPrompt: string | undefined;
+
+	constructor(context: TranscriptContext) {
+		this.context = context;
+		this.messages = context.messages;
+	}
+
+	/** Persistent (non-ephemeral) messages with their transcript index; the
+	 *  message key is computed on first use. */
+	persistent(): PersistentEntry[] {
+		this.#persistent ??= this.messages.flatMap((message, index) => (isEphemeralMessage(message) ? [] : [{ index, message }]));
+		return this.#persistent;
+	}
+
+	#key(entry: PersistentEntry): string {
+		entry.key ??= messageKey(entry.message);
+		return entry.key;
+	}
+
+	prefixHash(count: number): string | undefined {
+		const persistent = this.persistent();
+		if (count > persistent.length) return undefined;
+		if (!this.#prefixHashes) {
+			const hash = createHash("sha256");
+			const hashes = [hash.copy().digest("hex")];
+			for (const entry of persistent) {
+				hash.update(this.#key(entry)).update("\0");
+				hashes.push(hash.copy().digest("hex"));
+			}
+			this.#prefixHashes = hashes;
+		}
+		return this.#prefixHashes[count];
+	}
+
+	/** The first `count` persistent messages, and everything after them. */
+	splitAtPersistentCount(count: number): { prefix: Message[]; delta: Message[] } | null {
+		const persistent = this.persistent();
+		if (count > persistent.length) return null;
+		const last = count > 0 ? persistent[count - 1] : undefined;
+		return {
+			prefix: persistent.slice(0, count).map((entry) => entry.message),
+			delta: this.messages.slice(last ? last.index + 1 : 0),
+		};
+	}
+
+	body(): BodyEntry[] {
+		if (!this.#body) {
+			const body: BodyEntry[] = [];
+			for (const entry of this.persistent()) {
+				const message = entry.message;
+				if (message.role === "system") continue;
+				const item = toWarmItem(message, this.#key(entry));
+				body.push({ index: entry.index, item, isSummary: isHistorySummary(message), isCompaction: isCompactionSummary(message) });
+			}
+			this.#body = body;
+		}
+		return this.#body;
+	}
+
+	fresh(): AcpInput {
+		this.#fresh ??= freshInput(this.context);
+		return this.#fresh;
+	}
+
+	tools(): string {
+		this.#tools ??= toolsKey(this.context);
+		return this.#tools;
+	}
+
+	systemPrompt(): string {
+		this.#systemPrompt ??= getCurrentSystemPrompt(this.messages);
+		return this.#systemPrompt;
+	}
+}
+
 export type TurnPlan =
 	| { kind: "fresh"; input: AcpInput; reason: string }
 	| { kind: "warm"; sessionId: string; maxStepIdx?: number; input: AcpInput; fallback: AcpInput; deltaMessages: number };
 
-export function planTurn(context: TranscriptContext, cwd: string, warm: WarmSession | undefined): TurnPlan {
-	const fresh = (reason: string): TurnPlan => ({ kind: "fresh", input: freshInput(context), reason });
-	if (!warm) return fresh("no-session");
-	if (warm.cwd !== cwd) return fresh("cwd");
-	if (warm.tools !== toolsKey(context)) return fresh("tools");
-	const messages = context.messages;
-	const split = splitWarmTranscript(messages, warm);
-	if (!split) {
-		const persistent = persistentMessages(messages);
-		return fresh(persistent.length <= warm.count ? "history-shrank" : "history-diverged");
-	}
-	if (split.delta.length === 0) return fresh("history-shrank");
-	const delta = split.delta;
-	if (!delta.some((message) => message.role === "user")) return fresh("no-user-message");
+type WarmMatch = { warm: WarmSession; delta: Message[] } | { reason: string };
 
-	const systemPrompt = getCurrentSystemPrompt(messages);
+/** Whether `warm` can continue this transcript, and with which delta. */
+function matchWarm(index: TranscriptIndex, cwd: string, warm: WarmSession | undefined): WarmMatch {
+	if (!warm) return { reason: "no-session" };
+	if (warm.cwd !== cwd) return { reason: "cwd" };
+	if (warm.tools !== index.tools()) return { reason: "tools" };
+	const split = splitWarmTranscript(index, warm);
+	if (!split) {
+		return { reason: index.persistent().length <= warm.count ? "history-shrank" : "history-diverged" };
+	}
+	if (split.delta.length === 0) return { reason: "history-shrank" };
+	if (!split.delta.some((message) => message.role === "user")) return { reason: "no-user-message" };
+	return { warm, delta: split.delta };
+}
+
+function planFromMatch(index: TranscriptIndex, match: WarmMatch): TurnPlan {
+	if ("reason" in match) return { kind: "fresh", input: index.fresh(), reason: match.reason };
+	const { warm, delta } = match;
+	const systemPrompt = index.systemPrompt();
 	const systemChanged = systemPrompt !== warm.systemPrompt;
 	const visible = delta.filter((message) => message.role !== "system");
 	let input: AcpInput;
@@ -616,9 +693,31 @@ export function planTurn(context: TranscriptContext, cwd: string, warm: WarmSess
 		sessionId: warm.sessionId,
 		maxStepIdx: warm.maxStepIdx,
 		input,
-		fallback: freshInput(context),
+		fallback: index.fresh(),
 		deltaMessages: delta.length,
 	};
+}
+
+export function planTurn(context: TranscriptContext, cwd: string, warm: WarmSession | undefined): TurnPlan {
+	const index = new TranscriptIndex(context);
+	return planFromMatch(index, matchWarm(index, cwd, warm));
+}
+
+/** Plan against several remembered sessions (most preferred first): the one
+ *  with the smallest delta wins; with none usable, the first one's fresh
+ *  reason is reported. Inputs are built only for the winner. */
+export function planTurnFrom(context: TranscriptContext, cwd: string, candidates: readonly WarmSession[]): TurnPlan {
+	const index = new TranscriptIndex(context);
+	let best: Extract<WarmMatch, { warm: WarmSession }> | undefined;
+	for (const candidate of candidates) {
+		const match = matchWarm(index, cwd, candidate);
+		if ("reason" in match) continue;
+		if (!best || match.delta.length < best.delta.length) {
+			best = match;
+			if (best.delta.length === 1) break;
+		}
+	}
+	return planFromMatch(index, best ?? matchWarm(index, cwd, candidates[0]));
 }
 
 /** State after a completed turn: the session holds pi's persistent messages

@@ -12,17 +12,8 @@
 // StreamSanitizer buffers and strips these blocks statefully across streaming
 // deltas so they never leak into the user's transcript.
 
-export const START_MARKER = "The following is a <SYSTEM_MESSAGE>";
-export const END_MARKER = "</SYSTEM_MESSAGE>";
-
-export const SYSTEM_MESSAGE_RE =
-	/(?:\r?\n)?The following is a <SYSTEM_MESSAGE>[\s\S]*?<\/SYSTEM_MESSAGE>(?:\r?\n)?/g;
-
-/** Non-streaming sanitization for full text strings (result bodies, parked turns, transcripts). */
-export function sanitizeSystemMessage(text: string): string {
-	if (!text) return "";
-	return text.replace(SYSTEM_MESSAGE_RE, "");
-}
+const START_MARKER = "The following is a <SYSTEM_MESSAGE>";
+const END_MARKER = "</SYSTEM_MESSAGE>";
 
 /** Stateful streaming sanitizer that inspects and suppresses <SYSTEM_MESSAGE> blocks across chunks. */
 export class StreamSanitizer {
@@ -163,18 +154,5 @@ export class StreamSanitizer {
 			this.#emittedAny = true;
 		}
 		return remaining;
-	}
-
-	/** Peek at non-suppressed buffer contents without consuming them. */
-	peek(): string {
-		return this.#suppressing ? "" : this.#buffer;
-	}
-
-	/** Reset state. */
-	reset(): void {
-		this.#buffer = "";
-		this.#suppressedAcc = "";
-		this.#suppressing = false;
-		this.#emittedAny = false;
 	}
 }

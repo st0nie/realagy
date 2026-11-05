@@ -38,6 +38,13 @@ The catalog comes live from agy and depends on the account.
 
 Nothing runs in the background: quota is fetched only when you run `/agy usage`. There is no footer status, settings panel, engine switch, delegation tool, global MCP registration, or config file.
 
+## Interrupts and failures
+
+- Esc cancels the running Antigravity turn through ACP. agy keeps running, and the next prompt continues in the same session. agy is restarted only if it ignores the cancel for 10 seconds.
+- Starting a new prompt while Antigravity still waits on pi tool results (for example, after the tool calls were interrupted) ends that stale turn instead of waiting for it to time out.
+- If agy cannot start or exits mid-turn, the turn fails with the binary path, the exit code, and agy's last error line. The next prompt starts it again. A turn with no output for 5 minutes is stopped.
+- After `/reload`, `pi -c`, or `/tree`, realagy resumes the matching Antigravity session. If agy's copy of that conversation is gone, the next prompt starts a new session with the full pi transcript.
+
 | Environment | Effect |
 | --- | --- |
 | `AGY_BIN` | Path to the `agy` binary |
@@ -50,13 +57,14 @@ Nothing runs in the background: quota is fetched only when you run `/agy usage`.
 | --- | --- |
 | `extensions/index.ts` | Composition root: pi MCP bridge, `antigravity/*` models, agy discovery, `/agy setup`, `/agy usage` |
 | `src/provider.ts` | pi assistant event stream, MCP → `toolUse` → `toolResult` round-trips, usage mapping |
-| `src/transcript.ts` | Transcript serialization, fingerprints, warm-session turn planning |
+| `src/transcript.ts` | Transcript serialization, fingerprints, warm-session turn planning across checkpoints |
 | `src/models.ts` | ACP model catalog parsing, effort grouping, family limits, offline fallback catalog |
 | `src/mcp-server.ts`, `src/bridge-catalog.ts` | Loopback, token-protected MCP server for pi's active tools |
 | `src/quota.ts`, `src/usage-trace.ts` | Cache/quota meter, quota-exhaustion notice, usage diagnostics |
 | `src/acp/setup.ts` | Finding `agy` and its data dir |
 | `src/acp/connection.ts`, `driver.ts`, `events.ts`, `jsonrpc.ts` | `agy acp` process, ACP protocol, serialized turns, frame mapping |
-| `src/acp/step-usage.ts` | Exact per-model-call tokens from agy's conversation store |
+| `src/acp/step-usage.ts` | Exact per-model-call tokens from agy's conversation store, and `/tree` forks of it |
+| `src/stream-sanitizer.ts`, `src/frame-guard.ts`, `src/redact.ts` | Hiding injected `<SYSTEM_MESSAGE>` blocks, dropping stdout noise, redacting secrets from logs and errors |
 | `tests/` | Vitest suites; `tests/helpers/fake-acp-server.mjs` stands in for agy |
 | `scripts/` | Live smokes and probes (spend account quota) |
 

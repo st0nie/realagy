@@ -8,13 +8,11 @@ import { AcpDriver } from "../src/acp/driver.js";
 import { fetchCliUsage, UsageMeter } from "../src/quota.js";
 import type { AcpSessions } from "../src/provider.js";
 import { defaultConversationsDir } from "../src/acp/step-usage.js";
-import { resolveAcpBinary } from "../src/acp/connection.js";
 import { ensureAgyReady, MANUAL_SETUP, resolveAgyBinary } from "../src/acp/setup.js";
-import { bridgedPiTools } from "../src/bridge-catalog.js";
+import { bridgedPiTools, bridgeInputSchema } from "../src/bridge-catalog.js";
 import { startMcpServer, TOKEN_HEADER, type McpServerHandle } from "../src/mcp-server.js";
 import { entriesFromAcpModels, FALLBACK_MODELS, toPiModel, type AgyModelEntry } from "../src/models.js";
 import { createStreamSimple, POLL_TOOL_NAME, ToolRoundTrips } from "../src/provider.js";
-import { normalizeSchema } from "../src/schema.js";
 import { restoreWarmSessions, WARM_SESSION_ENTRY, type SessionEntryLike, type WarmSession } from "../src/transcript.js";
 const SIGN_IN = [
 	"Sign in with the Antigravity CLI in a terminal (realagy never handles credentials):",
@@ -25,7 +23,9 @@ const SIGN_IN = [
 
 export default async function (pi: ExtensionAPI): Promise<void> {
 	const entries: AgyModelEntry[] = [...FALLBACK_MODELS];
-	let bin = resolveAcpBinary("");
+	// Re-resolved by /agy setup; a missing binary fails the spawn with a
+	// pointer to /agy setup.
+	let bin = resolveAgyBinary() ?? "agy";
 	let bridge: McpServerHandle | null = null;
 	let stopped = false;
 	const shutdownController = new AbortController();
@@ -50,14 +50,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const activeTools = () => bridgedPiTools(pi.getAllTools(), pi.getActiveTools());
 	const started = await startMcpServer({
 		listTools: () => [
-			...activeTools().map((tool) => {
-				let inputSchema: Record<string, unknown> = { type: "object", properties: {}, additionalProperties: true };
-				try {
-					if (tool.parameters) inputSchema = JSON.parse(JSON.stringify(tool.parameters)) as Record<string, unknown>;
-				} catch { /* retain the permissive schema */ }
-				inputSchema = normalizeSchema(inputSchema);
-				return { name: tool.name, description: tool.description ?? tool.name, inputSchema };
-			}),
+			...activeTools().map((tool) => ({
+				name: tool.name,
+				description: tool.description ?? tool.name,
+				inputSchema: bridgeInputSchema(tool.parameters),
+			})),
 			{
 				name: POLL_TOOL_NAME,
 				description: "Fetch a slow pi tool result using the callId from a STILL RUNNING response.",
@@ -168,7 +165,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		sessions.warm = undefined;
 		sessions.checkpoints = undefined;
 		roundTrips.failAll("pi session shut down");
-		void driver.close("shutdown");
+		void driver.close();
 		if (bridge) void bridge.close();
 		bridge = null;
 	});
