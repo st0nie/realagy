@@ -281,8 +281,6 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				ctx.ui.notify(status.ok ? "Antigravity is still starting; try again shortly." : `Antigravity: ${status.error}. Run /agy setup for install steps.`, "warning");
 				return;
 			}
-			// Show session cache stats immediately while fetching fresh plan quota.
-			ctx.ui.notify(`${meter.report()}\n\nLoading plan quota from agy…`, "info");
 			let quotaError = "";
 			const loaded = await runWithLoader(ctx, "Loading Antigravity plan quota…", async (signal) => {
 				try {

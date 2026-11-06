@@ -222,8 +222,12 @@ export async function fetchCliUsage(
 	});
 }
 
-/** Remaining share, rounded DOWN to 0.1% so a slightly used bucket never
- *  reads 100% (a few prompts can be ~1% of a large weekly quota). */
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const BAR_WIDTH = 25;
+const LABEL_WIDTH = 20;
+const USED_WIDTH = 10;
+
+/** Share rounded DOWN to 0.1%. */
 function percent(fraction: number): string {
 	const clamped = Math.min(1, Math.max(0, fraction));
 	if (clamped >= 1) return "100%";
@@ -231,11 +235,78 @@ function percent(fraction: number): string {
 	return `${Number.isInteger(tenths) ? tenths : tenths.toFixed(1)}%`;
 }
 
+/** Used share from `remainingFraction`, rounded UP to 0.1% so a slightly used
+ *  bucket never reads `0% used` (and a non-empty bucket never reads `100% used`). */
+function usedPercent(remainingFraction: number): string {
+	const clamped = Math.min(1, Math.max(0, remainingFraction));
+	if (clamped >= 1) return "0%";
+	if (clamped <= 0) return "100%";
+	const usedTenths = Math.min(999, Math.max(1, 1000 - Math.floor(clamped * 1000 + 1e-9)));
+	const tenths = usedTenths / 10;
+	return `${Number.isInteger(tenths) ? tenths : tenths.toFixed(1)}%`;
+}
+
+function usageBar(remainingFraction: number, width = BAR_WIDTH): string {
+	const clamped = Math.min(1, Math.max(0, remainingFraction));
+	const used = 1 - clamped;
+	const filled = Math.min(width, Math.max(0, Math.round(used * width)));
+	return `${"━".repeat(filled)}${"─".repeat(width - filled)}`;
+}
+
+function formatCountdown(diffMs: number): string {
+	const totalMinutes = Math.max(1, Math.round(diffMs / 60_000));
+	if (totalMinutes >= 1440) {
+		const days = Math.floor(totalMinutes / 1440);
+		const hours = Math.floor((totalMinutes % 1440) / 60);
+		return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+	}
+	if (totalMinutes >= 60) {
+		const hours = Math.floor(totalMinutes / 60);
+		const minutes = totalMinutes % 60;
+		return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+	}
+	return `${totalMinutes}m`;
+}
+
 export function formatReset(iso: string, now = new Date()): string | undefined {
 	const reset = new Date(iso);
 	if (Number.isNaN(reset.getTime())) return undefined;
 	const time = `${String(reset.getHours()).padStart(2, "0")}:${String(reset.getMinutes()).padStart(2, "0")}`;
-	return reset.toDateString() === now.toDateString() ? time : `${reset.getDate()} ${MONTHS[reset.getMonth()]} ${time}`;
+	const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+	const startOfReset = new Date(reset.getFullYear(), reset.getMonth(), reset.getDate()).getTime();
+	const dayDiff = Math.round((startOfReset - startOfToday) / 86_400_000);
+	let dayLabel: string;
+	if (dayDiff === 0) dayLabel = `today ${time}`;
+	else if (dayDiff === 1) dayLabel = `tomorrow ${time}`;
+	else if (dayDiff > 1 && dayDiff <= 7) dayLabel = `${WEEKDAYS[reset.getDay()]} ${time}`;
+	else dayLabel = `${WEEKDAYS[reset.getDay()]}, ${reset.getDate()} ${MONTHS[reset.getMonth()]} ${time}`;
+	const diffMs = reset.getTime() - now.getTime();
+	return diffMs > 0 ? `${dayLabel} (in ${formatCountdown(diffMs)})` : dayLabel;
+}
+
+function isFiveHourWindow(window: string): boolean {
+	return window === "5h" || window.endsWith("-5h");
+}
+
+function isWeeklyWindow(window: string): boolean {
+	return window === "weekly" || window.endsWith("-weekly");
+}
+
+function bucketLabel(window: string): string {
+	if (isFiveHourWindow(window)) return "Current session (5h)";
+	if (isWeeklyWindow(window)) return "This week";
+	return window;
+}
+
+function bucketOrder(window: string): number {
+	if (isFiveHourWindow(window)) return 0;
+	if (isWeeklyWindow(window)) return 1;
+	return 2;
+}
+
+function groupHeader(group: UsageGroup): string {
+	const models = group.description.replace(/^Models within this group:\s*/i, "").trim();
+	return models ? `${group.name} · ${models}` : group.name;
 }
 
 /** Per-extension accumulator behind `/agy usage`. */
@@ -269,15 +340,31 @@ export class UsageMeter {
 	report(now = new Date()): string {
 		const lines: string[] = [];
 		lines.push(this.prompt > 0
-			? `Cache hits: ${percent(this.lastHitRate ?? 0)} latest · ${percent(this.cacheRead / this.prompt)} this session (${this.cacheRead} of ${this.prompt} prompt tokens)`
+			? `Cache hits: ${percent(this.lastHitRate ?? 0)} latest · ${percent(this.cacheRead / this.prompt)} this session (${this.cacheRead.toLocaleString("en-US")} / ${this.prompt.toLocaleString("en-US")} prompt tokens)`
 			: "Cache hits: no measured Antigravity calls yet");
-		if (this.exhausted) lines.push(`Quota exhausted${this.exhausted.resetAt ? ` · resets ${formatReset(this.exhausted.resetAt, now)}` : ""}`);
+		if (this.exhausted) {
+			const reset = this.exhausted.resetAt ? formatReset(this.exhausted.resetAt, now) : undefined;
+			lines.push(`Quota exhausted${reset ? ` · Resets ${reset}` : ""}`);
+		}
 		for (const group of this.quota ?? []) {
-			lines.push("", group.name);
-			for (const bucket of group.buckets) {
-				const reset = bucket.resetTime ? formatReset(bucket.resetTime, now) : undefined;
-				lines.push(`  ${bucket.window}: ${percent(bucket.remainingFraction)} left${reset ? ` · resets ${reset}` : ""}`);
-			}
+			lines.push("", groupHeader(group));
+			const buckets = [...group.buckets].sort((a, b) => bucketOrder(a.window) - bucketOrder(b.window));
+			buckets.forEach((bucket, index) => {
+				if (index > 0) lines.push("");
+				const label = bucketLabel(bucket.window).padEnd(LABEL_WIDTH);
+				const bar = usageBar(bucket.remainingFraction);
+				const used = `${usedPercent(bucket.remainingFraction)} used`.padStart(USED_WIDTH);
+				lines.push(`  ${label}  ${bar}  ${used}`);
+				if (bucket.remainingFraction >= 1) {
+					lines.push(isFiveHourWindow(bucket.window) ? "  Starts with your first message" : "  Quota available");
+				} else if (bucket.remainingFraction <= 0) {
+					const reset = bucket.resetTime ? formatReset(bucket.resetTime, now) : undefined;
+					lines.push(`  Quota exhausted${reset ? ` · Resets ${reset}` : ""}`);
+				} else if (bucket.resetTime) {
+					const reset = formatReset(bucket.resetTime, now);
+					if (reset) lines.push(`  Resets ${reset}`);
+				}
+			});
 		}
 		return lines.join("\n");
 	}

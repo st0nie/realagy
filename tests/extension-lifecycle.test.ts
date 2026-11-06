@@ -123,7 +123,7 @@ describe("extension session lifecycle", () => {
 		expect(session.ui.notify).not.toHaveBeenCalled();
 	});
 
-	it("registers /agy with usage completion, immediate loading notice, and final report", async () => {
+	it("registers /agy with usage completion and notifies only after fresh quota resolves", async () => {
 		const quota = deferred<never[]>();
 		mocks.ensure.mockReturnValue({ ok: true, bin: "agy" });
 		mocks.listModels.mockResolvedValue([]);
@@ -136,10 +136,11 @@ describe("extension session lifecycle", () => {
 		expect(agy.getArgumentCompletions("x")).toBeNull();
 		await vi.waitFor(() => expect(mocks.listModels).toHaveBeenCalled());
 		const pending = agy.handler("usage", session.ctx);
-		expect(session.ui.notify).toHaveBeenCalledWith("REPORT\n\nLoading plan quota from agy…", "info");
+		expect(session.ui.notify).not.toHaveBeenCalled();
 		expect(mocks.fetchCliUsage).toHaveBeenCalledWith("agy", expect.objectContaining({ pid: 4242 }));
 		quota.resolve([]);
 		await pending;
+		expect(session.ui.notify).toHaveBeenCalledTimes(1);
 		expect(session.ui.notify).toHaveBeenLastCalledWith("REPORT", "info");
 	});
 

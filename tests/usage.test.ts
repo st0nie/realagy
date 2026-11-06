@@ -217,18 +217,26 @@ test("findAcpHttpPort extracts the HTTP port from acp-server logs and ignores HT
 	assert.equal(findAcpHttpPort(-1, logDir), undefined);
 });
 
-test("usage meter reports cache hits and every quota group", () => {
+test("usage meter reports cache hits and every quota group in Claude style", () => {
 	const meter = new UsageMeter();
 	assert.match(meter.report(), /no measured Antigravity calls/);
 	meter.addSteps({ input: 1000, output: 10, cacheRead: 0, cacheWrite: 0, contextTokens: 1010, steps: 1 });
 	meter.addSteps({ input: 100, output: 10, cacheRead: 900, cacheWrite: 0, contextTokens: 1010, steps: 1 });
 	meter.setQuota(parseCliUsage(CLI_USAGE));
-	const report = meter.report(new Date(Date.UTC(2026, 10, 5)));
-	assert.match(report, /Cache hits: 90% latest · 45% this session/);
-	assert.match(report, /Claude and GPT models\n  weekly: 44% left/);
-	assert.match(report, /Gemini 4 Argon\n  weekly: 98\.8% left/, "never rounds a used bucket up to 100%");
-	meter.setExhausted({});
-	assert.match(meter.report(), /Quota exhausted/);
+	const now = new Date(Date.UTC(2026, 10, 5, 12, 0));
+	const report = meter.report(now);
+	assert.match(report, /Cache hits: 90% latest · 45% this session \(900 \/ 2,000 prompt tokens\)/);
+	assert.match(report, /Gemini Models\n  Current session \(5h\)  ─────────────────────────     0% used\n  Starts with your first message\n\n  This week             ━━━━━━━──────────────────    29% used\n  Resets Wednesday \d{2}:\d{2} \(in 6d\)/);
+	assert.match(report, /Claude and GPT models\n  This week             ━━━━━━━━━━━━━━───────────    56% used/);
+	assert.match(report, /Gemini 4 Argon\n  This week             ─────────────────────────   1\.2% used/, "never rounds a slightly used bucket down to 0%");
+
+	meter.setQuota(parseCliUsage(ACP_RPC_USAGE));
+	const rpcReport = meter.report(new Date(Date.UTC(2026, 10, 6, 7, 22, 36)));
+	assert.match(rpcReport, /Gemini Models · Gemini Flash, Gemini Pro\n  Current session \(5h\)  ━━───────────────────────   6\.6% used\n  Resets today \d{2}:\d{2} \(in 58m\)\n\n  This week             ━────────────────────────   2\.7% used\n  Resets (?:Thursday|Friday) \d{2}:\d{2} \(in 6d 10h\)/);
+	assert.match(rpcReport, /Claude and GPT models · Claude Opus, Claude Sonnet, GPT-OSS\n  This week             ━━━━━━━━━━━━━━━━━━━━━━━━━   100% used\n  Quota exhausted/);
+
+	meter.setExhausted({ resetAt: new Date(now.getTime() + 2 * 3_600_000).toISOString() });
+	assert.match(meter.report(now), /Quota exhausted · Resets (?:today|tomorrow) \d{2}:\d{2} \(in 2h\)/);
 });
 
 test("fetchCliUsage queries live agy acp ConnectRPC HTTP port and falls back to CLI on failure", async () => {
