@@ -1,11 +1,14 @@
 // Minimal realagy provider: official ACP transport, pi-native tools.
 // There is intentionally no config panel, stream-json engine, delegation tool,
-// or global MCP registration. agy keeps its own tools; a system-prompt policy
-// steers the model to pi's tools, and agy's own tool use stays visible.
+// or global MCP registration. agy runs realagy's hidden agent profile, which
+// replaces agy's own prompt and tools with pi's (src/agent-profile.ts); without
+// it, a system-prompt policy steers the model to pi's tools, and agy's own
+// tool use stays visible.
 
 import { createProvider } from "@earendil-works/pi-ai";
 import { BorderedLoader, type ExtensionAPI, type ExtensionCommandContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { AcpDriver } from "../src/acp/driver.js";
+import { agentProfileEnabled, installAgentProfile } from "../src/agent-profile.js";
 import { backgroundMessageText, defaultBrainDir } from "../src/acp/background.js";
 import { AGY_BACKGROUND_MESSAGE, renderBackgroundCard, type BackgroundCardDetails } from "../src/background-card.js";
 import { fetchCliUsage, UsageMeter } from "../src/quota.js";
@@ -67,7 +70,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		// Exact per-call usage comes from the server's conversation store;
 		// unmeasured messages are left to pi's own transcript estimate.
 		conversationsDir: () => defaultConversationsDir(),
-		systemPrompt: () => toolPolicyPrompt(bridgedTools().map((tool) => tool.name)),
+		systemPrompt: (agent) => toolPolicyPrompt(bridgedTools().map((tool) => tool.name), { profile: agent !== undefined }),
+		// Every bridged tool (and the poll helper) is marked eager in the
+		// profile; without the bridge, agy's default agent keeps its own tools.
+		agent: () =>
+			bridge && agentProfileEnabled()
+				? installAgentProfile([...bridgedTools().map((tool) => tool.name), POLL_TOOL_NAME])
+				: undefined,
 		onNativeTool: (event) => workPanel.update(event),
 		brainDir: () => defaultBrainDir(),
 		// Finished background work wakes pi's agent: an idle agent starts a

@@ -4,6 +4,8 @@ import readline from "node:readline";
 const capture = process.argv[2];
 const record = (message) => fs.appendFileSync(capture, JSON.stringify(message) + "\n");
 const send = (message) => process.stdout.write(JSON.stringify(message) + "\n");
+// FAKE_ACP_RECORD_ARGV: record the server's extra argv (e.g. --agent NAME).
+if (process.env.FAKE_ACP_RECORD_ARGV) record({ method: "argv", params: { argv: process.argv.slice(3) } });
 const result = (id, value) => send({ jsonrpc: "2.0", id, result: value });
 const fail = (id, code, message) => send({ jsonrpc: "2.0", id, error: { code, message } });
 const update = (sessionId, value) => send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: value } });

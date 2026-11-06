@@ -8,7 +8,7 @@ import { BackgroundMessages, backgroundMessageText, noticeFromMessage, type Back
 import { acpMode, AcpDriver, type AcpDriverOptions } from "../src/acp/driver.js";
 import type { DriverActivity, DriverTurnRequest, TurnHandle } from "../src/driver-types.js";
 import { AgyWorkPanel, formatDuration, nativeToolLabel, nativeToolLine, nativeToolTarget, type PanelHost, type PanelStyle, type PanelWidget, type NativeToolEvent } from "../src/native-tools.js";
-import { toolPolicyPrompt } from "../src/tool-policy.js";
+import { PLAIN_PATHS_RULE, toolPolicyPrompt } from "../src/tool-policy.js";
 
 type WireRequest = { id?: number; method: string; params: Record<string, unknown> };
 
@@ -51,7 +51,59 @@ test("tool policy names the active pi tools and is absent without them", () => {
 	assert.match(policy, /Do not use your built-in run_command, read_file, write_file, edit_file tools/);
 	assert.match(policy, /do not start subagents, the browser agent, background tasks, or scheduled tasks \(invoke_subagent, define_subagent, manage_subagents, schedule, manage_task\)/);
 	assert.match(policy, /only for a job no pi tool can do/);
-	assert.equal(toolPolicyPrompt([]), undefined);
+	// agy's default prompt demands file:// links; the policy overrides it.
+	assert.match(policy, /replaces your communication_style and artifacts rules on file links/);
+	assert.match(policy, /Never use file:\/\/ URLs or Markdown links for local files or code symbols/);
+	assert.equal(toolPolicyPrompt([]), PLAIN_PATHS_RULE);
+});
+
+test("with the agent profile the policy only names the pi tools", () => {
+	const policy = toolPolicyPrompt(["read", "bash", "read"], { profile: true });
+	assert.ok(policy);
+	assert.match(policy, /^read, bash$/m);
+	assert.match(policy, /mcp_pi-bridge_<name>/);
+	assert.doesNotMatch(policy, /run_command|file:\/\//);
+	assert.equal(toolPolicyPrompt([], { profile: true }), undefined);
+});
+
+test("the agent profile is passed as --agent, the policy learns it, and a changed profile respawns agy", async () => {
+	let agent: string | undefined = "realagy-aaaaaaaaaaaa";
+	const seen: Array<string | undefined> = [];
+	const { driver, wire, logs } = fixture({ FAKE_ACP_RECORD_ARGV: "1" }, () => ({
+		agent: () => agent,
+		systemPrompt: (current) => {
+			seen.push(current);
+			return `POLICY ${current ?? "default"}`;
+		},
+	}));
+	try {
+		await drain(await driver.run({ ...base, prompt: "one" }));
+		const firstPid = driver.pid;
+		await drain(await driver.run({ ...base, prompt: "two" }));
+		assert.equal(driver.pid, firstPid, "an unchanged profile keeps the process");
+		agent = "realagy-bbbbbbbbbbbb";
+		await drain(await driver.run({ ...base, prompt: "three" }));
+		assert.notEqual(driver.pid, firstPid, "a changed profile respawns agy");
+		assert.ok(logs.includes("agent-changed"));
+		const argv = wire().filter((request) => request.method === "argv").map((request) => request.params.argv);
+		assert.deepEqual(argv, [["--agent", "realagy-aaaaaaaaaaaa"], ["--agent", "realagy-bbbbbbbbbbbb"]]);
+		const appends = wire().filter((request) => request.method === "session/new").map((request) => (request.params._meta as any).antigravity.systemPrompt.append);
+		assert.deepEqual(appends, ["POLICY realagy-aaaaaaaaaaaa", "POLICY realagy-aaaaaaaaaaaa", "POLICY realagy-bbbbbbbbbbbb"]);
+		assert.ok(seen.every((value) => value !== undefined));
+	} finally {
+		await driver.close();
+	}
+});
+
+test("without a profile agy runs its default agent", async () => {
+	const { driver, wire } = fixture({ FAKE_ACP_RECORD_ARGV: "1" }, () => ({ agent: () => undefined, systemPrompt: (agent) => `POLICY ${agent ?? "default"}` }));
+	try {
+		await drain(await driver.run({ ...base, prompt: "one" }));
+		assert.deepEqual(wire().find((request) => request.method === "argv")?.params.argv, []);
+		assert.equal((wire().find((request) => request.method === "session/new")?.params._meta as any).antigravity.systemPrompt.append, "POLICY default");
+	} finally {
+		await driver.close();
+	}
 });
 
 test("native call labels, durations, and lines", () => {

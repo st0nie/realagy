@@ -20,6 +20,7 @@ Protocol tests run against `tests/helpers/fake-acp-server.mjs` instead of agy. I
 | prompt text containing `[hang]` | The prompt never ends on its own; a `session/cancel` notification ends it with `stopReason: "cancelled"` |
 | prompt text containing `[silent-cancel]` | Like `[hang]`, but `session/cancel` is ignored, which exercises the teardown safety net |
 | `session/set_config_option` mode | Only agy 1.5's advertised modes (`default`, `accept-edits`, `plan`); others fail with `-32602 Unknown mode` |
+| `FAKE_ACP_RECORD_ARGV` | Records the server's extra argv (such as `--agent <name>`) as a request with method `argv` |
 | `FAKE_ACP_BRAIN_DIR` | Where background work reports completion, as agy does in `brain/<sessionId>/.system_generated/messages/<id>.json` |
 | any prompt | Echoed as `user_message_chunk` first, after the leftovers of earlier background work, as agy does; `[no-echo]` skips the echo |
 | prompt text containing `[native]` | agy's own `read_file` (completed) and `run_command` (failed) plus one `mcp_pi-bridge_bash` call |
@@ -44,15 +45,17 @@ REALAGY_TRACE_USAGE=/tmp/trace.jsonl pi      # turn plans, usage_update, step to
 
 ## Conventions
 
-- Keep the extension minimal: one command (`/agy setup`, `/agy usage`), no installers, sign-in flows, config panel, fallback engine, delegation framework, or global agy/MCP mutation.
-- agy decides which tools to use, its own or pi's. Pi owns the transcript and rendering.
+- Keep the extension minimal: one command (`/agy setup`, `/agy usage`), no installers, sign-in flows, config panel, fallback engine, delegation framework, or global agy/MCP mutation. The one exception is realagy's hidden agent profile in `~/.gemini/config/agents/realagy-<hash>.md` (`src/agent-profile.ts`): it affects only processes started with `--agent`, and stale copies are pruned.
+- Under the profile the model has only pi's tools; without it (`REALAGY_AGY_PROFILE=0`) agy decides which tools to use, its own or pi's. Pi owns the transcript and rendering.
 - Small functional modules, explicit types, early returns.
-- `agy acp` ignores `enabledTools`/`disabledTools`, so realagy sends neither. `eagerMcpServers: ["pi-bridge"]` avoids agy's lazy `call_mcp_tool` loop.
+- `agy acp` ignores `enabledTools`/`disabledTools`, so realagy sends neither. `eagerMcpServers: ["pi-bridge"]` avoids agy's lazy `call_mcp_tool` loop under the default agent; a custom agent ignores it, so the profile lists every bridged tool as `eager`.
 - agy refuses native reads inside its own data dir (`~/.gemini`), so never hand the model files there.
 - Never write estimates or turn-cumulative totals into `usage.totalTokens`. See [architecture.md](architecture.md#usage-context-and-quota).
 - Background work in `extensions/index.ts` checks the shutdown flag after every `await` before touching `ctx` or `pi`. Pi replaces the extension runtime on `/new`, `/resume`, `/fork`, and `/reload`.
 
 ## Pitfalls
+
+- agy's ACP `_meta.antigravity.systemPrompt` supports only `append`; replacing the prompt needs a custom agent (`--agent`, per process). agy loads only Markdown agents, `mcpServers` only in list form (`- name: pi-bridge`), tool `eager` flags only per name (no wildcard), and `tools:` only accepts agy's registry tool names (an MCP name makes every turn fail). Inspect the real system prompt in the `gen_metadata` blob of `<sessionId>.db`.
 
 - An aborted `npm install` leaves a corrupt `node_modules`, and `tsc`/`vitest` then die with "Bus error". Delete `node_modules` and run `bun install`.
 - `node:sqlite` prints an ExperimentalWarning on Node 22. `src/acp/step-usage.ts` silences it for that one `require`, because it would corrupt pi's TUI.
