@@ -3,12 +3,16 @@
 // store, and the extension wiring depend on this interface only, so tests can
 // substitute a scripted driver.
 
+import type { NativeToolResult } from "./native-tools.js";
 export interface DriverTurnRequest {
 	cwd: string;
 	/** Base model slug (effort tier separate) or the exact ACP model id. */
 	model: string;
 	effort?: string;
-	mode: string;
+	/** pi's agent mode: "plan" maps to agy's `plan` mode, "default" to
+	 *  `accept-edits` with skipPermissions, else agy's `default`. */
+	mode: "default" | "plan";
+	/** Approve agy's permission requests for its native tools. */
 	skipPermissions: boolean;
 	/** ACP session to continue: reused when live in the current process,
 	 *  otherwise resumed (or loaded); a lost session falls back to a new one. */
@@ -66,6 +70,9 @@ export type DriverActivity =
 			diff?: { path: string; oldText?: string; newText: string };
 	  }
 	| { type: "tool_error"; toolCallId: string; name: string; message: string; mcpServer?: string }
+	/** One of agy's own tool calls finished, or was still running when the
+	 *  prompt ended (pi tool calls over the bridge are excluded). */
+	| ({ type: "native_tool"; toolCallId: string } & NativeToolResult)
 	/** Turn-cumulative PromptResponse.usage. */
 	| { type: "usage"; usage: AgyUsage }
 	| { type: "context_usage"; contextUsage: AgyContextUsage }

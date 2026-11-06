@@ -13,6 +13,18 @@ const update = (sessionId, value) => send({ jsonrpc: "2.0", method: "session/upd
 const dbDir = process.env.FAKE_ACP_DB_DIR;
 // FAKE_ACP_RESUME: advertise and answer session/resume, as agy 1.5 does.
 const canResume = Boolean(process.env.FAKE_ACP_RESUME);
+// FAKE_ACP_BRAIN_DIR: where background work reports completion, like agy's
+// brain/<sessionId>/.system_generated/messages/<id>.json.
+const brainDir = process.env.FAKE_ACP_BRAIN_DIR;
+/** sessionId → frames agy buffered while no prompt ran (sent at the next
+ *  prompt's start, before the prompt echo). */
+const leftovers = new Map();
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+function writeMessage(sessionId, message) {
+	const dir = `${brainDir}/${sessionId}/.system_generated/messages`;
+	fs.mkdirSync(dir, { recursive: true });
+	fs.writeFileSync(`${dir}/msg-${Date.now()}-${Math.random().toString(16).slice(2)}.json`, JSON.stringify({ recipient: sessionId, priority: "MESSAGE_PRIORITY_HIGH", timestamp: new Date().toISOString(), ...message }));
+}
 let sessionCount = 0;
 /** sessionId → request id of a prompt waiting for session/cancel. */
 const hanging = new Map();
@@ -81,6 +93,49 @@ rl.on("line", async (line) => {
 	}
 	if (method === "session/prompt") {
 		const text = params.prompt.map((block) => block.text ?? block.resource?.text ?? "").join("\n");
+		const sid = params.sessionId;
+		// Like agy: leftovers of finished background work first, then the
+		// prompt echo, then the live turn.
+		const pending = leftovers.get(sid);
+		for (const frame of pending ?? []) update(sid, frame);
+		// agy sends session status before the echo too; it is current, not a leftover.
+		if (pending) update(sid, { sessionUpdate: "usage_update", used: 1234, size: 100000 });
+		leftovers.delete(sid);
+		if (!text.includes("[no-echo]")) update(sid, { sessionUpdate: "user_message_chunk", content: { type: "text", text } });
+		// [invalid]: agy's retry notice after a malformed model tool call.
+		if (text.includes("[invalid]")) update(sid, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n⚠ Model produced invalid output.\n" } });
+		if (text.includes("[native]")) {
+			update(sid, { sessionUpdate: "tool_call", toolCallId: "n1", name: "read_file", args: { Path: "/w/a.txt" }, status: "in_progress", kind: "read", title: "File a.txt", rawInput: { Path: "/w/a.txt" } });
+			update(sid, { sessionUpdate: "tool_call_update", toolCallId: "n1", name: "read_file", status: "completed", kind: "read", title: "File a.txt" });
+			update(sid, { sessionUpdate: "tool_call", toolCallId: "n2", name: "run_command", args: { CommandLine: "false" }, status: "in_progress", kind: "execute", title: "false", rawInput: { CommandLine: "false" } });
+			update(sid, { sessionUpdate: "tool_call_update", toolCallId: "n2", name: "run_command", status: "failed", kind: "execute", title: "false", rawOutput: { output: "" } });
+			update(sid, { sessionUpdate: "tool_call", toolCallId: "b1", name: "mcp_pi-bridge_bash", args: { command: "ls" }, status: "in_progress", kind: "other", title: "Run mcp_pi-bridge_bash", rawInput: { command: "ls" } });
+			update(sid, { sessionUpdate: "tool_call_update", toolCallId: "b1", name: "mcp_pi-bridge_bash", status: "completed", kind: "other", title: "Run mcp_pi-bridge_bash" });
+		}
+		const slow = /\[native-slow:(\d+)\]/.exec(text);
+		if (slow) {
+			update(sid, { sessionUpdate: "tool_call", toolCallId: "s1", name: "run_command", args: { CommandLine: "make" }, status: "in_progress", kind: "execute", title: "make", rawInput: { CommandLine: "make" } });
+			// [overlap]: a quick call ends while the slow one still runs.
+			if (text.includes("[overlap]")) update(sid, { sessionUpdate: "tool_call", toolCallId: "q1", name: "read_file", args: { Path: "/w/q" }, status: "in_progress", kind: "read", title: "File q", rawInput: { Path: "/w/q" } });
+			if (text.includes("[overlap]")) update(sid, { sessionUpdate: "tool_call_update", toolCallId: "q1", name: "read_file", status: "completed", kind: "read", title: "File q" });
+			await sleep(Number(slow[1]));
+			update(sid, { sessionUpdate: "tool_call_update", toolCallId: "s1", name: "run_command", status: "completed", kind: "execute", title: "make", rawOutput: { output: "Command exited with code 0." } });
+		}
+		if (text.includes("[background]")) {
+			update(sid, { sessionUpdate: "tool_call", toolCallId: "bg1", name: "run_command", args: { CommandLine: "sleep 1; echo FINISHED" }, status: "in_progress", kind: "execute", title: "sleep 1; echo FINISHED", rawInput: { CommandLine: "sleep 1; echo FINISHED" } });
+			setTimeout(() => {
+				writeMessage(sid, { sender: `${sid}/task-1`, renderDetails: { messageTitle: "Sleep task finished" }, content: "Command exited with code 0.\n\nCommand output:\ntick\r\nFINISHED\r\n\nLog: file:///tmp/task-1.log", sourceMetadata: { tool: { toolCall: { id: "bg1", name: "run_command" } } } });
+				leftovers.set(sid, [
+					{ sessionUpdate: "tool_call_update", toolCallId: "bg1", name: "run_command", status: "completed", kind: "execute", title: "sleep 1; echo FINISHED", rawOutput: { output: "FINISHED" } },
+					{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "LEFTOVER" } },
+				]);
+			}, 50);
+		}
+		if (text.includes("[subagent]")) {
+			update(sid, { sessionUpdate: "tool_call", toolCallId: "sa1", name: "invoke_subagent", args: { Role: "Checker", Prompt: "check" }, status: "in_progress", kind: "other", title: "Run invoke_subagent", rawInput: { Role: "Checker", Prompt: "check" } });
+			update(sid, { sessionUpdate: "tool_call_update", toolCallId: "sa1", name: "invoke_subagent", status: "completed", kind: "other", title: "Run invoke_subagent" });
+			setTimeout(() => writeMessage(sid, { sender: "sub-1", renderDetails: { messageTitle: "Message from Checker (research)" }, content: "all good" }), 50);
+		}
 		if (text.includes("[exit]")) {
 			process.stderr.write("fatal: fake server crashed\n");
 			process.exit(3);

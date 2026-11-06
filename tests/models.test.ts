@@ -36,6 +36,8 @@ test("pi model metadata matches live family limits and image/reasoning support",
 	const gpt = toPiModel(entries.find((entry) => entry.id === "gpt-oss-120b")!);
 	assert.equal(gpt.contextWindow, 131_072);
 	assert.equal(gpt.maxTokens, 32_768);
+	// GPT-OSS cannot see images, not even through agy's native read_file.
+	assert.deepEqual(gpt.input, ["text"]);
 	assert.equal(gpt.reasoning, true);
 	assert.deepEqual(gpt.thinkingLevelMap, { off: null, minimal: null, low: null, high: null });
 	assert.equal(toAgyEffort("high", entries.find((entry) => entry.id === "gpt-oss-120b")!.efforts!), "medium");

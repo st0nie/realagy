@@ -16,6 +16,7 @@ import {
 import { resolveSessionAtStep } from "./acp/step-usage.js";
 import type { AgyStepUsage, AgyUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "./driver-types.js";
 import { toAgyEffort, type AgyModelEntry } from "./models.js";
+import { nativeToolLine } from "./native-tools.js";
 import type { BridgeResult } from "./mcp-server.js";
 import {
 	formatToolResult,
@@ -282,6 +283,12 @@ function appendThinking(stream: AssistantMessageEventStream, blocks: BlockState,
 	stream.push({ type: "thinking_delta", contentIndex: blocks.thinkingIdx, delta, partial: blocks.partial });
 }
 
+/** One of agy's own tool calls as its own line in the thinking block. */
+function appendNativeLine(stream: AssistantMessageEventStream, blocks: BlockState, line: string): void {
+	const open = blocks.thinkingIdx === null ? "" : (blocks.partial.content[blocks.thinkingIdx] as { thinking: string }).thinking;
+	appendThinking(stream, blocks, `${open && !open.endsWith("\n") ? "\n" : ""}${line}\n`);
+}
+
 function finish(stream: AssistantMessageEventStream, blocks: BlockState, reason: "stop" | "error" | "aborted", message?: string): void {
 	closeText(stream, blocks);
 	closeThinking(stream, blocks);
@@ -326,6 +333,7 @@ async function consumeTurn(
 		await options?.onProviderStreamEvent?.(activity, model);
 		if (activity.type === "text") appendText(stream, blocks, activity.delta);
 		else if (activity.type === "thought" && activity.delta) appendThinking(stream, blocks, activity.delta);
+		else if (activity.type === "native_tool") appendNativeLine(stream, blocks, nativeToolLine(activity));
 		else if (activity.type === "step_usage") {
 			addStepUsage(usage, activity.usage);
 			meter?.addSteps(activity.usage);
@@ -340,7 +348,8 @@ async function consumeTurn(
 			emitToolUse(stream, blocks, activity);
 			return;
 		}
-		// agy's native tool frames need no pi tool card: agy runs them itself.
+		// tool_start/tool_done/tool_error only feed onProviderStreamEvent: agy
+		// runs those tools itself, and native_tool renders the visible line.
 	}
 	// Occupancy reported during an EARLIER message of this turn is stale here
 	// (tool results were added since), so outcome.contextUsage is not applied.
@@ -354,8 +363,9 @@ async function consumeTurn(
 		meter?.setExhausted(exhausted);
 		return finish(stream, blocks, "error", `Antigravity quota exhausted for ${model.id}.${exhausted.resetAt ? ` Resets at ${exhausted.resetAt}.` : ""}`);
 	}
-	if (blocks.textIdx === null && outcome.response) appendText(stream, blocks, outcome.response);
-	if (blocks.textIdx === null && blocks.thinkingIdx === null) appendText(stream, blocks, "");
+	// Every response character already streamed as a text delta (the driver
+	// flushes its sanitizer before settling); only an empty message needs a block.
+	if (blocks.partial.content.length === 0) appendText(stream, blocks, "");
 	onCompleted(outcome, blocks.partial);
 	finish(stream, blocks, "stop");
 }
@@ -441,9 +451,10 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					cwd,
 					model: entry?.full ?? model.id,
 					effort: entry?.efforts?.length ? toAgyEffort(options?.reasoning, entry.efforts) : undefined,
-					mode: "accept-edits",
-					// ACP transport and its native viewer are auto-approved. Original
-					// pi tool execution still goes through pi's permission policy.
+					mode: "default",
+					// agy's native tools are approved (agy session mode
+					// accept-edits); the tool policy steers the model to pi's
+					// tools, which run under pi's permission policy.
 					skipPermissions: true,
 					conversationId: plan.kind === "warm" ? plan.sessionId : null,
 					prompt: plan.input.prompt,

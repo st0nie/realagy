@@ -19,6 +19,13 @@ Protocol tests run against `tests/helpers/fake-acp-server.mjs` instead of agy. I
 | session id `missing` | `session/load` and `session/resume` fail, which exercises the fresh-session fallback |
 | prompt text containing `[hang]` | The prompt never ends on its own; a `session/cancel` notification ends it with `stopReason: "cancelled"` |
 | prompt text containing `[silent-cancel]` | Like `[hang]`, but `session/cancel` is ignored, which exercises the teardown safety net |
+| `FAKE_ACP_BRAIN_DIR` | Where background work reports completion, as agy does in `brain/<sessionId>/.system_generated/messages/<id>.json` |
+| any prompt | Echoed as `user_message_chunk` first, after the leftovers of earlier background work, as agy does; `[no-echo]` skips the echo |
+| prompt text containing `[native]` | agy's own `read_file` (completed) and `run_command` (failed) plus one `mcp_pi-bridge_bash` call |
+| prompt text containing `[native-slow:<ms>]` | A native `run_command` that runs `<ms>` without any frames; `[overlap]` adds a quick `read_file` inside it |
+| prompt text containing `[background]` | A native command still running when the prompt ends; it reports to the brain directory and leaves leftovers for the next prompt |
+| prompt text containing `[subagent]` | An `invoke_subagent` call whose subagent replies through the brain directory |
+| prompt text containing `[invalid]` | agy's `⚠ Model produced invalid output.` retry notice as a message chunk |
 | prompt text containing `[exit]` | The server writes a stderr line and exits with code 3 mid-prompt |
 
 ## Live smokes

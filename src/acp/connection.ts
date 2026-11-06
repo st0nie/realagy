@@ -17,6 +17,10 @@
 //     notifications BEFORE its response (dropped here) and silently returns
 //     an empty session for unknown ids
 //   - session/request_permission is answered from the turn's policy
+//   - _meta.antigravity.systemPrompt.append (advertised in initialize as
+//     agentCapabilities._meta.antigravity.systemPrompt.append) appends to
+//     agy's system prompt; honored by session/new, resume, and load.
+//     _meta.antigravity.enabledTools / disabledTools are ignored
 //   - mcpServers entries: {name, type:"http", url, headers:[]} — headers is a
 //     LIST; a dead URL is accepted at session time (lazy connect)
 //   - agy exits by itself when its stdin closes
@@ -76,6 +80,10 @@ export interface AcpConnectionOptions {
 	/** mcpServers entries for session/new, session/resume, and session/load.
 	 *  Evaluated lazily per call. */
 	mcpServers?: () => AcpMcpServer[];
+	/** Text appended to agy's system prompt on session/new, session/resume,
+	 *  and session/load (`_meta.antigravity.systemPrompt.append`). Evaluated
+	 *  lazily per call; undefined appends nothing. */
+	systemPrompt?: () => string | undefined;
 	/** Permission policy for session/request_permission, evaluated per request:
 	 *  "auto" selects the first allow option, "deny" the first reject option.
 	 *  Absent = deny (fail closed). */
@@ -204,7 +212,7 @@ export class AcpConnection {
 	async newSession(cwd: string): Promise<AcpSessionInfo> {
 		const result = (await this.request(
 			"session/new",
-			{ cwd, mcpServers: this.#mcpServers(), ...antigravityMeta() },
+			{ cwd, mcpServers: this.#mcpServers(), ...this.#meta() },
 			SESSION_OP_TIMEOUT_MS,
 		)) as Record<string, unknown> | undefined;
 		const sessionId = result?.sessionId;
@@ -226,7 +234,7 @@ export class AcpConnection {
 	/** Reopen a persisted session: `session/resume` when advertised (no
 	 *  history replay), else `session/load` with its replay dropped. */
 	async reopenSession(sessionId: string, cwd: string): Promise<"resumed" | "loaded"> {
-		const params = { sessionId, cwd, mcpServers: this.#mcpServers(), ...antigravityMeta() };
+		const params = { sessionId, cwd, mcpServers: this.#mcpServers(), ...this.#meta() };
 		if (this.#canResume) {
 			await this.request("session/resume", params, SESSION_OP_TIMEOUT_MS);
 			return "resumed";
@@ -333,6 +341,27 @@ export class AcpConnection {
 		}
 	}
 
+	/** agy keeps its native tools alongside pi's (`agy acp` ignores tool
+	 *  allowlists). Expose pi tools directly, not through agy's lazy
+	 *  call_mcp_tool helper, and append the tool policy to agy's system prompt
+	 *  (honored by session/new, session/resume, and session/load). */
+	#meta(): Record<string, unknown> {
+		let append: string | undefined;
+		try {
+			append = this.#opts.systemPrompt?.();
+		} catch (err) {
+			this.#opts.log("system-prompt-failed", { message: err instanceof Error ? err.message : String(err) });
+		}
+		return {
+			_meta: {
+				antigravity: {
+					eagerMcpServers: ["pi-bridge"],
+					...(append ? { systemPrompt: { append } } : {}),
+				},
+			},
+		};
+	}
+
 	#write(frame: string): void {
 		const stdin = this.#child?.stdin;
 		if (!stdin || !stdin.writable || this.#exited) {
@@ -393,12 +422,6 @@ function record(value: unknown): Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
-/** agy keeps its native tools alongside pi's (agy acp ignores tool
- *  allowlists). Expose pi tools directly, not through agy's lazy
- *  call_mcp_tool / read_resource helper loop. */
-function antigravityMeta(): Record<string, unknown> {
-	return { _meta: { antigravity: { eagerMcpServers: ["pi-bridge"] } } };
-}
 
 function exitReason(code: number | null, signal: string | null): string {
 	if (signal) return `killed by ${signal}`;

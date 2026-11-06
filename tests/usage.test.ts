@@ -100,7 +100,7 @@ test("AcpDriver reports exact step usage, reuses live sessions, and falls back w
 		extraEnv: { FAKE_ACP_DB_DIR: dir },
 		conversationsDir: () => dir,
 	});
-	const base = { cwd: process.cwd(), model: "gemini-3.8-flash", effort: "medium", mode: "accept-edits", skipPermissions: true };
+	const base = { cwd: process.cwd(), model: "gemini-3.8-flash", effort: "medium", mode: "default" as const, skipPermissions: true };
 	const wire = () => fs.readFileSync(capture, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { method: string; params: Record<string, unknown> });
 	try {
 		const first = await driver.run({ ...base, prompt: "first" });

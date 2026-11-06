@@ -106,7 +106,13 @@ function familyLimits(full: string): { contextWindow: number; maxTokens: number 
 	return { contextWindow: 1_048_576, maxTokens: 65_536 };
 }
 
-export function toPiModel(entry: AgyModelEntry, input: Array<"text" | "image"> = ["text", "image"]): Model<Api> {
+/** GPT-OSS is text-only: it cannot see images, not even through agy's native
+ *  read_file (verified live with agy 1.5.1). */
+function familyInput(full: string): Array<"text" | "image"> {
+	return /^gpt-oss-/.test(full) ? ["text"] : ["text", "image"];
+}
+
+export function toPiModel(entry: AgyModelEntry): Model<Api> {
 	const effortDriven = !!entry.efforts?.length;
 	const limits = familyLimits(entry.full);
 	return {
@@ -117,7 +123,7 @@ export function toPiModel(entry: AgyModelEntry, input: Array<"text" | "image"> =
 		baseUrl: "agy-bridge://antigravity",
 		reasoning: effortDriven,
 		...(effortDriven ? { thinkingLevelMap: thinkingLevelMapFor(entry.efforts!) } : {}),
-		input,
+		input: familyInput(entry.full),
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: limits.contextWindow,
 		maxTokens: limits.maxTokens,

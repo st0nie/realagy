@@ -7,13 +7,15 @@
 //   - agent_message_chunk  { content: { type: "text", text } }         (pure deltas)
 //   - agent_thought_chunk  { content: { type: "text", text } }          (thought TEXT)
 //   - user_message_chunk   { content: { type: "text", text } }          (load replay only)
-//   - tool_call            { toolCallId, title, kind, status, content?, locations?, rawInput? }
-//   - tool_call_update     { toolCallId, status: completed|failed, rawOutput? }
+//   - tool_call            { toolCallId, name, args, title, kind, status, content?, locations?, rawInput? }
+//   - tool_call_update     { toolCallId, name, status: pending|in_progress|completed|failed, rawOutput?, content? }
+//     (name: native `run_command`, pi bridge `mcp_pi-bridge_<tool>`)
 //   - plan                 { entries: [...] }
 //   - available_commands_update { availableCommands: [...] }
 // Token usage arrives in the session/prompt result and as usage_update
 // frames; both are handled by the driver, not here.
 
+import { PI_BRIDGE_SERVER } from "../native-tools.js";
 import { StreamSanitizer } from "../stream-sanitizer.js";
 
 /** Map one `update` object to a driver-level event, or null when the update
@@ -32,7 +34,7 @@ export interface AcpEditDiff {
 export type MappedUpdate =
 	| { kind: "text"; delta: string }
 	| { kind: "thought"; delta: string }
-	| { kind: "tool_start"; toolCallId: string; name: string; args: Record<string, unknown>; diff?: AcpEditDiff; mcpServer?: string }
+	| { kind: "tool_start"; toolCallId: string; name: string; args: Record<string, unknown>; title?: string; diff?: AcpEditDiff; mcpServer?: string }
 	| { kind: "tool_done"; toolCallId: string; output?: string; diff?: AcpEditDiff; mcpServer?: string }
 	| { kind: "tool_error"; toolCallId: string; message: string; mcpServer?: string }
 	| { kind: "replay_user" }
@@ -53,16 +55,16 @@ export function mapUpdate(update: unknown): MappedUpdate {
 		case "tool_call": {
 			const id = stringField(u.toolCallId);
 			if (!id) return null;
+			const named = frameToolName(u);
 			return {
 				kind: "tool_start",
 				toolCallId: id,
-				name: metaToolName(u._meta) ?? toolName(u.title, u.kind),
-				args: rawArguments(u.rawInput),
-				mcpServer: stringField(recordField(recordField(u._meta).mcp).server),
+				name: named.name,
+				args: rawArguments(u.rawInput ?? u.args),
+				...(named.mcpServer ? { mcpServer: named.mcpServer } : {}),
+				...(stringField(u.title) ? { title: stringField(u.title) } : {}),
 				// Edits carry their native diff HERE, on the pending tool_call
-				// frame (run 6:10) — the completed update carries only display
-				// text. contentDiff on the update stays as a future-build
-				// fallback.
+				// frame — the completed update carries only display text.
 				diff: contentDiff(u.content),
 			};
 		}
@@ -77,7 +79,7 @@ export function mapUpdate(update: unknown): MappedUpdate {
 				// failure next to a successful edit.
 				const raw = stringField(u.rawOutput);
 				if (raw?.includes("approved but never executed")) return null;
-				const mcpServer = stringField(recordField(recordField(u._meta).mcp).server);
+				const mcpServer = frameToolName(u).mcpServer;
 				return { kind: "tool_error", toolCallId: id, message: raw ?? "tool failed", ...(mcpServer ? { mcpServer } : {}) };
 			}
 			if (u.status === "completed") {
@@ -85,7 +87,7 @@ export function mapUpdate(update: unknown): MappedUpdate {
 				// often just the server's display title, not the result (probe
 				// 2026-09-03: completed MCP call, rawOutput "Call bridge_echo").
 				const diff = contentDiff(u.content);
-				const mcpServer = stringField(recordField(recordField(u._meta).mcp).server);
+				const mcpServer = frameToolName(u).mcpServer;
 				return {
 					kind: "tool_done",
 					toolCallId: id,
@@ -114,12 +116,21 @@ function rawArguments(rawInput: unknown): Record<string, unknown> {
 		: rec;
 }
 
-/** Clean tool name for MCP tools: the title is "<server>_<tool>" (e.g.
- *  "pi-bridge_bridge_echo") and the real name hides in _meta.mcp.tool. */
-function metaToolName(meta: unknown): string | undefined {
-	const mcp = recordField(recordField(meta).mcp);
-	const tool = mcp.tool;
-	return typeof tool === "string" && tool.length > 0 ? tool : undefined;
+/** Tool name and MCP server of a tool frame. agy 1.5 sends `name` (native
+ *  `run_command`, bridge `mcp_pi-bridge_bash`); `_meta.mcp` and the title are
+ *  older shapes. Only the pi bridge's prefix is split off: other servers'
+ *  names may contain underscores, and their calls count as agy's own. */
+function frameToolName(u: Record<string, unknown>): { name: string; mcpServer?: string } {
+	const mcp = recordField(recordField(u._meta).mcp);
+	const metaTool = stringField(mcp.tool);
+	const metaServer = stringField(mcp.server);
+	if (metaTool) return { name: metaTool, ...(metaServer ? { mcpServer: metaServer } : {}) };
+	const name = stringField(u.name);
+	const bridgePrefix = `mcp_${PI_BRIDGE_SERVER}_`;
+	if (name?.startsWith(bridgePrefix) && name.length > bridgePrefix.length) {
+		return { name: name.slice(bridgePrefix.length), mcpServer: PI_BRIDGE_SERVER };
+	}
+	return { name: name ?? toolName(u.title, u.kind), ...(metaServer ? { mcpServer: metaServer } : {}) };
 }
 
 /** First diff entry of a completed tool call: edits carry their native diff
@@ -179,6 +190,15 @@ export function toolName(title: unknown, kind: unknown): string {
 		if (m) return m[1] as string;
 	}
 	return typeof kind === "string" && kind.length > 0 ? kind : "tool";
+}
+
+/** agy inserts this line as a message chunk of its own when the model
+ *  produced a malformed tool call, then retries (seen with GPT-OSS on agy
+ *  1.5.1). It is agy's status, not reply text. */
+const AGY_RETRY_NOTICE = "⚠ Model produced invalid output.";
+
+export function isAgyRetryNotice(delta: string): boolean {
+	return delta.trim() === AGY_RETRY_NOTICE;
 }
 
 /** Map a `session/prompt` result stopReason to a TurnOutcome shape.

@@ -59,7 +59,7 @@ test("AcpDriver lists all families and sends GPT's full medium model slug", asyn
 	try {
 		const models = await driver.listModels(process.cwd());
 		assert.equal(models.length, 3);
-		const handle = await driver.run({ cwd: process.cwd(), model: "gpt-oss-120b", effort: "medium", mode: "accept-edits", skipPermissions: true, prompt: "Reply" });
+		const handle = await driver.run({ cwd: process.cwd(), model: "gpt-oss-120b", effort: "medium", mode: "default", skipPermissions: true, prompt: "Reply" });
 		const activities = [];
 		for await (const activity of { async *[Symbol.asyncIterator]() { for (;;) { const next = await handle.next(); if (!next) return; yield next; } } }) activities.push(activity);
 		assert.deepEqual(activities.filter((activity) => activity.type !== "usage" && activity.type !== "context_usage").map((activity) => activity.type), ["thought", "text"]);

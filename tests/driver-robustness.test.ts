@@ -24,7 +24,7 @@ function fixture(env: Record<string, string> = {}, options: (dir: string) => Par
 	return { driver, wire, dir, logs };
 }
 
-const base = { cwd: process.cwd(), model: "gemini-3.8-flash", effort: "medium", mode: "accept-edits", skipPermissions: true } satisfies Omit<DriverTurnRequest, "prompt">;
+const base = { cwd: process.cwd(), model: "gemini-3.8-flash", effort: "medium", mode: "default", skipPermissions: true } satisfies Omit<DriverTurnRequest, "prompt">;
 
 async function drain(handle: TurnHandle): Promise<DriverActivity[]> {
 	const activities: DriverActivity[] = [];

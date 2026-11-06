@@ -25,7 +25,7 @@ Choose a model in pi's `/model` picker:
 | --- | --- |
 | `antigravity/gemini-4-argon`, `antigravity/gemini-3-1-pro`, `antigravity/gemini-3-8-flash` | low / medium / high |
 | `antigravity/claude-opus-5-5`, `antigravity/claude-sonnet-5-5` | low / medium / high |
-| `antigravity/gpt-oss-120b` | medium |
+| `antigravity/gpt-oss-120b` | medium (text only, no image input) |
 
 The catalog comes live from agy and depends on the account.
 
@@ -36,13 +36,21 @@ The catalog comes live from agy and depends on the account.
 | `/agy setup` | Checks agy: shows install steps when it is missing, sign-in steps when it cannot start a session, and reloads the model catalog when it is ready |
 | `/agy usage` | Cache-hit rate for this session plus every quota group's 5-hour and weekly remaining share and reset times (from `agy --print /usage`) |
 
-Nothing runs in the background: quota is fetched only when you run `/agy usage`. There is no footer status, settings panel, engine switch, delegation tool, global MCP registration, or config file.
+Quota is fetched only when you run `/agy usage`. There is no settings panel, engine switch, delegation tool, global MCP registration, or config file.
+
+## Pi tools and agy's own tools
+
+The model sees pi's active tools next to agy's built-in ones (`read_file`, `run_command`, `write_file`, subagents, web search, …); agy cannot switch its own tools off. realagy adds a short policy to agy's system prompt that asks the model to prefer pi's tools for reading files (images included), running commands, and changing files, so that work goes through pi's permissions and shows up as pi tool calls. agy's own tools still work when the model picks them, and pi always shows it:
+
+- each finished call adds a line to the reply's thinking, for example `agy → run_command npm test ✓ 2.1s`;
+- while a call runs, the status line shows `agy: run_command npm test … 12s` (the 5-minute inactivity limit waits for it);
+- a command agy moved to the background, or a subagent, is marked `(runs in background)`, and a notice appears when agy reports it finished, with the exit code and the end of its output. Its leftover output does not leak into your next reply.
 
 ## Interrupts and failures
 
 - Esc cancels the running Antigravity turn through ACP. agy keeps running, and the next prompt continues in the same session. agy is restarted only if it ignores the cancel for 10 seconds.
 - Starting a new prompt while Antigravity still waits on pi tool results (for example, after the tool calls were interrupted) ends that stale turn instead of waiting for it to time out.
-- If agy cannot start or exits mid-turn, the turn fails with the binary path, the exit code, and agy's last error line. The next prompt starts it again. A turn with no output for 5 minutes is stopped.
+- If agy cannot start or exits mid-turn, the turn fails with the binary path, the exit code, and agy's last error line. The next prompt starts it again. A turn with no output for 5 minutes is stopped, unless one of agy's own tools is still running.
 - After `/reload`, `pi -c`, or `/tree`, realagy resumes the matching Antigravity session. If agy's copy of that conversation is gone, the next prompt starts a new session with the full pi transcript.
 
 | Environment | Effect |
@@ -64,6 +72,8 @@ Nothing runs in the background: quota is fetched only when you run `/agy usage`.
 | `src/acp/setup.ts` | Finding `agy` and its data dir |
 | `src/acp/connection.ts`, `driver.ts`, `events.ts`, `jsonrpc.ts` | `agy acp` process, ACP protocol, serialized turns, frame mapping |
 | `src/acp/step-usage.ts` | Exact per-model-call tokens from agy's conversation store, and `/tree` forks of it |
+| `src/tool-policy.ts` | The tool policy appended to agy's system prompt |
+| `src/native-tools.ts`, `src/acp/background.ts` | Thinking lines and live status for agy's own tool calls; notices when its background work finishes |
 | `src/stream-sanitizer.ts`, `src/frame-guard.ts`, `src/redact.ts` | Hiding injected `<SYSTEM_MESSAGE>` blocks, dropping stdout noise, redacting secrets from logs and errors |
 | `tests/` | Vitest suites; `tests/helpers/fake-acp-server.mjs` stands in for agy |
 | `scripts/` | Live smokes and probes (spend account quota) |

@@ -1,10 +1,12 @@
 // Minimal realagy provider: official ACP transport, pi-native tools.
 // There is intentionally no config panel, stream-json engine, delegation tool,
-// or global MCP registration. Only the native image/file viewer is enabled.
+// or global MCP registration. agy keeps its own tools; a system-prompt policy
+// steers the model to pi's tools, and agy's own tool use stays visible.
 
 import { createProvider } from "@earendil-works/pi-ai";
 import { BorderedLoader, type ExtensionAPI, type ExtensionCommandContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { AcpDriver } from "../src/acp/driver.js";
+import { defaultBrainDir, formatBackgroundNotice } from "../src/acp/background.js";
 import { fetchCliUsage, UsageMeter } from "../src/quota.js";
 import type { AcpSessions } from "../src/provider.js";
 import { defaultConversationsDir } from "../src/acp/step-usage.js";
@@ -12,7 +14,9 @@ import { ensureAgyReady, MANUAL_SETUP, resolveAgyBinary } from "../src/acp/setup
 import { bridgedPiTools, bridgeInputSchema } from "../src/bridge-catalog.js";
 import { startMcpServer, TOKEN_HEADER, type McpServerHandle } from "../src/mcp-server.js";
 import { entriesFromAcpModels, FALLBACK_MODELS, toPiModel, type AgyModelEntry } from "../src/models.js";
+import { NativeToolStatus } from "../src/native-tools.js";
 import { createStreamSimple, POLL_TOOL_NAME, ToolRoundTrips } from "../src/provider.js";
+import { toolPolicyPrompt } from "../src/tool-policy.js";
 import { restoreWarmSessions, WARM_SESSION_ENTRY, type SessionEntryLike, type WarmSession } from "../src/transcript.js";
 const SIGN_IN = [
 	"Sign in with the Antigravity CLI in a terminal (realagy never handles credentials):",
@@ -30,6 +34,15 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	let stopped = false;
 	const shutdownController = new AbortController();
 
+	const activeTools = () => bridgedPiTools(pi.getAllTools(), pi.getActiveTools());
+	// UI of this runtime, for notices outside an event (background work) and
+	// the live native-tool status. pi replaces the runtime on /new, /resume,
+	// /fork, and /reload after session_shutdown, so `stopped` guards every use.
+	let ui: ExtensionUIContext | undefined;
+	const nativeStatus = new NativeToolStatus((text) => {
+		if (!stopped) ui?.setStatus("agy-native-tools", text);
+	});
+
 	const driver = new AcpDriver({
 		bin: () => bin,
 		mcpServers: () => bridge ? [{
@@ -41,13 +54,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		// Exact per-call usage comes from the server's conversation store;
 		// unmeasured messages are left to pi's own transcript estimate.
 		conversationsDir: () => defaultConversationsDir(),
+		systemPrompt: () => toolPolicyPrompt(activeTools().map((tool) => tool.name)),
+		onNativeTool: (event) => nativeStatus.update(event),
+		brainDir: () => defaultBrainDir(),
+		onBackgroundMessage: (notice) => {
+			if (!stopped) ui?.notify(formatBackgroundNotice(notice), "info");
+		},
 	});
 	const roundTrips = new ToolRoundTrips(driver);
 	driver.onTurnEnd = (outcome) => {
 		if (outcome.aborted || outcome.status === "ERROR") roundTrips.failAll(outcome.error ?? "Antigravity turn ended");
 	};
-
-	const activeTools = () => bridgedPiTools(pi.getAllTools(), pi.getActiveTools());
 	const started = await startMcpServer({
 		listTools: () => [
 			...activeTools().map((tool) => ({
@@ -137,6 +154,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	};
 
 	pi.on("session_start", (_event, ctx) => {
+		if (ctx.hasUI) ui = ctx.ui;
 		syncWarmFromSession(ctx);
 		refresh ??= refreshCatalog(ctx).catch((error: unknown) => {
 			if (!stopped && ctx.hasUI) ctx.ui.notify(`Antigravity setup failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
@@ -160,6 +178,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	});
 	pi.on("session_shutdown", () => {
 		stopped = true;
+		ui = undefined;
+		nativeStatus.close();
 		shutdownController.abort();
 		pendingWarmEntry = null;
 		sessions.warm = undefined;

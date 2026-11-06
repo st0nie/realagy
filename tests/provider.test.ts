@@ -221,7 +221,7 @@ test("slow tools early-ack and return the real result through the poll tool", as
 	try {
 		const driver = new FakeDriver();
 		driver.autoFinish = false;
-		await driver.run({ cwd: process.cwd(), model: "gpt-oss-120b", mode: "accept-edits", skipPermissions: true, prompt: "test" });
+		await driver.run({ cwd: process.cwd(), model: "gpt-oss-120b", mode: "default", skipPermissions: true, prompt: "test" });
 		const roundTrips = new ToolRoundTrips(driver);
 		const parked = roundTrips.onToolCall("slow-1", "bash", {}, new AbortController().signal);
 		await vi.advanceTimersByTimeAsync(20_000);
@@ -738,4 +738,60 @@ test("universal extension invariance: arbitrary prompt decorators, transient mes
 		warm2,
 	);
 	assert.equal(plan3Compacted.kind, "fresh");
+});
+
+test("agy's native tool calls become thinking lines without duplicating the reply text", async () => {
+	const driver = new FakeDriver();
+	const roundTrips = new ToolRoundTrips(driver);
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips });
+	const entry = FALLBACK_MODELS.find((candidate) => candidate.id === "gemini-3-8-flash")!;
+	driver.autoFinish = false;
+	driver.script = [
+		{ type: "thought", delta: "Let me look" },
+		{ type: "native_tool", toolCallId: "n1", label: "read_file /w/a.txt", status: "ok", durationMs: 400, background: false },
+		{ type: "text", delta: "Hello " },
+		{ type: "native_tool", toolCallId: "n2", label: "run_command false", status: "failed", durationMs: 120, background: false },
+		{ type: "native_tool", toolCallId: "n3", label: "invoke_subagent Checker", status: "ok", durationMs: 600, background: true },
+		{ type: "text", delta: "world" },
+		{ type: "native_tool", toolCallId: "n4", label: "run_command sleep 60", status: "running", background: true },
+	];
+	const pending = collect(stream(toPiModel(entry), context([system(), user("go")])));
+	await vi.waitFor(() => assert.ok(driver.activeHandle));
+	(driver.activeHandle as FakeHandle).complete({ status: "OK", response: "Hello world", aborted: false, conversationId: "s" });
+	const done = (await pending).find((event) => event.type === "done");
+	assert.equal(done?.type, "done");
+	if (done?.type !== "done") return;
+	assert.equal(driver.requests[0]?.mode, "default");
+	assert.deepEqual(done.message.content, [
+		{ type: "thinking", thinking: "Let me look\nagy → read_file /w/a.txt ✓ 0.4s\n" },
+		{ type: "text", text: "Hello " },
+		{
+			type: "thinking",
+			thinking: [
+				"agy → run_command false ✗ 0.1s",
+				"agy → invoke_subagent Checker ✓ 0.6s (runs in background)",
+				"",
+			].join("\n"),
+		},
+		{ type: "text", text: "world" },
+		// The message ends on a thinking line: the reply is not appended again.
+		{ type: "thinking", thinking: "agy → run_command sleep 60 … (runs in background)\n" },
+	]);
+});
+
+test("a reply split by native-tool thinking lines is one assistant reply in the transcript, without the lines", () => {
+	const reply = {
+		role: "assistant",
+		content: [
+			{ type: "text", text: "Hello " },
+			{ type: "thinking", thinking: "agy → read_file a ✓ 0.1s\n" },
+			{ type: "text", text: "world" },
+			{ type: "toolCall", id: "c1", name: "bash", arguments: { command: "ls" } },
+			{ type: "text", text: "after" },
+		],
+	} as unknown as Message;
+	const { text } = serializeBounded("", [reply]);
+	assert.ok(text.includes("<assistant>\nHello world\n</assistant>"), text);
+	assert.ok(text.indexOf("Hello world") < text.indexOf("assistant-tool-call") && text.indexOf("assistant-tool-call") < text.indexOf("<assistant>\nafter"));
+	assert.ok(!text.includes("agy →"));
 });

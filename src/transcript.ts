@@ -81,13 +81,22 @@ function serializeMessage(message: Message, imageBase: number): { text: string; 
 	}
 	if (message.role === "assistant") {
 		const parts: string[] = [];
+		// Text blocks separated only by thinking (agy's native-tool lines split
+		// a reply mid-stream) are one reply.
+		let reply = "";
+		const flushReply = () => {
+			const clean = reply ? stripForgedRealctx(reply) : "";
+			if (clean) parts.push(`<assistant>\n${clean}\n</assistant>`);
+			reply = "";
+		};
 		for (const block of message.content) {
-			if (block.type === "text" && block.text) {
-				const clean = stripForgedRealctx(block.text);
-				if (clean) parts.push(`<assistant>\n${clean}\n</assistant>`);
+			if (block.type === "text") reply += block.text;
+			if (block.type === "toolCall") {
+				flushReply();
+				parts.push(`<assistant-tool-call name=${JSON.stringify(block.name)} id=${JSON.stringify(block.id)}>\n${JSON.stringify(block.arguments)}\n</assistant-tool-call>`);
 			}
-			if (block.type === "toolCall") parts.push(`<assistant-tool-call name=${JSON.stringify(block.name)} id=${JSON.stringify(block.id)}>\n${JSON.stringify(block.arguments)}\n</assistant-tool-call>`);
 		}
+		flushReply();
 		return { text: parts.join("\n\n"), images };
 	}
 	return { text: "", images };

@@ -12,15 +12,24 @@
 //     "cancelled" and process and session survive. Only when agy ignores the
 //     cancel is the process torn down.
 //   - inactivity guard: no session/update for `inactivityMin` fails the turn;
-//     parked pi tool calls (bridge_call) pause the guard.
+//     parked pi tool calls (bridge_call) and running native agy tools pause
+//     the guard.
+//   - native tools: agy's own calls are reported as native_tool activities
+//     and live onNativeTool events; work still running when the prompt ends
+//     is watched in agy's brain directory (src/acp/background.ts).
+//   - leftovers: frames agy flushes at prompt start, before echoing the
+//     prompt, belong to background work that finished meanwhile and are
+//     dropped.
 //   - usage: exact per-model-call tokens from agy's conversation store at
 //     each bridge_call and at prompt end (src/acp/step-usage.ts).
 
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
+import { BackgroundMessages, type BackgroundNotice } from "./background.js";
 import { AcpConnection, type AcpExitInfo, type AcpMcpServer } from "./connection.js";
-import { mapStopReason, mapUpdate, TextAccumulator, type AcpEditDiff } from "./events.js";
+import { isAgyRetryNotice, mapStopReason, mapUpdate, TextAccumulator, type AcpEditDiff } from "./events.js";
 import { conversationDbPath, lastStepIdx, readStepState, siblingUsage, summarizeSteps, type StepTokens, type StepUsage } from "./step-usage.js";
+import { nativeToolLabel, PI_BRIDGE_SERVER, type NativeToolEvent } from "../native-tools.js";
 import { traceUsage } from "../usage-trace.js";
 import type { AgyStepUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../driver-types.js";
 
@@ -46,6 +55,17 @@ export interface AcpDriverOptions {
 	/** Cancel-to-teardown grace period (tests shrink it). */
 	cancelGraceMs?: number;
 	log?: (msg: string, data?: unknown) => void;
+	/** Appended to agy's system prompt for every session (the tool policy). */
+	systemPrompt?: () => string | undefined;
+	/** agy's `brain` directory, watched for background work that finishes
+	 *  after a prompt ended. undefined disables the watcher. */
+	brainDir?: () => string | undefined;
+	/** A native call started or ended (live status). */
+	onNativeTool?: (event: NativeToolEvent) => void;
+	/** agy reported finished background work (command or subagent). */
+	onBackgroundMessage?: (notice: BackgroundNotice) => void;
+	/** Background watcher poll interval (tests shrink it). */
+	backgroundPollMs?: number;
 }
 
 type TurnInput = Pick<DriverTurnRequest, "prompt" | "images" | "contextBlock">;
@@ -81,6 +101,16 @@ interface ActiveTurn {
 	/** toolCallId → tool name + args + optional native diff (the diff rides
 	 *  on the pending tool_call frame; updates don't repeat it). */
 	toolCalls: Map<string, { name: string; args: Record<string, unknown>; diff?: AcpEditDiff; mcpServer?: string }>;
+	/** agy's own calls still running: they pause the inactivity guard. */
+	natives: Map<string, { name: string; label: string; startedAt: number }>;
+	/** Subagents started by this prompt (they finish in the background). */
+	subagents: number;
+	promptStartedAt: number;
+	/** agy echoes the prompt as user_message_chunk. Content frames before
+	 *  that echo are leftovers of background work that finished between
+	 *  prompts; they are held here and dropped once the echo arrives. */
+	echoSeen: boolean;
+	held: unknown[];
 }
 
 /** Recombine the provider's (base slug, effort) into the FULL ACP model slug
@@ -92,9 +122,10 @@ export function acpModelSlug(model: string, effort?: string): string {
 }
 
 /** Map our knobs onto ACP session modes. */
-export function acpMode(mode: string, skipPermissions: boolean): string {
-	if (skipPermissions) return "yolo";
-	return mode === "plan" ? "default" : "auto_edit";
+export function acpMode(mode: DriverTurnRequest["mode"], skipPermissions: boolean): string {
+	// agy 1.5 offers only default, accept-edits, and plan.
+	if (mode === "plan") return "plan";
+	return skipPermissions ? "accept-edits" : "default";
 }
 
 export class AcpDriver implements TurnDriver {
@@ -107,6 +138,8 @@ export class AcpDriver implements TurnDriver {
 	#onTurnEnd: ((outcome: TurnOutcome) => void) | undefined;
 	/** Sessions held in memory by the current server process (reset on respawn). */
 	#liveSessions = new Set<string>();
+	/** Watches agy's brain directory for background work (created lazily). */
+	#background: BackgroundMessages | undefined;
 
 	constructor(opts: AcpDriverOptions) {
 		this.#opts = opts;
@@ -253,10 +286,12 @@ export class AcpDriver implements TurnDriver {
 
 		this.#armIdle(turn);
 		turn.promptStarted = true;
+		turn.promptStartedAt = Date.now();
 		try {
 			const result = await conn.prompt(turn.sessionId, turn.input.prompt, turn.input.images, turn.input.contextBlock);
 			if (turn.closed) return;
 			traceUsage("prompt-result", { sessionId: turn.sessionId, stopReason: result.stopReason, usage: result.usage, usageUpdate: turn.contextUsage });
+			this.#finishPrompt(turn);
 			// Exact per-call steps first; the turn-cumulative total is only a
 			// fallback for messages no step measurement covered.
 			const maxStepIdx = this.#collectStepUsage(turn);
@@ -356,21 +391,40 @@ export class AcpDriver implements TurnDriver {
 		if (!turn || turn.closed || turn.conn !== conn) return;
 		if (sessionId !== null && sessionId !== turn.sessionId) return;
 		turn.idleTimer?.refresh();
-		if (typeof update === "object" && update !== null && !Array.isArray(update)) {
-			const frame = update as Record<string, unknown>;
-			if (frame.sessionUpdate === "usage_update" && Number.isSafeInteger(frame.used) && Number.isSafeInteger(frame.size)
-				&& (frame.used as number) >= 0 && (frame.size as number) > 0) {
-				const contextUsage = { used: frame.used as number, size: frame.size as number };
-				turn.contextUsage = contextUsage;
-				traceUsage("usage-update", { sessionId: turn.sessionId, used: contextUsage.used, size: contextUsage.size });
-				this.#emit(turn, { type: "context_usage", contextUsage });
-				return;
+		const kind = record(update).sessionUpdate;
+		if (turn.promptStarted && !turn.echoSeen && (kind === "user_message_chunk" || LEFTOVER_KINDS.has(String(kind)))) {
+			if (kind === "user_message_chunk") {
+				turn.echoSeen = true;
+				if (turn.held.length > 0) this.#log("leftovers-dropped", { sessionId: turn.sessionId, frames: turn.held.length });
+				turn.held = [];
+			} else {
+				turn.held.push(update);
 			}
+			return;
+		}
+		this.#applyUpdate(turn, update);
+	}
+
+	#applyUpdate(turn: ActiveTurn, update: unknown): void {
+		const frame = record(update);
+		if (frame.sessionUpdate === "usage_update" && Number.isSafeInteger(frame.used) && Number.isSafeInteger(frame.size)
+			&& (frame.used as number) >= 0 && (frame.size as number) > 0) {
+			const contextUsage = { used: frame.used as number, size: frame.size as number };
+			turn.contextUsage = contextUsage;
+			traceUsage("usage-update", { sessionId: turn.sessionId, used: contextUsage.used, size: contextUsage.size });
+			this.#emit(turn, { type: "context_usage", contextUsage });
+			return;
 		}
 		const mapped = mapUpdate(update);
 		if (!mapped) return;
 		switch (mapped.kind) {
 			case "text": {
+				if (isAgyRetryNotice(mapped.delta)) {
+					// agy's own notice, not the model's reply: keep it visible
+					// but out of the answer pi stores and replays.
+					this.#emit(turn, { type: "thought", delta: `\n${mapped.delta.trim()} agy retries.\n` });
+					return;
+				}
 				const emit = turn.response.append(mapped.delta);
 				if (emit) this.#emit(turn, { type: "text", delta: emit });
 				return;
@@ -381,6 +435,7 @@ export class AcpDriver implements TurnDriver {
 			case "tool_start": {
 				turn.toolCalls.set(mapped.toolCallId, { name: mapped.name, args: mapped.args, diff: mapped.diff, mcpServer: mapped.mcpServer });
 				this.#emit(turn, { type: "tool_start", name: mapped.name, args: mapped.args, mcpServer: mapped.mcpServer, toolCallId: mapped.toolCallId });
+				if (mapped.mcpServer !== PI_BRIDGE_SERVER) this.#nativeStarted(turn, mapped.toolCallId, mapped.name, nativeToolLabel(mapped.name, mapped.args, mapped.title));
 				return;
 			}
 			case "tool_done": {
@@ -402,17 +457,80 @@ export class AcpDriver implements TurnDriver {
 					mcpServer: mapped.mcpServer ?? entry?.mcpServer,
 					toolCallId: mapped.toolCallId,
 				});
+				this.#nativeEnded(turn, mapped.toolCallId, "ok");
 				return;
 			}
 			case "tool_error": {
 				const entry = turn.toolCalls.get(mapped.toolCallId);
 				turn.toolCalls.delete(mapped.toolCallId);
 				this.#emit(turn, { type: "tool_error", name: entry?.name ?? "tool", message: mapped.message, mcpServer: mapped.mcpServer ?? entry?.mcpServer, toolCallId: mapped.toolCallId });
+				this.#nativeEnded(turn, mapped.toolCallId, "failed");
 				return;
 			}
 			case "replay_user":
-				return; // load replay: history, never live text
+				return; // load replay or a repeated echo: never live text
 		}
+	}
+
+	/** One of agy's own tools started: show it live and pause the inactivity
+	 *  guard, since a long native command produces no frames. */
+	#nativeStarted(turn: ActiveTurn, id: string, name: string, label: string): void {
+		if (turn.natives.has(id)) return;
+		const startedAt = Date.now();
+		turn.natives.set(id, { name, label, startedAt });
+		this.#clearIdle(turn);
+		this.#notifyNative({ type: "start", id, label, startedAt });
+	}
+
+	#nativeEnded(turn: ActiveTurn, id: string, status: "ok" | "failed"): void {
+		const native = turn.natives.get(id);
+		if (!native) return;
+		turn.natives.delete(id);
+		// invoke_subagent returns at once; the subagent keeps working.
+		const background = status === "ok" && native.name === "invoke_subagent";
+		if (background) turn.subagents += 1;
+		this.#emit(turn, { type: "native_tool", toolCallId: id, label: native.label, status, durationMs: Date.now() - native.startedAt, background });
+		this.#notifyNative({ type: "end", id });
+		this.#armIdle(turn);
+	}
+
+	#notifyNative(event: NativeToolEvent): void {
+		try {
+			this.#opts.onNativeTool?.(event);
+		} catch (err) {
+			this.#log("native-tool-listener-failed", { message: describe(err) });
+		}
+	}
+
+	/** Prompt ended: frames held for an echo that never came are real output;
+	 *  native calls still running continue in the background. */
+	#finishPrompt(turn: ActiveTurn): void {
+		if (!turn.echoSeen && turn.held.length > 0) {
+			this.#log("no-prompt-echo", { sessionId: turn.sessionId, frames: turn.held.length });
+			const held = turn.held;
+			turn.held = [];
+			turn.echoSeen = true;
+			for (const update of held) this.#applyUpdate(turn, update);
+		}
+		const taskIds = [...turn.natives.keys()];
+		for (const [id, native] of turn.natives) {
+			this.#emit(turn, { type: "native_tool", toolCallId: id, label: native.label, status: "running", background: true });
+		}
+		if (taskIds.length > 0 || turn.subagents > 0) {
+			this.#backgroundWatcher()?.track(turn.sessionId, { since: turn.promptStartedAt, taskIds, subagents: turn.subagents });
+		}
+	}
+
+	#backgroundWatcher(): BackgroundMessages | undefined {
+		const { brainDir, onBackgroundMessage } = this.#opts;
+		if (!brainDir || !onBackgroundMessage) return undefined;
+		this.#background ??= new BackgroundMessages({
+			brainDir,
+			onMessage: onBackgroundMessage,
+			log: (msg, data) => this.#log(msg, data),
+			intervalMs: this.#opts.backgroundPollMs,
+		});
+		return this.#background;
 	}
 
 	#onConnectionExit(conn: AcpConnection, info: AcpExitInfo): void {
@@ -445,6 +563,7 @@ export class AcpDriver implements TurnDriver {
 			cwd,
 			mcpServers: this.#opts.mcpServers,
 			log: (msg, data) => this.#log(msg, data),
+			systemPrompt: this.#opts.systemPrompt,
 			// Fail-closed: only skipPermissions turns approve agy's requests.
 			permissions: () => (this.#active?.request.skipPermissions ? "auto" : "deny"),
 			onUpdate: (sessionId, update) => this.#onConnectionUpdate(conn, sessionId, update),
@@ -526,12 +645,18 @@ export class AcpDriver implements TurnDriver {
 			aborted: false,
 			parks: 0,
 			toolCalls: new Map(),
+			natives: new Map(),
+			subagents: 0,
+			promptStartedAt: 0,
+			echoSeen: false,
+			held: [],
 		};
 	}
 
 	#armIdle(turn: ActiveTurn): void {
 		this.#clearIdle(turn);
-		if (turn.parks > 0 || turn.closed) return; // parked: resumes on unpark
+		// Parked on pi, or one of agy's own tools is running: resumes after.
+		if (turn.parks > 0 || turn.natives.size > 0 || turn.closed) return;
 		const idleMin = turn.request.inactivityMin ?? DEFAULT_INACTIVITY_MIN;
 		if (idleMin <= 0) return;
 		turn.idleTimer = setTimeout(() => {
@@ -561,6 +686,9 @@ export class AcpDriver implements TurnDriver {
 		turn.closed = true;
 		this.#clearIdle(turn);
 		if (turn.cancelTimer) clearTimeout(turn.cancelTimer);
+		// The live status must not outlive the turn.
+		for (const id of turn.natives.keys()) this.#notifyNative({ type: "end", id });
+		turn.natives.clear();
 		if (this.#active === turn) this.#active = undefined;
 		for (const wake of turn.wake) wake();
 		turn.wake = [];
@@ -623,7 +751,17 @@ export class AcpDriver implements TurnDriver {
 		this.#starting = undefined;
 		this.#liveSessions.clear();
 		conn?.kill();
+		this.#background?.close();
+		this.#background = undefined;
 	}
+}
+
+/** Content frames that can be leftovers of background work; status frames
+ *  (usage, config, commands) describe the session now and always apply. */
+const LEFTOVER_KINDS = new Set(["agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update"]);
+
+function record(value: unknown): Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
 function describe(err: unknown): string {
