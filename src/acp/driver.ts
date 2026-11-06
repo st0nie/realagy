@@ -60,8 +60,13 @@ export interface AcpDriverOptions {
 	/** Cancel-to-teardown grace period (tests shrink it). */
 	cancelGraceMs?: number;
 	log?: (msg: string, data?: unknown) => void;
-	/** Appended to agy's system prompt for every session (the tool policy). */
-	systemPrompt?: () => string | undefined;
+	/** Appended to agy's system prompt for every session (the tool policy),
+	 *  given the agent the serving process runs. */
+	systemPrompt?: (agent: string | undefined) => string | undefined;
+	/** agy custom agent for the next spawn (`--agent`; src/agent-profile.ts).
+	 *  Evaluated per turn: when it differs from the live process's agent, the
+	 *  process is respawned before the turn. undefined = agy's default agent. */
+	agent?: () => string | undefined;
 	/** agy's `brain` directory, watched for background work that finishes
 	 *  after a prompt ended. undefined disables the watcher. */
 	brainDir?: () => string | undefined;
@@ -278,6 +283,7 @@ export class AcpDriver implements TurnDriver {
 
 	async #executeTurn(turn: ActiveTurn): Promise<void> {
 		const request = turn.request;
+		this.#retireStaleAgent();
 		const conn = await this.#ensureConnection(request.cwd);
 		if (turn.closed) return;
 		turn.conn = conn;
@@ -496,6 +502,9 @@ export class AcpDriver implements TurnDriver {
 				if (mapped.delta) this.#emit(turn, { type: "thought", delta: mapped.delta });
 				return;
 			case "tool_start": {
+				// Text held for a possible file link cannot complete now.
+				const released = turn.response.boundary();
+				if (released) this.#emit(turn, { type: "text", delta: released });
 				turn.toolCalls.set(mapped.toolCallId, { name: mapped.name, args: mapped.args, diff: mapped.diff, mcpServer: mapped.mcpServer });
 				this.#emit(turn, { type: "tool_start", name: mapped.name, args: mapped.args, mcpServer: mapped.mcpServer, toolCallId: mapped.toolCallId });
 				if (mapped.mcpServer !== PI_BRIDGE_SERVER) this.#nativeStarted(turn, mapped.toolCallId, mapped.name, nativeToolTarget(mapped.name, mapped.args, mapped.title));
@@ -648,13 +657,40 @@ export class AcpDriver implements TurnDriver {
 
 	/** The live connection, spawning one if needed. Concurrent callers share a
 	 *  pending start, so no request ever precedes the initialize handshake. */
+	#resolveAgent(): string | undefined {
+		try {
+			return this.#opts.agent?.();
+		} catch (err) {
+			this.#log("agent-failed", { message: describe(err) });
+			return undefined;
+		}
+	}
+
+	/** A turn starts on a process whose agent profile is out of date (the
+	 *  bridged tool set changed): tear it down so the turn respawns with the
+	 *  new profile. Turns are serialized, so no turn runs on it; remembered
+	 *  sessions resume in the new process. */
+	#retireStaleAgent(): void {
+		const conn = this.#conn;
+		if (!this.#opts.agent || this.#starting || !conn?.alive) return;
+		const agent = this.#resolveAgent();
+		if (agent === conn.agent) return;
+		this.#log("agent-changed", { from: conn.agent ?? null, to: agent ?? null });
+		this.#conn = undefined;
+		this.#liveSessions.clear();
+		this.#background?.forgetAll();
+		conn.kill();
+	}
+
 	#ensureConnection(cwd: string): Promise<AcpConnection> {
 		if (this.#starting) return this.#starting;
 		if (this.#conn?.alive) return Promise.resolve(this.#conn);
 		const bin = typeof this.#opts.bin === "function" ? this.#opts.bin() : this.#opts.bin;
+		const agent = this.#resolveAgent();
 		const conn: AcpConnection = new AcpConnection({
 			bin,
 			binArgs: this.#opts.binArgs,
+			agent,
 			extraEnv: this.#opts.extraEnv,
 			cwd,
 			mcpServers: this.#opts.mcpServers,
@@ -667,7 +703,7 @@ export class AcpDriver implements TurnDriver {
 		});
 		this.#conn = conn;
 		this.#liveSessions.clear();
-		this.#log("spawn", { bin });
+		this.#log("spawn", { bin, agent: agent ?? null });
 		const starting = conn.start().then(
 			() => {
 				if (this.#starting === starting) this.#starting = undefined;
@@ -736,7 +772,7 @@ export class AcpDriver implements TurnDriver {
 			closed: false,
 			resolve,
 			outcome,
-			response: new TextAccumulator(),
+			response: new TextAccumulator(request.cwd),
 			promptStarted: false,
 			priming: false,
 			finalPromptSent: false,

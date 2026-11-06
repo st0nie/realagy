@@ -1,6 +1,6 @@
 # realagy
 
-A minimal [pi](https://github.com/earendil-works/pi-coding-agent) provider for Google Antigravity. It runs the local Antigravity CLI as an ACP server (`agy acp`) and exposes the account's Gemini, Claude, and GPT models as ordinary `antigravity/*` pi models. Pi's active tools are offered to the model next to agy's own tools, and pi keeps the transcript.
+A minimal [pi](https://github.com/earendil-works/pi-coding-agent) provider for Google Antigravity. It runs the local Antigravity CLI as an ACP server (`agy acp`) and exposes the account's Gemini, Claude, and GPT models as ordinary `antigravity/*` pi models. The model works with pi's tools instead of agy's own, and pi keeps the transcript.
 
 | Document | For |
 | --- | --- |
@@ -40,7 +40,9 @@ Quota is fetched only when you run `/agy usage`. There is no settings panel, eng
 
 ## Pi tools and agy's own tools
 
-The model sees pi's active tools next to agy's built-in ones (`read_file`, `run_command`, `write_file`, subagents, web search, …); agy cannot switch its own tools off. realagy adds a short policy to agy's system prompt that asks the model to use pi's tools for reading files (images included), running commands, and changing files, so that work goes through pi's permissions and shows up as pi tool calls, and to work itself instead of starting subagents, background tasks, or scheduled tasks. agy's own tools still work when the model picks them, and pi always shows it:
+realagy starts agy with its own hidden agent profile, `~/.gemini/config/agents/realagy-<hash>.md`. It replaces agy's system prompt (Antigravity's identity, artifacts, IDE slash commands, and its rule to write every file and symbol as a `file://` link) with a short prompt of realagy's, and leaves the model with pi's tools only: agy's `read_file`, `run_command`, `write_file`, `edit_file`, subagents, and web search are gone. pi's tools stay direct tools, so their calls go through pi's permissions and show up as pi tool calls. File references arrive as plain paths (`src/app.ts:10-20`); a `file://` link a model still writes is rewritten to one while the reply streams. The profile is hidden from normal agy sessions (only `agy agents` lists it), changes only processes realagy starts, and is deleted after 7 days without use.
+
+With `REALAGY_AGY_PROFILE=0` (or when the profile cannot be written) agy keeps its default agent. The model then sees pi's tools next to agy's built-in ones, since agy cannot switch its own tools off. realagy adds a short policy to agy's system prompt that asks the model to use pi's tools for reading files (images included), running commands, and changing files, to work itself instead of starting subagents, background tasks, or scheduled tasks, and to write plain paths instead of `file://` links. agy's own tools still work when the model picks them, and pi always shows it:
 
 - each finished call adds a line to the reply's thinking, for example `agy → run_command npm test ✓ 2.1s`;
 - while agy works on its own, a live panel above the editor lists each running call, background command, and subagent with a spinner and its elapsed time (the 5-minute inactivity limit waits for a running call);
@@ -58,6 +60,7 @@ The model sees pi's active tools next to agy's built-in ones (`read_file`, `run_
 | --- | --- |
 | `AGY_BIN` | Path to the `agy` binary |
 | `GEMINI_HOME` | agy's data root (default `~/.gemini`) |
+| `REALAGY_AGY_PROFILE` | `0` keeps agy's default agent (its own prompt and tools) instead of realagy's profile |
 | `REALAGY_TRACE_USAGE` | `1` or an absolute path: log turn plans and token counts (no content) to `~/.pi/agent/realagy/usage-trace.jsonl` |
 
 ## Layout
@@ -74,9 +77,9 @@ The model sees pi's active tools next to agy's built-in ones (`read_file`, `run_
 | `src/acp/setup.ts` | Finding `agy` and its data dir |
 | `src/acp/connection.ts`, `driver.ts`, `events.ts`, `jsonrpc.ts` | `agy acp` process, ACP protocol, serialized turns, frame mapping |
 | `src/acp/step-usage.ts` | Exact per-model-call tokens from agy's conversation store, and `/tree` forks of it |
-| `src/tool-policy.ts` | The tool policy appended to agy's system prompt |
+| `src/agent-profile.ts`, `src/tool-policy.ts` | agy's custom agent profile (realagy's system prompt, eager pi tools) and the tool policy appended to it |
 | `src/native-tools.ts`, `src/acp/background.ts`, `src/background-card.ts` | Thinking lines and the live panel for agy's own tool calls; finished background work as a conversation card that wakes pi's agent |
-| `src/stream-sanitizer.ts`, `src/frame-guard.ts`, `src/redact.ts` | Hiding injected `<SYSTEM_MESSAGE>` blocks, dropping stdout noise, redacting secrets from logs and errors |
+| `src/stream-sanitizer.ts`, `src/file-links.ts`, `src/frame-guard.ts`, `src/redact.ts` | Hiding injected `<SYSTEM_MESSAGE>` blocks, rewriting `file://` links to plain paths, dropping stdout noise, redacting secrets from logs and errors |
 | `tests/` | Vitest suites; `tests/helpers/fake-acp-server.mjs` stands in for agy |
 | `scripts/` | Live smokes and probes (spend account quota) |
 

@@ -1,3 +1,6 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -242,6 +245,26 @@ describe("extension session lifecycle", () => {
 		const signal = new AbortController().signal;
 		await mocks.bridge!.onToolCall("c2", "lens_symbols", { name: "x" }, signal);
 		expect(mocks.onToolCall).toHaveBeenCalledWith("c2", "lens_symbols", { name: "x" }, signal);
+	});
+
+	it("runs agy with a hidden profile that marks every bridged tool eager, unless opted out", async () => {
+		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-ext-profile-"));
+		vi.stubEnv("GEMINI_HOME", home);
+		try {
+			const session = await start({ all: [{ name: "bash", exposure: "direct" }, { name: "read", exposure: "direct" }], active: ["bash", "read"] });
+			const agent = session.driver.agent();
+			expect(agent).toMatch(/^realagy-[0-9a-f]{12}$/);
+			const profile = fs.readFileSync(path.join(home, "config", "agents", `${agent}.md`), "utf8");
+			for (const tool of ["bash", "read", "poll"]) expect(profile).toContain(`"${tool}":\n        eager: true`);
+			expect(session.driver.systemPrompt(agent)).toMatch(/mcp_pi-bridge_<name>/);
+			expect(session.driver.systemPrompt(undefined)).toMatch(/Do not use your built-in run_command/);
+			vi.stubEnv("REALAGY_AGY_PROFILE", "0");
+			expect(session.driver.agent()).toBeUndefined();
+		} finally {
+			vi.unstubAllEnvs();
+			fs.rmSync(home, { recursive: true, force: true });
+		}
 	});
 
 	it("fails a settled turn's parked calls through failParkedCalls", async () => {

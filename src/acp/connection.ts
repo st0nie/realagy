@@ -23,6 +23,8 @@
 //     _meta.antigravity.enabledTools / disabledTools are ignored
 //   - mcpServers entries: {name, type:"http", url, headers:[]} — headers is a
 //     LIST; a dead URL is accepted at session time (lazy connect)
+//   - `--agent NAME` selects a custom agent for the whole process (there is
+//     no per-session field); an unknown name falls back to the default agent
 //   - agy exits by itself when its stdin closes
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -71,6 +73,9 @@ export interface AcpConnectionOptions {
 	bin: string;
 	/** argv for the binary; default `["acp"]`. */
 	binArgs?: string[];
+	/** agy custom agent for this process (`--agent`, appended to binArgs);
+	 *  see src/agent-profile.ts. */
+	agent?: string;
 	extraEnv?: Record<string, string>;
 	log: (msg: string, data?: unknown) => void;
 	/** Live `session/update` payloads (load replays are dropped). */
@@ -82,8 +87,8 @@ export interface AcpConnectionOptions {
 	mcpServers?: () => AcpMcpServer[];
 	/** Text appended to agy's system prompt on session/new, session/resume,
 	 *  and session/load (`_meta.antigravity.systemPrompt.append`). Evaluated
-	 *  lazily per call; undefined appends nothing. */
-	systemPrompt?: () => string | undefined;
+	 *  lazily per call with this process's agent; undefined appends nothing. */
+	systemPrompt?: (agent: string | undefined) => string | undefined;
 	/** Permission policy for session/request_permission, evaluated per request:
 	 *  "auto" selects the first allow option, "deny" the first reject option.
 	 *  Absent = deny (fail closed). */
@@ -122,6 +127,11 @@ export class AcpConnection {
 		return this.#child?.pid;
 	}
 
+	/** The custom agent this process was started with. */
+	get agent(): string | undefined {
+		return this.#opts.agent;
+	}
+
 	get serverVersion(): string | undefined {
 		return this.#serverVersion;
 	}
@@ -135,7 +145,8 @@ export class AcpConnection {
 	 *  instance. */
 	async start(): Promise<void> {
 		if (this.#child) throw new Error("ACP connection already started");
-		const child = spawn(this.#opts.bin, this.#opts.binArgs ?? ["acp"], {
+		const args = [...(this.#opts.binArgs ?? ["acp"]), ...(this.#opts.agent ? ["--agent", this.#opts.agent] : [])];
+		const child = spawn(this.#opts.bin, args, {
 			cwd: this.#opts.cwd,
 			stdio: ["pipe", "pipe", "pipe"],
 			// Own process group: teardown kills agy and any helpers it spawned.
@@ -341,14 +352,14 @@ export class AcpConnection {
 		}
 	}
 
-	/** agy keeps its native tools alongside pi's (`agy acp` ignores tool
-	 *  allowlists). Expose pi tools directly, not through agy's lazy
-	 *  call_mcp_tool helper, and append the tool policy to agy's system prompt
-	 *  (honored by session/new, session/resume, and session/load). */
+	/** Expose pi tools directly, not through agy's lazy call_mcp_tool helper
+	 *  (under realagy's agent profile agy ignores this and the profile marks
+	 *  the tools eager instead), and append the tool policy to agy's system
+	 *  prompt (honored by session/new, session/resume, and session/load). */
 	#meta(): Record<string, unknown> {
 		let append: string | undefined;
 		try {
-			append = this.#opts.systemPrompt?.();
+			append = this.#opts.systemPrompt?.(this.#opts.agent);
 		} catch (err) {
 			this.#opts.log("system-prompt-failed", { message: err instanceof Error ? err.message : String(err) });
 		}

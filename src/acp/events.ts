@@ -16,6 +16,7 @@
 // frames; both are handled by the driver, not here.
 
 import { PI_BRIDGE_SERVER } from "../native-tools.js";
+import { FileLinkRewriter } from "../file-links.js";
 import { StreamSanitizer } from "../stream-sanitizer.js";
 
 /** Map one `update` object to a driver-level event, or null when the update
@@ -253,6 +254,14 @@ export class TextAccumulator {
 	#sanitizedAcc = "";
 	#cumulative: boolean | undefined;
 	#sanitizer = new StreamSanitizer();
+	/** file:// Markdown links become plain paths (src/file-links.ts). */
+	#links: FileLinkRewriter;
+
+	/** `cwd`: the turn's working directory; link targets inside it are
+	 *  shown relative to it. */
+	constructor(cwd?: string) {
+		this.#links = new FileLinkRewriter(cwd);
+	}
 
 	/** Returns the delta to emit, or null when nothing new should be emitted. */
 	append(delta: string): string | null {
@@ -284,7 +293,7 @@ export class TextAccumulator {
 		}
 
 		if (rawEmit === null) return null;
-		const sanitized = this.#sanitizer.push(rawEmit);
+		const sanitized = this.#links.push(this.#sanitizer.push(rawEmit));
 		if (sanitized.length > 0) {
 			this.#sanitizedAcc += sanitized;
 			return sanitized;
@@ -292,8 +301,20 @@ export class TextAccumulator {
 		return null;
 	}
 
+	/** The reply text paused (a tool call starts): release a held partial
+	 *  link, which can no longer complete, so it is not emitted after the
+	 *  call. */
+	boundary(): string | null {
+		const released = this.#links.flush();
+		if (released.length > 0) {
+			this.#sanitizedAcc += released;
+			return released;
+		}
+		return null;
+	}
+
 	flush(): string | null {
-		const flushed = this.#sanitizer.flush();
+		const flushed = this.#links.push(this.#sanitizer.flush()) + this.#links.flush();
 		if (flushed.length > 0) {
 			this.#sanitizedAcc += flushed;
 			return flushed;
