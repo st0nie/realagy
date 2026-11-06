@@ -669,7 +669,7 @@ function matchWarm(index: TranscriptIndex, cwd: string, warm: WarmSession | unde
 		return { reason: index.persistent().length <= warm.count ? "history-shrank" : "history-diverged" };
 	}
 	if (split.delta.length === 0) return { reason: "history-shrank" };
-	if (!split.delta.some((message) => message.role === "user")) return { reason: "no-user-message" };
+	if (!split.delta.some((message) => message.role === "user" || message.role === "toolResult")) return { reason: "no-user-message" };
 	return { warm, delta: split.delta };
 }
 

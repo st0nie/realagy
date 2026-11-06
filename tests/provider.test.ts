@@ -7,7 +7,7 @@ import { createAssistantMessageEventStream, type AssistantMessageEvent, type Mes
 import { calculateContextTokens, AgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { test, vi } from "vitest";
 import { conversationDbPath, lastStepIdx } from "../src/acp/step-usage.js";
-import { createStreamSimple, POLL_TOOL_NAME, ToolRoundTrips, type AcpSessions } from "../src/provider.js";
+import { createStreamSimple, ESCALATE_AFTER_MS, POLL_TOOL_NAME, ToolRoundTrips, type AcpSessions } from "../src/provider.js";
 import type { DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../src/driver-types.js";
 import { FALLBACK_MODELS, toPiModel } from "../src/models.js";
 import {
@@ -216,23 +216,101 @@ test("MCP call becomes a genuine pi toolUse and its toolResult resumes ACP", asy
 	assert.equal(finalDone?.type === "done" && (finalDone.message.usage as typeof finalDone.message.usage & { agyCumulativeTotalTokens?: number }).agyCumulativeTotalTokens, 697244);
 });
 
-test("slow tools early-ack and return the real result through the poll tool", async () => {
+test("slow tools early-ack after ESCALATE_AFTER_MS, long-poll on bridge_poll_result, and never hard-kill running tools at 30m", async () => {
 	vi.useFakeTimers();
 	try {
 		const driver = new FakeDriver();
 		driver.autoFinish = false;
 		await driver.run({ cwd: process.cwd(), model: "gpt-oss-120b", mode: "default", skipPermissions: true, prompt: "test" });
 		const roundTrips = new ToolRoundTrips(driver);
-		const parked = roundTrips.onToolCall("slow-1", "bash", {}, new AbortController().signal);
+		const initialAbort = new AbortController();
+		const parked = roundTrips.onToolCall("slow-1", "bash", {}, initialAbort.signal);
+
+		// Does not escalate at 20s anymore; escalates at ESCALATE_AFTER_MS (150s).
 		await vi.advanceTimersByTimeAsync(20_000);
+		let settled = false;
+		void parked.then(() => { settled = true; });
+		await Promise.resolve();
+		assert.equal(settled, false);
+
+		await vi.advanceTimersByTimeAsync(ESCALATE_AFTER_MS - 20_000);
 		const early = await parked;
 		assert.match(early.content[0].type === "text" ? early.content[0].text : "", /STILL RUNNING/);
-		roundTrips.resolve("slow-1", "slow output", false);
-		const polled = await roundTrips.onToolCall("poll", POLL_TOOL_NAME, { callId: "slow-1" }, new AbortController().signal);
-		assert.deepEqual(polled, { content: [{ type: "text", text: "slow output" }], isError: false });
+
+		// Initial HTTP request aborting after escalation must not fail the running tool.
+		initialAbort.abort();
+
+		// First bridge_poll_result holds for ESCALATE_AFTER_MS and returns STILL RUNNING if still running.
+		const poll1Promise = roundTrips.onToolCall("poll-1", POLL_TOOL_NAME, { callId: "slow-1" }, new AbortController().signal);
+		await vi.advanceTimersByTimeAsync(ESCALATE_AFTER_MS);
+		const poll1 = await poll1Promise;
+		assert.match(poll1.content[0].type === "text" ? poll1.content[0].text : "", /STILL RUNNING/);
+
+		// Even after 40 minutes of running, the escalated tool is NOT killed.
+		await vi.advanceTimersByTimeAsync(40 * 60_000);
+
+		// Second bridge_poll_result holds until resolve() is called, then wakes immediately.
+		const poll2Promise = roundTrips.onToolCall("poll-2", POLL_TOOL_NAME, { callId: "slow-1" }, new AbortController().signal);
+		await vi.advanceTimersByTimeAsync(5_000);
+		roundTrips.resolve("slow-1", "20-min build succeeded", false);
+		const polled = await poll2Promise;
+		assert.deepEqual(polled, { content: [{ type: "text", text: "20-min build succeeded" }], isError: false });
 	} finally {
 		vi.useRealTimers();
 	}
+});
+
+test("late toolResult after ACP turn ended while escalated tool was running reuses warm ACP session", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const entries = [...FALLBACK_MODELS];
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const roundTrips = new ToolRoundTrips(driver, { escalateAfterMs: 10, pollWaitMs: 10 });
+	const sessions: AcpSessions = {};
+	const streamSimple = createStreamSimple({ entries, driver, roundTrips, sessions });
+
+	const userMsg = user("Run 20m task");
+	const first = collect(streamSimple(model, context([system(), userMsg])));
+	await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+
+	const parked = roundTrips.onToolCall("long-call-1", "bash", { command: "sleep 1200" }, new AbortController().signal);
+	const firstEvents = await first;
+	const firstDone = firstEvents.find((event) => event.type === "done");
+	assert.equal(firstDone?.type === "done" && firstDone.reason, "toolUse");
+	if (firstDone?.type !== "done") return;
+
+	// Escalates while pi is still running the tool.
+	const early = await parked;
+	assert.match(early.content[0].type === "text" ? early.content[0].text : "", /STILL RUNNING/);
+
+	// Suppose agy gives up polling and ends its ACP turn before the tool finishes in pi.
+	const handle = driver.activeHandle as FakeHandle;
+	handle.pushExternal({ type: "text", delta: "Task is still running, let me know when done." });
+	handle.complete({ conversationId: "conv-long-1", status: "OK", response: "Task is still running", aborted: false });
+	driver.activeHandle = null;
+	await handle.outcome;
+
+	// Warm session should have been recorded at the toolUse checkpoint when the handle settled.
+	await vi.waitFor(() => assert.equal(sessions.warm?.sessionId, "conv-long-1"));
+	assert.equal(sessions.parked, undefined);
+
+	// 20 minutes later, pi finishes the bash tool and invokes streamSimple with the toolResult.
+	driver.autoFinish = true;
+	driver.script = [{ type: "text", delta: "Received the 20m build output!" }];
+	const toolResult: Message = {
+		role: "toolResult",
+		toolCallId: "long-call-1",
+		toolName: "bash",
+		content: [{ type: "text", text: "build completed after 20m" }],
+		isError: false,
+		timestamp: Date.now(),
+	};
+	const secondEvents = await collect(streamSimple(model, context([system(), userMsg, firstDone.message, toolResult])));
+	assert.ok(secondEvents.some((event) => event.type === "text_delta" && event.delta === "Received the 20m build output!"));
+	assert.equal(driver.requests.length, 2);
+	assert.equal(driver.requests[1].conversationId, "conv-long-1");
+	assert.match(driver.requests[1].contextBlock?.text ?? "", /<pi-tool-result name="bash" id="long-call-1" error=false>/);
+	assert.match(driver.requests[1].contextBlock?.text ?? "", /build completed after 20m/);
 });
 
 

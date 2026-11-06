@@ -31,14 +31,22 @@ import { quotaExhaustion, type UsageMeter } from "./quota.js";
 
 export const POLL_TOOL_NAME = "bridge_poll_result";
 const PARK_TIMEOUT_MS = 8 * 60_000;
-const ESCALATE_AFTER_MS = 20_000;
+/** `agy acp` times out an MCP `tools/call` request after 180 s. Escalate to
+ *  `bridge_poll_result` at 150 s, and hold each poll for up to 150 s so slow
+ *  foreground tools never hit the 180 s cap or spin in a 0 ms poll loop. */
+export const ESCALATE_AFTER_MS = 150_000;
 const ESCALATED_TTL_MS = 30 * 60_000;
+
+export interface ToolRoundTripsOptions {
+	escalateAfterMs?: number;
+	pollWaitMs?: number;
+}
 
 interface PendingCall {
 	name: string;
 	resolve: (result: BridgeResult) => void;
 	reject: (error: Error) => void;
-	timer: NodeJS.Timeout;
+	timer?: NodeJS.Timeout;
 	escalateTimer?: NodeJS.Timeout;
 	escalated: boolean;
 	signal: AbortSignal;
@@ -52,6 +60,7 @@ interface PollResult {
 	isError?: boolean;
 	images: Array<{ data: string; mimeType: string }>;
 	expires: number;
+	waiters: Set<(result: BridgeResult) => void>;
 }
 
 /** MCP calls park into a real pi toolUse. Slow calls early-ack with a poll
@@ -69,11 +78,25 @@ function bridgeResult(text: string, isError: boolean, images: Array<{ data: stri
 	};
 }
 
+function stillRunningResult(callId: string, initial: boolean): BridgeResult {
+	const action = initial
+		? `The pi tool is still executing. Call ${POLL_TOOL_NAME} with callId ${JSON.stringify(callId)} until it returns the result. Do not call other tools or end your turn while it is running.`
+		: `The pi tool is still executing. Call ${POLL_TOOL_NAME} again with callId ${JSON.stringify(callId)} until it returns the result.`;
+	return {
+		content: [{ type: "text", text: `STILL RUNNING\n${action}` }],
+	};
+}
+
 export class ToolRoundTrips {
 	#pending = new Map<string, PendingCall>();
 	#polls = new Map<string, PollResult>();
+	#escalateAfterMs: number;
+	#pollWaitMs: number;
 
-	constructor(private readonly driver: TurnDriver) {}
+	constructor(private readonly driver: TurnDriver, opts: ToolRoundTripsOptions = {}) {
+		this.#escalateAfterMs = opts.escalateAfterMs ?? ESCALATE_AFTER_MS;
+		this.#pollWaitMs = opts.pollWaitMs ?? this.#escalateAfterMs;
+	}
 
 	/** True while the bridge waits for pi's result of this call. */
 	isPending(callId: string): boolean {
@@ -81,7 +104,7 @@ export class ToolRoundTrips {
 	}
 
 	onToolCall = (callId: string, name: string, args: Record<string, unknown>, signal: AbortSignal): Promise<BridgeResult> => {
-		if (name === POLL_TOOL_NAME) return Promise.resolve(this.#poll(typeof args.callId === "string" ? args.callId : ""));
+		if (name === POLL_TOOL_NAME) return this.#poll(typeof args.callId === "string" ? args.callId : "", signal);
 		const handle = this.driver.activeHandle;
 		if (!handle) return Promise.reject(new Error("no active Antigravity turn for this pi tool call"));
 		this.#prunePolls();
@@ -95,17 +118,26 @@ export class ToolRoundTrips {
 				onAbort: () => this.#fail(callId, "ACP disconnected before the pi tool result arrived"),
 				timer: setTimeout(() => this.#fail(callId, "pi tool round-trip timed out"), PARK_TIMEOUT_MS),
 			};
-			pending.escalateTimer = setTimeout(() => {
-				const current = this.#pending.get(callId);
-				if (!current) return;
-				current.escalated = true;
-				clearTimeout(current.timer);
-				current.timer = setTimeout(() => this.#fail(callId, "escalated pi tool timed out"), ESCALATED_TTL_MS);
-				this.#polls.set(callId, { name, state: "running", images: [], expires: Date.now() + ESCALATED_TTL_MS });
-				resolve({
-					content: [{ type: "text", text: `STILL RUNNING\nThe pi tool is still executing. Call ${POLL_TOOL_NAME} with callId ${JSON.stringify(callId)} until it returns the result.` }],
-				});
-			}, ESCALATE_AFTER_MS);
+			if (this.#escalateAfterMs > 0) {
+				pending.escalateTimer = setTimeout(() => {
+					const current = this.#pending.get(callId);
+					if (!current) return;
+					current.escalated = true;
+					if (current.timer) clearTimeout(current.timer);
+					current.timer = undefined;
+					// The initial HTTP request is about to finish with STILL RUNNING;
+					// its socket closing afterwards must not abort the running pi tool.
+					current.signal.removeEventListener("abort", current.onAbort);
+					this.#polls.set(callId, {
+						name,
+						state: "running",
+						images: [],
+						expires: Number.POSITIVE_INFINITY,
+						waiters: new Set(),
+					});
+					resolve(stillRunningResult(callId, true));
+				}, this.#escalateAfterMs);
+			}
 			this.#pending.set(callId, pending);
 			signal.addEventListener("abort", pending.onAbort, { once: true });
 			handle.pushExternal({ type: "bridge_call", callId, name, args });
@@ -116,21 +148,34 @@ export class ToolRoundTrips {
 		const pending = this.#pending.get(callId);
 		if (!pending) return false;
 		this.#pending.delete(callId);
-		clearTimeout(pending.timer);
+		if (pending.timer) clearTimeout(pending.timer);
 		if (pending.escalateTimer) clearTimeout(pending.escalateTimer);
 		pending.signal.removeEventListener("abort", pending.onAbort);
+		const finalResult = bridgeResult(text, isError, images);
 		if (pending.escalated) {
-			this.#polls.set(callId, { name: pending.name, state: "done", text, isError, images, expires: Date.now() + ESCALATED_TTL_MS });
+			const waiters = this.#polls.get(callId)?.waiters;
+			this.#polls.set(callId, {
+				name: pending.name,
+				state: "done",
+				text,
+				isError,
+				images,
+				expires: Date.now() + ESCALATED_TTL_MS,
+				waiters: new Set(),
+			});
+			if (waiters) {
+				for (const wake of waiters) wake(finalResult);
+			}
 		} else {
-			pending.resolve(bridgeResult(text, isError, images));
+			pending.resolve(finalResult);
 		}
 		this.driver.kickIdle();
 		return true;
 	}
 
-	failAll(reason: string): void {
+	failAll(reason: string, opts: { includeEscalated?: boolean } = {}): void {
 		for (const id of [...this.#pending.keys()]) {
-			if (!this.#pending.get(id)?.escalated) this.#fail(id, reason);
+			if (opts.includeEscalated || !this.#pending.get(id)?.escalated) this.#fail(id, reason);
 		}
 	}
 
@@ -138,27 +183,74 @@ export class ToolRoundTrips {
 		const pending = this.#pending.get(callId);
 		if (!pending) return;
 		this.#pending.delete(callId);
-		clearTimeout(pending.timer);
+		if (pending.timer) clearTimeout(pending.timer);
 		if (pending.escalateTimer) clearTimeout(pending.escalateTimer);
 		pending.signal.removeEventListener("abort", pending.onAbort);
 		if (pending.escalated) {
-			this.#polls.set(callId, { name: pending.name, state: "done", text: `Error: ${reason}`, isError: true, images: [], expires: Date.now() + ESCALATED_TTL_MS });
+			const text = `Error: ${reason}`;
+			const finalResult = bridgeResult(text, true, []);
+			const waiters = this.#polls.get(callId)?.waiters;
+			this.#polls.set(callId, {
+				name: pending.name,
+				state: "done",
+				text,
+				isError: true,
+				images: [],
+				expires: Date.now() + ESCALATED_TTL_MS,
+				waiters: new Set(),
+			});
+			if (waiters) {
+				for (const wake of waiters) wake(finalResult);
+			}
 		} else {
 			pending.reject(new Error(reason));
 		}
 		this.driver.kickIdle();
 	}
 
-	#poll(callId: string): BridgeResult {
+	#poll(callId: string, signal: AbortSignal): Promise<BridgeResult> {
+		this.#prunePolls();
 		const result = this.#polls.get(callId);
-		if (!result) return { content: [{ type: "text", text: `Unknown or non-escalated callId: ${callId || "(missing)"}` }], isError: true };
-		if (result.state === "running") return { content: [{ type: "text", text: `STILL RUNNING\nCall ${POLL_TOOL_NAME} again with the same callId.` }] };
-		return bridgeResult(result.text ?? "", result.isError ?? false, result.images);
+		if (!result) {
+			return Promise.resolve({ content: [{ type: "text", text: `Unknown or non-escalated callId: ${callId || "(missing)"}` }], isError: true });
+		}
+		if (result.state === "done") {
+			return Promise.resolve(bridgeResult(result.text ?? "", result.isError ?? false, result.images));
+		}
+		if (signal.aborted) {
+			return Promise.reject(new Error("ACP disconnected while polling pi tool result"));
+		}
+		if (this.#pollWaitMs <= 0) {
+			return Promise.resolve(stillRunningResult(callId, false));
+		}
+		return new Promise<BridgeResult>((resolve, reject) => {
+			const cleanup = () => {
+				clearTimeout(timer);
+				result.waiters.delete(wake);
+				signal.removeEventListener("abort", onAbort);
+			};
+			const wake = (settled: BridgeResult) => {
+				cleanup();
+				resolve(settled);
+			};
+			const onAbort = () => {
+				cleanup();
+				reject(new Error("ACP disconnected while polling pi tool result"));
+			};
+			const timer = setTimeout(() => {
+				cleanup();
+				resolve(stillRunningResult(callId, false));
+			}, this.#pollWaitMs);
+			result.waiters.add(wake);
+			signal.addEventListener("abort", onAbort, { once: true });
+		});
 	}
 
 	#prunePolls(): void {
 		const now = Date.now();
-		for (const [id, result] of this.#polls) if (result.expires <= now) this.#polls.delete(id);
+		for (const [id, result] of this.#polls) {
+			if (result.state === "done" && result.expires <= now) this.#polls.delete(id);
+		}
 	}
 }
 
@@ -325,6 +417,7 @@ async function consumeTurn(
 	model: Model<Api>,
 	options: SimpleStreamOptions | undefined,
 	onCompleted: (outcome: TurnOutcome, final: AssistantMessage) => void,
+	onToolCall: (handle: TurnHandle, assistant: AssistantMessage) => void,
 	meter: UsageMeter | undefined,
 ): Promise<void> {
 	const usage = blocks.usage;
@@ -347,6 +440,7 @@ async function consumeTurn(
 			syncUsage(blocks.partial.usage, usage);
 		} else if (activity.type === "bridge_call") {
 			emitToolUse(stream, blocks, activity);
+			onToolCall(handle, blocks.partial);
 			return;
 		}
 		// tool_start/tool_done/tool_error only feed onProviderStreamEvent: agy
@@ -388,6 +482,9 @@ export interface AcpSessions {
 	onWarm?: (warm: WarmSession) => void;
 	/** cwd of the in-flight turn, for continuations that complete it. */
 	turnCwd?: string;
+	/** In-flight toolUse turn: if agy ends its prompt while an escalated pi tool
+	 *  is still running, its outcome records a warm checkpoint at `assistant`. */
+	parked?: { handle: TurnHandle };
 }
 function selectTurnPlan(context: TranscriptContext, cwd: string, sessions: AcpSessions): TurnPlan {
 	const candidates: WarmSession[] = [];
@@ -412,15 +509,27 @@ export interface StreamSimpleDeps {
 
 export function createStreamSimple(deps: StreamSimpleDeps) {
 	const sessions = deps.sessions ?? {};
+	const recordWarm = (targetContext: TranscriptContext, outcome: TurnOutcome, final: AssistantMessage): void => {
+		if (outcome.status !== "OK" || outcome.aborted || !outcome.conversationId || sessions.turnCwd === undefined) return;
+		const warm = warmAfterTurn(targetContext, final, outcome.conversationId, sessions.turnCwd, outcome.maxStepIdx);
+		sessions.warm = warm;
+		sessions.checkpoints = [...(sessions.checkpoints ?? []), warm];
+		sessions.onWarm?.(warm);
+	};
 	return (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream => {
 		const stream = createAssistantMessageEventStream();
 		const blocks: BlockState = { partial: newAssistant(model), textIdx: null, thinkingIdx: null, started: false, usage: {} };
 		const onCompleted = (outcome: TurnOutcome, final: AssistantMessage): void => {
-			if (outcome.status !== "OK" || !outcome.conversationId || sessions.turnCwd === undefined) return;
-			const warm = warmAfterTurn(context, final, outcome.conversationId, sessions.turnCwd, outcome.maxStepIdx);
-			sessions.warm = warm;
-			sessions.checkpoints = [...(sessions.checkpoints ?? []), warm];
-			sessions.onWarm?.(warm);
+			recordWarm(context, outcome, final);
+		};
+		const onToolCall = (handle: TurnHandle, assistant: AssistantMessage): void => {
+			const parked = { handle };
+			sessions.parked = parked;
+			void handle.outcome.then((outcome) => {
+				if (sessions.parked !== parked) return;
+				sessions.parked = undefined;
+				recordWarm(context, outcome, assistant);
+			});
 		};
 		void (async () => {
 			try {
@@ -435,9 +544,16 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 				}
 				const active = results.length > 0 ? deps.driver.reentry() : null;
 				if (active) {
-					await consumeTurn(stream, blocks, active, model, options, onCompleted, deps.meter);
+					sessions.parked = undefined;
+					await consumeTurn(stream, blocks, active, model, options, onCompleted, onToolCall, deps.meter);
 					return;
 				}
+				if (results.length > 0 && sessions.parked) {
+					// Flush an already-settled parked handle's outcome handler
+					// before planning the continuation turn.
+					await Promise.resolve();
+				}
+				sessions.parked = undefined;
 				// A turn still parked on pi tool calls that this context does not
 				// answer is orphaned (pi's loop ended after its toolUse message):
 				// end it now instead of queueing behind it until its timeout.
@@ -472,7 +588,7 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 				const replacement = await options?.onPayload?.(request, model);
 				const handle = await deps.driver.run((replacement === undefined ? request : replacement) as DriverTurnRequest);
 				await options?.onResponse?.({ status: 200, headers: {} }, model);
-				await consumeTurn(stream, blocks, handle, model, options, onCompleted, deps.meter);
+				await consumeTurn(stream, blocks, handle, model, options, onCompleted, onToolCall, deps.meter);
 			} catch (error) {
 				finish(stream, blocks, options?.signal?.aborted ? "aborted" : "error", error instanceof Error ? error.message : String(error));
 			}

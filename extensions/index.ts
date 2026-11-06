@@ -162,6 +162,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	const syncWarmFromSession = (ctx: { sessionManager?: { getBranch?: () => unknown[]; getEntries?: () => unknown[] } }): void => {
 		pendingWarmEntry = null;
+		sessions.parked = undefined;
 		const branch = (ctx.sessionManager?.getBranch?.() ?? []) as readonly SessionEntryLike[];
 		const all = (ctx.sessionManager?.getEntries?.() ?? branch) as readonly SessionEntryLike[];
 		const restored = restoreWarmSessions(branch, all);
@@ -181,6 +182,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	});
 	pi.on("session_compact", () => {
 		pendingWarmEntry = null;
+		sessions.parked = undefined;
 		sessions.warm = undefined;
 		sessions.checkpoints = undefined;
 	});
@@ -201,9 +203,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		ui = undefined;
 		shutdownController.abort();
 		pendingWarmEntry = null;
+		sessions.parked = undefined;
 		sessions.warm = undefined;
 		sessions.checkpoints = undefined;
-		roundTrips.failAll("pi session shut down");
+		roundTrips.failAll("pi session shut down", { includeEscalated: true });
 		void driver.close();
 		if (bridge) void bridge.close();
 		bridge = null;

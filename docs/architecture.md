@@ -41,7 +41,7 @@ A pi tool call follows this path:
 3. Pi runs the tool under its normal permission policy and hooks.
 4. Pi's `toolResult` answers the parked MCP request — appending any user steering messages and images queued while the tool ran as a `<pi-steering>` block — and the same ACP turn continues.
 
-After 20 seconds, a slow tool returns a `STILL RUNNING` handle that the model resolves through `bridge_poll_result`. This avoids upstream MCP timeouts.
+`agy acp` times out an MCP `tools/call` HTTP request after 180 seconds. After 150 seconds (`ESCALATE_AFTER_MS`), a still-running pi tool returns a `STILL RUNNING` handle that the model resolves through `bridge_poll_result`. Each `bridge_poll_result` request long-polls for up to another 150 seconds, waking immediately when the tool finishes, so multi-minute or multi-hour foreground tools never hit the 180-second MCP deadline or spin in a tight polling loop. While pi is still executing an escalated tool, no hard timeout kills the call. If agy stops polling and ends its prompt before the pi tool finishes, realagy records the warm checkpoint at the `toolUse` message and delivers the late `toolResult` on the same ACP session as a `pi://transcript-delta` continuation.
 
 ## Images
 
