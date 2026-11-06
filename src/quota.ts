@@ -1,9 +1,18 @@
 // `/agy usage`: cache-hit rate from exact per-model-call usage (step_usage)
-// and plan quota from `agy --print /usage`, plus agy's fixed "Usage Limit
+// and plan quota from the live `agy acp` Language Server ConnectRPC endpoint
+// (with fallback to `agy --print /usage`), plus agy's fixed "Usage Limit
 // Reached" notice, which arrives as ordinary model text.
 
 import { execFile } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { agyDataDir } from "./acp/setup.js";
 import type { AgyStepUsage } from "./driver-types.js";
+
+const ACP_QUOTA_PATH = "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
+const ACP_QUOTA_TIMEOUT_MS = 15_000;
+const ACP_LOG_HEAD_BYTES = 64 * 1024;
+const HTTP_PORT_RE = /Language server listening on [^\r\n]+? port at (\d+) for HTTP(?:\r?\n|$)/m;
 
 const UNIT_MS: Record<string, number> = { day: 86_400_000, hour: 3_600_000, minute: 60_000, second: 1_000 };
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -47,7 +56,52 @@ function str(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value : undefined;
 }
 
-/** Parse `agy --print /usage --output-format json`. */
+export function defaultAgyLogDir(env: NodeJS.ProcessEnv = process.env): string {
+	return path.join(agyDataDir(env), "log");
+}
+
+let cachedAcpPort: { pid: number; logDir: string; port: number } | undefined;
+
+/** Find the in-process Language Server HTTP port logged by `agy acp` on its
+ *  first `session/new` (`acp-server-<timestamp>-<pid>.log`). */
+export function findAcpHttpPort(pid: number, logDir = defaultAgyLogDir()): number | undefined {
+	if (!Number.isInteger(pid) || pid <= 0) return undefined;
+	if (cachedAcpPort?.pid === pid && cachedAcpPort.logDir === logDir) return cachedAcpPort.port;
+	let entries: string[];
+	try {
+		entries = fs.readdirSync(logDir);
+	} catch {
+		return undefined;
+	}
+	const suffix = `-${pid}.log`;
+	const matches = entries
+		.filter((name) => name.startsWith("acp-server-") && name.endsWith(suffix))
+		.sort((a, b) => b.localeCompare(a));
+	for (const name of matches) {
+		try {
+			const fd = fs.openSync(path.join(logDir, name), "r");
+			let head: string;
+			try {
+				const buf = Buffer.allocUnsafe(ACP_LOG_HEAD_BYTES);
+				const bytes = fs.readSync(fd, buf, 0, buf.length, 0);
+				head = buf.subarray(0, bytes).toString("utf8");
+			} finally {
+				fs.closeSync(fd);
+			}
+			const match = HTTP_PORT_RE.exec(head);
+			const port = match ? Number(match[1]) : NaN;
+			if (Number.isInteger(port) && port > 0 && port <= 65535) {
+				cachedAcpPort = { pid, logDir, port };
+				return port;
+			}
+		} catch {
+			// Try the next candidate or fall back.
+		}
+	}
+	return undefined;
+}
+
+/** Parse `agy --print /usage --output-format json` or ConnectRPC `RetrieveUserQuotaSummary`. */
 export function parseCliUsage(stdout: string): UsageGroup[] {
 	let root: Record<string, unknown> | undefined;
 	try {
@@ -57,19 +111,26 @@ export function parseCliUsage(stdout: string): UsageGroup[] {
 	}
 	const status = str(root?.status);
 	if (status && status !== "SUCCESS") throw new Error(str(root?.error) ?? `agy /usage failed (${status})`);
-	const groups = record(record(root?.command)?.data)?.groups;
+	const rpcMessage = str(root?.message);
+	if (str(root?.code) && rpcMessage) throw new Error(rpcMessage);
+	const data = record(record(root?.command)?.data) ?? record(root?.response) ?? root;
+	const groups = data?.groups;
 	const result: UsageGroup[] = [];
 	for (const value of Array.isArray(groups) ? groups : []) {
 		const group = record(value);
-		const name = str(group?.name);
+		const name = str(group?.name) ?? str(group?.displayName);
 		if (!name) continue;
 		const buckets: UsageBucket[] = [];
 		for (const raw of Array.isArray(group?.buckets) ? group.buckets : []) {
 			const bucket = record(raw);
-			const fraction = bucket?.remaining_fraction;
+			const fraction = bucket?.remaining_fraction ?? bucket?.remainingFraction;
 			if (typeof fraction !== "number" || !Number.isFinite(fraction)) continue;
-			const resetTime = str(bucket?.reset_time);
-			buckets.push({ window: str(bucket?.window) ?? str(bucket?.id) ?? "limit", remainingFraction: fraction, ...(resetTime ? { resetTime } : {}) });
+			const resetTime = str(bucket?.reset_time) ?? str(bucket?.resetTime);
+			buckets.push({
+				window: str(bucket?.window) ?? str(bucket?.id) ?? str(bucket?.bucketId) ?? "limit",
+				remainingFraction: fraction,
+				...(resetTime ? { resetTime } : {}),
+			});
 		}
 		result.push({ name, description: str(group?.description) ?? "", buckets });
 	}
@@ -77,12 +138,55 @@ export function parseCliUsage(stdout: string): UsageGroup[] {
 	return result;
 }
 
-export function fetchCliUsage(
-	bin: string,
-	options: number | { timeoutMs?: number; signal?: AbortSignal } = 60_000,
+/** Query the live `agy acp` process's local ConnectRPC Language Server for fresh quota. */
+export async function fetchAcpQuota(
+	port: number,
+	options: { timeoutMs?: number; signal?: AbortSignal } = {},
 ): Promise<UsageGroup[]> {
-	const timeoutMs = typeof options === "number" ? options : (options.timeoutMs ?? 60_000);
-	const signal = typeof options === "number" ? undefined : options.signal;
+	const timeoutMs = options.timeoutMs ?? ACP_QUOTA_TIMEOUT_MS;
+	const timeoutSignal = AbortSignal.timeout(timeoutMs);
+	const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+	const res = await fetch(`http://127.0.0.1:${port}${ACP_QUOTA_PATH}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify({ forceRefresh: true }),
+		signal,
+	});
+	const body = await res.text();
+	if (!res.ok) throw new Error(`agy ACP quota HTTP ${res.status}: ${body.slice(0, 200)}`);
+	return parseCliUsage(body);
+}
+
+export interface FetchUsageOptions {
+	timeoutMs?: number;
+	signal?: AbortSignal;
+	/** PID of the live `agy acp` process, used to find its local HTTP port. */
+	pid?: number;
+	/** Directory holding `acp-server-*-<pid>.log` (default: `<agyDataDir>/log`). */
+	logDir?: string;
+	/** Explicit local Language Server HTTP port (skips log discovery). */
+	port?: number;
+}
+
+export async function fetchCliUsage(
+	bin: string,
+	options: number | FetchUsageOptions = 60_000,
+): Promise<UsageGroup[]> {
+	const opts = typeof options === "number" ? { timeoutMs: options } : options;
+	const timeoutMs = opts.timeoutMs ?? 60_000;
+	const signal = opts.signal;
+	let port = opts.port;
+	if (port === undefined && opts.pid !== undefined) {
+		port = findAcpHttpPort(opts.pid, opts.logDir);
+	}
+	if (port !== undefined) {
+		try {
+			return await fetchAcpQuota(port, { timeoutMs: Math.min(timeoutMs, ACP_QUOTA_TIMEOUT_MS), signal });
+		} catch (error) {
+			if (signal?.aborted) throw error;
+			if (opts.pid !== undefined && cachedAcpPort?.pid === opts.pid) cachedAcpPort = undefined;
+		}
+	}
 	return new Promise((resolve, reject) => {
 		let settled = false;
 		let output = "";

@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "vitest";
 import { AcpDriver } from "../src/acp/driver.js";
 import { forkConversationAtStep, lastStepIdx, readStepState, siblingUsage, summarizeSteps, tokensFromMetadata } from "../src/acp/step-usage.js";
-import { fetchCliUsage, parseCliUsage, quotaExhaustion, UsageMeter } from "../src/quota.js";
+import { fetchCliUsage, findAcpHttpPort, parseCliUsage, quotaExhaustion, UsageMeter } from "../src/quota.js";
 import type { DriverActivity, TurnHandle } from "../src/driver-types.js";
 
 const varint = (n: number): number[] => {
@@ -103,9 +104,11 @@ test("AcpDriver reports exact step usage, reuses live sessions, and falls back w
 	const base = { cwd: process.cwd(), model: "gemini-3.8-flash", effort: "medium", mode: "default" as const, skipPermissions: true };
 	const wire = () => fs.readFileSync(capture, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { method: string; params: Record<string, unknown> });
 	try {
+		assert.equal(driver.pid, undefined);
 		const first = await driver.run({ ...base, prompt: "first" });
 		const firstActivities = await drain(first);
 		const outcome = await first.outcome;
+		assert.equal(typeof driver.pid, "number");
 		assert.equal(outcome.conversationId, "session-1");
 		assert.deepEqual(firstActivities.filter((activity) => activity.type === "step_usage"), [
 			{ type: "step_usage", usage: { input: 1200, output: 80, cacheRead: 8800, cacheWrite: 0, contextTokens: 10_080, steps: 1 } },
@@ -128,6 +131,7 @@ test("AcpDriver reports exact step usage, reuses live sessions, and falls back w
 		assert.deepEqual(wire().filter((request) => request.method === "session/prompt").at(-1)!.params.prompt, [{ type: "text", text: "full" }]);
 	} finally {
 		await driver.close();
+		assert.equal(driver.pid, undefined);
 	}
 });
 
@@ -140,17 +144,77 @@ const CLI_USAGE = JSON.stringify({
 	] } },
 });
 
-test("quota helpers parse agy /usage output and exhaustion notices", () => {
+const ACP_RPC_USAGE = JSON.stringify({
+	response: {
+		description: "Shared quota groups",
+		groups: [
+			{
+				displayName: "Gemini Models",
+				description: "Gemini Flash, Gemini Pro",
+				buckets: [
+					{ bucketId: "gemini-weekly", displayName: "Weekly Limit Remaining", window: "weekly", remainingFraction: 0.973, resetTime: "2026-11-12T17:45:22Z" },
+					{ bucketId: "gemini-5h", displayName: "Five Hour Limit Remaining", window: "5h", remainingFraction: 0.934, resetTime: "2026-11-06T08:20:36Z" },
+				],
+			},
+			{
+				displayName: "Claude and GPT models",
+				description: "Claude Opus, Claude Sonnet, GPT-OSS",
+				buckets: [{ bucketId: "3p-weekly", remainingFraction: 0 }],
+			},
+		],
+	},
+});
+
+test("quota helpers parse CLI snake_case, ConnectRPC camelCase, and exhaustion notices", () => {
 	const groups = parseCliUsage(CLI_USAGE);
 	assert.deepEqual(groups.map((group) => group.name), ["Gemini Models", "Claude and GPT models", "Gemini 4 Argon"]);
+	const rpcGroups = parseCliUsage(ACP_RPC_USAGE);
+	assert.deepEqual(rpcGroups, [
+		{
+			name: "Gemini Models",
+			description: "Gemini Flash, Gemini Pro",
+			buckets: [
+				{ window: "weekly", remainingFraction: 0.973, resetTime: "2026-11-12T17:45:22Z" },
+				{ window: "5h", remainingFraction: 0.934, resetTime: "2026-11-06T08:20:36Z" },
+			],
+		},
+		{
+			name: "Claude and GPT models",
+			description: "Claude Opus, Claude Sonnet, GPT-OSS",
+			buckets: [{ window: "3p-weekly", remainingFraction: 0 }],
+		},
+	]);
 	assert.throws(() => parseCliUsage("nope"));
 	assert.throws(() => parseCliUsage(JSON.stringify({ status: "ERROR", error: "not signed in" })), /not signed in/);
+	assert.throws(() => parseCliUsage(JSON.stringify({ code: "unauthenticated", message: "login required" })), /login required/);
 	const now = Date.UTC(2026, 10, 5, 0, 0);
 	assert.deepEqual(
 		quotaExhaustion("Usage Limit Reached\n\nYou have reached your current quota for this period. Your limit will reset in 2 hours, 30 minutes.", now),
 		{ resetAt: new Date(now + 2.5 * 3_600_000).toISOString() },
 	);
 	assert.equal(quotaExhaustion("All good"), undefined);
+});
+
+test("findAcpHttpPort extracts the HTTP port from acp-server logs and ignores HTTPS gRPC", () => {
+	const logDir = tmp();
+	fs.writeFileSync(
+		path.join(logDir, "acp-server-20261106_130000-7777.log"),
+		[
+			"I1106 13:00:00.100000 1 options.go:489] Starting ACP server (pid 7777)",
+			"I1106 13:00:00.200000 43 server.go:895] Language server listening on random port at 38655 for HTTPS (gRPC)",
+			"I1106 13:00:00.200100 43 server.go:903] Language server listening on random port at 41111 for HTTP",
+		].join("\n") + "\n",
+	);
+	fs.writeFileSync(
+		path.join(logDir, "acp-server-20261106_133013-7777.log"),
+		[
+			"I1106 13:30:13.879483 43 server.go:895] Language server listening on random port at 38655 for HTTPS (gRPC)",
+			"I1106 13:30:13.879590 43 server.go:903] Language server listening on random port at 43705 for HTTP",
+		].join("\n") + "\n",
+	);
+	assert.equal(findAcpHttpPort(7777, logDir), 43705);
+	assert.equal(findAcpHttpPort(9999, logDir), undefined);
+	assert.equal(findAcpHttpPort(-1, logDir), undefined);
 });
 
 test("usage meter reports cache hits and every quota group", () => {
@@ -167,7 +231,7 @@ test("usage meter reports cache hits and every quota group", () => {
 	assert.match(meter.report(), /Quota exhausted/);
 });
 
-test("fetchCliUsage resolves as soon as stdout flushes the JSON line", async () => {
+test("fetchCliUsage queries live agy acp ConnectRPC HTTP port and falls back to CLI on failure", async () => {
 	const dir = tmp();
 	const script = path.join(dir, "fake-agy.mjs");
 	fs.writeFileSync(
@@ -175,8 +239,58 @@ test("fetchCliUsage resolves as soon as stdout flushes the JSON line", async () 
 		`#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(CLI_USAGE)} + "\\n");\nsetTimeout(() => process.exit(0), 5000);\n`,
 		{ mode: 0o755 },
 	);
-	const started = Date.now();
-	const groups = await fetchCliUsage(script, 10_000);
-	assert.ok(Date.now() - started < 2000, "resolves without waiting for post-output teardown");
-	assert.equal(groups.length, 3);
+
+	let requests = 0;
+	let failRpc = false;
+	let lastBody = "";
+	let lastPath = "";
+	const server = http.createServer((req, res) => {
+		requests += 1;
+		lastPath = req.url ?? "";
+		let body = "";
+		req.setEncoding("utf8");
+		req.on("data", (chunk: string) => { body += chunk; });
+		req.on("end", () => {
+			lastBody = body;
+			if (failRpc) {
+				res.writeHead(503, { "content-type": "application/json" });
+				res.end(JSON.stringify({ code: "unavailable", message: "backend down" }));
+				return;
+			}
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(ACP_RPC_USAGE);
+		});
+	});
+	await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+	const port = (server.address() as { port: number }).port;
+	const pid = 88421;
+	fs.writeFileSync(
+		path.join(dir, `acp-server-20261106_133013-${pid}.log`),
+		`I1106 13:30:13.879590 43 server.go:903] Language server listening on random port at ${port} for HTTP\n`,
+	);
+
+	try {
+		// 1. Fast ConnectRPC path succeeds without touching the CLI binary.
+		const fastGroups = await fetchCliUsage(path.join(dir, "missing-agy"), { pid, logDir: dir, timeoutMs: 5_000 });
+		assert.equal(requests, 1);
+		assert.equal(lastPath, "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary");
+		assert.deepEqual(JSON.parse(lastBody), { forceRefresh: true });
+		assert.equal(fastGroups.length, 2);
+		assert.equal(fastGroups[0]?.buckets[0]?.remainingFraction, 0.973);
+
+		// 2. Aborting the signal rejects immediately without falling back to the CLI binary.
+		const aborted = new AbortController();
+		aborted.abort();
+		await assert.rejects(fetchCliUsage(script, { pid, logDir: dir, signal: aborted.signal }));
+
+		// 3. When ConnectRPC errors, fetchCliUsage falls back to `agy --print /usage` and resolves on the first newline.
+		failRpc = true;
+		const started = Date.now();
+		const fallbackGroups = await fetchCliUsage(script, { pid, logDir: dir, timeoutMs: 10_000 });
+		assert.equal(requests, 2);
+		assert.ok(Date.now() - started < 2000, "CLI fallback still resolves without waiting for post-output teardown");
+		assert.equal(fallbackGroups.length, 3);
+	} finally {
+		await new Promise<void>((resolve) => server.close(() => resolve()));
+	}
 });

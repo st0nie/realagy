@@ -146,6 +146,10 @@ export class AcpDriver implements TurnDriver {
 		this.#opts = opts;
 	}
 
+	/** PID of the live `agy acp` process, if running. */
+	get pid(): number | undefined {
+		return this.#conn?.alive ? this.#conn.pid : undefined;
+	}
 	/** Read the account's live catalog through the official ACP session flow. */
 	async listModels(cwd: string): Promise<Array<{ modelId: string; name?: string }>> {
 		const conn = await this.#ensureConnection(cwd);

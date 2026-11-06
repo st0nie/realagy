@@ -281,12 +281,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				ctx.ui.notify(status.ok ? "Antigravity is still starting; try again shortly." : `Antigravity: ${status.error}. Run /agy setup for install steps.`, "warning");
 				return;
 			}
-			// Show session cache stats immediately; `agy --print /usage` takes ~5-10 s.
+			// Show session cache stats immediately while fetching fresh plan quota.
 			ctx.ui.notify(`${meter.report()}\n\nLoading plan quota from agy…`, "info");
 			let quotaError = "";
 			const loaded = await runWithLoader(ctx, "Loading Antigravity plan quota…", async (signal) => {
 				try {
-					meter.setQuota(await fetchCliUsage(bin, { signal }));
+					meter.setQuota(await fetchCliUsage(bin, { signal, pid: driver.pid }));
 				} catch (error) {
 					if (!signal.aborted) {
 						quotaError = `\n\nQuota unavailable: ${error instanceof Error ? error.message : String(error)}`;

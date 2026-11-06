@@ -34,7 +34,7 @@ The catalog comes live from agy and depends on the account.
 | Command | What it does |
 | --- | --- |
 | `/agy setup` | Checks agy: shows install steps when it is missing, sign-in steps when it cannot start a session, and reloads the model catalog when it is ready |
-| `/agy usage` | Cache-hit rate for this session plus every quota group's 5-hour and weekly remaining share and reset times (from `agy --print /usage`) |
+| `/agy usage` | Cache-hit rate for this session plus every quota group's 5-hour and weekly remaining share and reset times (from the live `agy acp` server, or `agy --print /usage`) |
 
 Quota is fetched only when you run `/agy usage`. There is no settings panel, engine switch, delegation tool, global MCP registration, or config file.
 

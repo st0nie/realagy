@@ -8,6 +8,7 @@ vi.mock("../src/acp/setup.js", () => ({ ensureAgyReady: mocks.ensure, resolveAgy
 vi.mock("../src/acp/connection.js", () => ({ resolveAcpBinary: () => "agy" }));
 vi.mock("../src/quota.js", () => ({ fetchCliUsage: mocks.fetchCliUsage, UsageMeter: class { setQuota() {} report() { return "REPORT"; } } }));
 vi.mock("../src/acp/driver.js", () => ({ AcpDriver: class {
+	pid = 4242;
 	listModels = mocks.listModels;
 	close = mocks.close;
 	constructor(options: Record<string, any>) { mocks.driverOptions = options; }
@@ -136,6 +137,7 @@ describe("extension session lifecycle", () => {
 		await vi.waitFor(() => expect(mocks.listModels).toHaveBeenCalled());
 		const pending = agy.handler("usage", session.ctx);
 		expect(session.ui.notify).toHaveBeenCalledWith("REPORT\n\nLoading plan quota from agy…", "info");
+		expect(mocks.fetchCliUsage).toHaveBeenCalledWith("agy", expect.objectContaining({ pid: 4242 }));
 		quota.resolve([]);
 		await pending;
 		expect(session.ui.notify).toHaveBeenLastCalledWith("REPORT", "info");
