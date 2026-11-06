@@ -1,5 +1,5 @@
-// Loopback-only MCP transport exposing pi's ACTIVE tools to the official ACP
-// server. No global agy config, approval hooks, or tool execution happens here:
+// Loopback-only MCP transport exposing pi's tools (src/bridge-catalog.ts) to
+// the official ACP server. No global agy config, approval hooks, or tool execution happens here:
 // every call is parked into provider.ts and executed by pi itself.
 
 import http from "node:http";

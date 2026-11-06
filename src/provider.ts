@@ -105,6 +105,11 @@ export class ToolRoundTrips {
 
 	onToolCall = (callId: string, name: string, args: Record<string, unknown>, signal: AbortSignal): Promise<BridgeResult> => {
 		if (name === POLL_TOOL_NAME) return this.#poll(typeof args.callId === "string" ? args.callId : "", signal);
+		// While earlier transcript parts are delivered the model only
+		// acknowledges them; a pi tool call there would end pi's message early.
+		if (this.driver.priming) {
+			return Promise.resolve({ content: [{ type: "text", text: "Pi tools are unavailable while the pi transcript is delivered in parts. Reply with only OK." }], isError: true });
+		}
 		const handle = this.driver.activeHandle;
 		if (!handle) return Promise.reject(new Error("no active Antigravity turn for this pi tool call"));
 		this.#prunePolls();
@@ -252,6 +257,16 @@ export class ToolRoundTrips {
 			if (result.state === "done" && result.expires <= now) this.#polls.delete(id);
 		}
 	}
+}
+
+/** A settled turn's parked calls (TurnDriver.onTurnEnd). An aborted turn
+ *  fails all of them, escalated ones too: nothing will poll them any more and
+ *  pi's own tools were aborted with it. A failed turn fails the calls agy
+ *  still waits on; escalated ones keep running for pi, whose late result
+ *  continues the session as a delta. */
+export function failParkedCalls(roundTrips: ToolRoundTrips, outcome: TurnOutcome): void {
+	if (outcome.aborted) roundTrips.failAll(outcome.error ?? "Antigravity turn aborted", { includeEscalated: true });
+	else if (outcome.status === "ERROR") roundTrips.failAll(outcome.error ?? "Antigravity turn ended");
 }
 
 interface BlockState {
@@ -417,7 +432,7 @@ async function consumeTurn(
 	model: Model<Api>,
 	options: SimpleStreamOptions | undefined,
 	onCompleted: (outcome: TurnOutcome, final: AssistantMessage) => void,
-	onToolCall: (handle: TurnHandle, assistant: AssistantMessage) => void,
+	onToolCall: (handle: TurnHandle, assistant: AssistantMessage, call: Extract<DriverActivity, { type: "bridge_call" }>) => void,
 	meter: UsageMeter | undefined,
 ): Promise<void> {
 	const usage = blocks.usage;
@@ -440,7 +455,7 @@ async function consumeTurn(
 			syncUsage(blocks.partial.usage, usage);
 		} else if (activity.type === "bridge_call") {
 			emitToolUse(stream, blocks, activity);
-			onToolCall(handle, blocks.partial);
+			onToolCall(handle, blocks.partial, activity);
 			return;
 		}
 		// tool_start/tool_done/tool_error only feed onProviderStreamEvent: agy
@@ -449,7 +464,12 @@ async function consumeTurn(
 	// Occupancy reported during an EARLIER message of this turn is stale here
 	// (tool results were added since), so outcome.contextUsage is not applied.
 	const outcome = await handle.outcome;
-	if (outcome.aborted) return finish(stream, blocks, "aborted", "Operation aborted");
+	if (outcome.aborted) {
+		// The session keeps what agy recorded before the cancel, including
+		// this partial reply's turn: `continue` resumes it warm.
+		onCompleted(outcome, blocks.partial);
+		return finish(stream, blocks, "aborted", "Operation aborted");
+	}
 	if (outcome.status === "ERROR") return finish(stream, blocks, "error", outcome.error ?? "Antigravity turn failed");
 	// agy reports an exhausted plan as ordinary model text; surface it as an
 	// error so pi's retry/fallback logic and the status line see it.
@@ -469,16 +489,22 @@ async function consumeTurn(
 	finish(stream, blocks, "stop");
 }
 
-/** Per-extension ACP session continuity. `warm` is set only after a turn
- *  completes cleanly, and cleared while a turn runs. */
+/** Per-extension ACP session continuity. `warm` is the latest checkpoint:
+ *  cleared when a turn starts, set at each pi tool boundary of the turn and
+ *  when it completes or is aborted after agy recorded its prompt. */
 export interface AcpSessions {
 	warm?: WarmSession;
 	/** Historical warm checkpoints in chronological order, enabling `/tree`
-	 *  branch switching and rewind to any earlier completed turn. */
+	 *  branch switching and rewind to any earlier turn, and `continue` after
+	 *  an aborted one. */
 	checkpoints?: WarmSession[];
+	/** The in-flight turn's latest tool-boundary checkpoint (memory only):
+	 *  replaced by the turn's next checkpoint, kept if the turn fails. */
+	step?: WarmSession;
 	/** Directory holding `<sessionId>.db` stores for step-boundary forking on rewind. */
 	conversationsDir?: () => string;
-	/** Invoked when a turn completes and records a new `WarmSession`. */
+	/** Invoked when a turn settles (completed or aborted) and records a
+	 *  `WarmSession` worth persisting. */
 	onWarm?: (warm: WarmSession) => void;
 	/** cwd of the in-flight turn, for continuations that complete it. */
 	turnCwd?: string;
@@ -509,12 +535,28 @@ export interface StreamSimpleDeps {
 
 export function createStreamSimple(deps: StreamSimpleDeps) {
 	const sessions = deps.sessions ?? {};
-	const recordWarm = (targetContext: TranscriptContext, outcome: TurnOutcome, final: AssistantMessage): void => {
-		if (outcome.status !== "OK" || outcome.aborted || !outcome.conversationId || sessions.turnCwd === undefined) return;
-		const warm = warmAfterTurn(targetContext, final, outcome.conversationId, sessions.turnCwd, outcome.maxStepIdx);
+	/** Make `warm` the preferred checkpoint. A turn's tool-boundary checkpoint
+	 *  is replaced by its next one, so the list grows by one per turn. */
+	const remember = (warm: WarmSession, settled: boolean): void => {
+		const step = sessions.step;
+		const kept = (sessions.checkpoints ?? []).filter((checkpoint) => checkpoint !== step);
+		sessions.checkpoints = [...kept, warm];
 		sessions.warm = warm;
-		sessions.checkpoints = [...(sessions.checkpoints ?? []), warm];
-		sessions.onWarm?.(warm);
+		sessions.step = settled ? undefined : warm;
+		if (settled) sessions.onWarm?.(warm);
+	};
+	/** A settled turn's checkpoint: after it completed, or after an abort once
+	 *  agy recorded its prompt (the session keeps everything up to the cancel). */
+	const recordWarm = (targetContext: TranscriptContext, outcome: TurnOutcome, final: AssistantMessage): void => {
+		if (outcome.status !== "OK" || !outcome.conversationId || sessions.turnCwd === undefined) return;
+		if (outcome.aborted && outcome.promptDelivered !== true) return;
+		remember(warmAfterTurn(targetContext, final, outcome.conversationId, sessions.turnCwd, outcome.maxStepIdx), true);
+	};
+	/** At a pi tool call the session holds the transcript up to its toolUse
+	 *  message: an Esc during the tool still leaves a matching checkpoint. */
+	const recordStep = (targetContext: TranscriptContext, call: Extract<DriverActivity, { type: "bridge_call" }>, assistant: AssistantMessage): void => {
+		if (!call.sessionId || sessions.turnCwd === undefined) return;
+		remember(warmAfterTurn(targetContext, assistant, call.sessionId, sessions.turnCwd, call.maxStepIdx), false);
 	};
 	return (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream => {
 		const stream = createAssistantMessageEventStream();
@@ -522,7 +564,8 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 		const onCompleted = (outcome: TurnOutcome, final: AssistantMessage): void => {
 			recordWarm(context, outcome, final);
 		};
-		const onToolCall = (handle: TurnHandle, assistant: AssistantMessage): void => {
+		const onToolCall = (handle: TurnHandle, assistant: AssistantMessage, call: Extract<DriverActivity, { type: "bridge_call" }>): void => {
+			recordStep(context, call, assistant);
 			const parked = { handle };
 			sessions.parked = parked;
 			void handle.outcome.then((outcome) => {
@@ -548,25 +591,36 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					await consumeTurn(stream, blocks, active, model, options, onCompleted, onToolCall, deps.meter);
 					return;
 				}
+				if (options?.signal?.aborted) {
+					// Esc: pi hands back its aborted tool results with the run's
+					// signal already aborted. The turn they belonged to was cancelled
+					// by that signal (or is orphaned and is cancelled here) and
+					// records its checkpoint as it settles; nothing new starts.
+					void deps.driver.cancelActive("aborted in pi");
+					finish(stream, blocks, "aborted", "Operation aborted");
+					return;
+				}
 				if (results.length > 0 && sessions.parked) {
 					// Flush an already-settled parked handle's outcome handler
 					// before planning the continuation turn.
 					await Promise.resolve();
 				}
-				sessions.parked = undefined;
 				// A turn still parked on pi tool calls that this context does not
 				// answer is orphaned (pi's loop ended after its toolUse message):
-				// end it now instead of queueing behind it until its timeout.
+				// end it now instead of queueing behind it until its timeout. Its
+				// parked handler records the checkpoint its session reached.
 				await deps.driver.cancelActive("superseded by a new pi turn");
+				sessions.parked = undefined;
 
 				const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 				const entry = deps.entries.find((candidate) => candidate.id === model.id);
 				const plan = selectTurnPlan(context, cwd, sessions);
 				traceUsage("plan", plan.kind === "warm"
-					? { kind: plan.kind, sessionId: plan.sessionId, deltaMessages: plan.deltaMessages, delta: plan.input.contextBlock ? "transcript" : "user" }
-					: { kind: plan.kind, reason: plan.reason, messages: context.messages.length });
-				// Unknown until this turn completes cleanly.
+					? { kind: plan.kind, sessionId: plan.sessionId, deltaMessages: plan.deltaMessages, delta: plan.input.contextBlock ? "transcript" : "user", parts: plan.input.parts?.length ?? 0 }
+					: { kind: plan.kind, reason: plan.reason, messages: context.messages.length, parts: plan.input.parts?.length ?? 0 });
+				// Unknown until this turn reaches a tool boundary or settles.
 				sessions.warm = undefined;
+				sessions.step = undefined;
 				sessions.turnCwd = cwd;
 				const request: DriverTurnRequest = {
 					cwd,
@@ -581,6 +635,7 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					prompt: plan.input.prompt,
 					images: plan.input.images,
 					...(plan.input.contextBlock ? { contextBlock: plan.input.contextBlock } : {}),
+					...(plan.input.parts ? { parts: plan.input.parts } : {}),
 					...(plan.kind === "warm" ? { fallback: plan.fallback } : {}),
 					signal: options?.signal,
 					inactivityMin: 5,

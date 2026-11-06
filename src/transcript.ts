@@ -5,12 +5,15 @@
 // it produced natively. The next user turn reuses that session and sends only
 // the messages pi added since, so the server's native history stays a stable
 // prompt prefix (provider prompt caching) instead of being re-serialized.
-// Any divergence (compaction, branch navigation, edits, cwd or tool-set
-// change, a failed or aborted turn) falls back to a fresh session that receives
-// the whole transcript, keeping pi the source of truth.
+// Any divergence (compaction, edits, a cwd change, a failed turn with no
+// matching checkpoint) falls back to a fresh session that receives the whole
+// transcript, keeping pi the source of truth. A changed active tool set is
+// announced in the delta instead: the pi-bridge lists every tool an extension
+// can activate, so the session can already call it.
 
 import { createHash } from "node:crypto";
 import { getCurrentSystemPrompt, getCurrentTools, type AssistantMessage, type Message, type TranscriptContext } from "@earendil-works/pi-ai";
+import type { TurnPart } from "./driver-types.js";
 
 export type AcpImage = { data: string; mimeType: string };
 
@@ -18,6 +21,9 @@ export interface AcpInput {
 	prompt: string;
 	images: AcpImage[];
 	contextBlock?: { uri: string; text: string };
+	/** Earlier parts of a context block too large for one `session/prompt`,
+	 *  each sent as its own prompt before this one, in order. */
+	parts?: TurnPart[];
 }
 
 export interface WarmItem {
@@ -133,6 +139,57 @@ function serializeRange(messages: Message[], imageBase = 0): { text: string; ima
  *  resource block. `agy acp` truncates a single `session/prompt` past 192 KB
  *  from the end, which would cut off recent messages and the user's prompt. */
 export const MAX_TRANSCRIPT_BYTES = 160_000;
+
+/** Most prompts one transcript is delivered in. Past
+ *  MAX_TRANSCRIPT_PARTS × 90% × MAX_TRANSCRIPT_BYTES, older middle messages
+ *  are omitted instead (see serializeBounded). */
+export const MAX_TRANSCRIPT_PARTS = 8;
+
+/** Every part but the last is filled to at least 90% of the cap, so a body
+ *  of this size never needs more than MAX_TRANSCRIPT_PARTS parts. */
+const MAX_PARTED_BYTES = Math.floor((MAX_TRANSCRIPT_PARTS * MAX_TRANSCRIPT_BYTES * 9) / 10);
+
+/** Prompt of an earlier part: the model only acknowledges it. */
+export function transcriptPartPrompt(index: number, total: number): string {
+	return `Part ${index} of ${total} of the pi transcript is attached. Do not act on it yet and do not use any tools: reply with only "OK". The next part follows in the next message.`;
+}
+
+/** Split `text` into pieces of at most `maxBytes` UTF-8 bytes. A piece ends
+ *  after a newline in its last tenth when there is one, else at a character
+ *  boundary, so every piece but the last holds at least 90% of `maxBytes`. */
+export function splitUtf8(text: string, maxBytes: number): string[] {
+	const buf = Buffer.from(text, "utf8");
+	if (buf.length <= maxBytes) return [text];
+	const pieces: string[] = [];
+	let start = 0;
+	while (buf.length - start > maxBytes) {
+		let end = start + maxBytes;
+		const newline = buf.lastIndexOf(0x0a, end - 1);
+		if (newline >= end - Math.ceil(maxBytes / 10)) end = newline + 1;
+		else while (end > start + 1 && ((buf[end] ?? 0) & 0xc0) === 0x80) end--;
+		pieces.push(buf.subarray(start, end).toString("utf8"));
+		start = end;
+	}
+	pieces.push(buf.subarray(start).toString("utf8"));
+	return pieces;
+}
+
+/** A transcript resource as prompt input: one block when it fits a single
+ *  `session/prompt`, otherwise earlier parts sent ahead of the final prompt,
+ *  so the whole transcript reaches agy instead of a truncated one. */
+function transcriptInput(uri: string, prompt: string, header: string, messages: Message[]): AcpInput {
+	const body = serializeBounded(header, messages, MAX_PARTED_BYTES);
+	const pieces = splitUtf8(body.text, MAX_TRANSCRIPT_BYTES);
+	const total = pieces.length;
+	const last = pieces[total - 1] ?? "";
+	if (total === 1) return { prompt, images: body.images, contextBlock: { uri, text: last } };
+	return {
+		prompt: `${prompt}\n\nThis message carries part ${total} of ${total} of the pi transcript; parts 1-${total - 1} came in the previous messages.`,
+		images: body.images,
+		contextBlock: { uri, text: last },
+		parts: pieces.slice(0, -1).map((text, index) => ({ prompt: transcriptPartPrompt(index + 1, total), contextBlock: { uri, text } })),
+	};
+}
 
 const COMPACTION_SUMMARY_HEADER = "The conversation history before this point was compacted into the following summary:";
 const BRANCH_SUMMARY_HEADER = "The following is a summary of a branch that this conversation came back from:";
@@ -270,12 +327,12 @@ export function formatToolResult(
 }
 
 /** The whole transcript for a fresh ACP session. Stable and append-only, so
- *  consecutive fresh turns still share a prompt prefix. */
-export function freshInput(context: TranscriptContext, maxBytes = MAX_TRANSCRIPT_BYTES): AcpInput {
+ *  consecutive fresh turns still share a prompt prefix. Past
+ *  MAX_TRANSCRIPT_BYTES it is delivered in parts. */
+export function freshInput(context: TranscriptContext): AcpInput {
 	const system = getCurrentSystemPrompt(context.messages);
 	const header = system ? `<pi-system>\n${system}\n</pi-system>` : "";
-	const body = serializeBounded(header, context.messages, maxBytes);
-	return { prompt: FRESH_PROMPT, images: body.images, contextBlock: { uri: "pi://transcript", text: body.text } };
+	return transcriptInput("pi://transcript", FRESH_PROMPT, header, context.messages);
 }
 
 /** Content fingerprint: role, visible text, tool identities, and image bytes.
@@ -663,7 +720,9 @@ type WarmMatch = { warm: WarmSession; delta: Message[] } | { reason: string };
 function matchWarm(index: TranscriptIndex, cwd: string, warm: WarmSession | undefined): WarmMatch {
 	if (!warm) return { reason: "no-session" };
 	if (warm.cwd !== cwd) return { reason: "cwd" };
-	if (warm.tools !== index.tools()) return { reason: "tools" };
+	// A changed active tool set (pi's `<tools>` system messages after an
+	// extension activates tools, or a `/tree` restore) is announced in the
+	// delta: the bridge already lists every tool that can be activated.
 	const split = splitWarmTranscript(index, warm);
 	if (!split) {
 		return { reason: index.persistent().length <= warm.count ? "history-shrank" : "history-diverged" };
@@ -678,9 +737,11 @@ function planFromMatch(index: TranscriptIndex, match: WarmMatch): TurnPlan {
 	const { warm, delta } = match;
 	const systemPrompt = index.systemPrompt();
 	const systemChanged = systemPrompt !== warm.systemPrompt;
+	const tools = index.tools();
+	const toolsChanged = tools !== warm.tools;
 	const visible = delta.filter((message) => message.role !== "system");
 	let input: AcpInput;
-	if (!systemChanged && visible.every((message) => message.role === "user")) {
+	if (!systemChanged && !toolsChanged && visible.every((message) => message.role === "user")) {
 		// The common case: plain user turns, sent the way an ACP client would.
 		const images: AcpImage[] = [];
 		const texts: string[] = [];
@@ -693,9 +754,10 @@ function planFromMatch(index: TranscriptIndex, match: WarmMatch): TurnPlan {
 		}
 		input = { prompt: texts.join("\n\n") || "See the attached images.", images };
 	} else {
-		const header = systemChanged && systemPrompt ? `<pi-system-update>\n${systemPrompt}\n</pi-system-update>` : "";
-		const body = serializeBounded(header, visible);
-		input = { prompt: DELTA_PROMPT, images: body.images, contextBlock: { uri: "pi://transcript-delta", text: body.text } };
+		const headers: string[] = [];
+		if (systemChanged && systemPrompt) headers.push(`<pi-system-update>\n${systemPrompt}\n</pi-system-update>`);
+		if (toolsChanged) headers.push(toolsUpdate(tools));
+		input = transcriptInput("pi://transcript-delta", DELTA_PROMPT, headers.join("\n\n"), visible);
 	}
 	return {
 		kind: "warm",
@@ -705,6 +767,15 @@ function planFromMatch(index: TranscriptIndex, match: WarmMatch): TurnPlan {
 		fallback: index.fresh(),
 		deltaMessages: delta.length,
 	};
+}
+
+/** The active pi tool set after it changed since the session's checkpoint. */
+function toolsUpdate(tools: string): string {
+	const names = tools.split(",").filter(Boolean);
+	const text = names.length > 0
+		? `The active pi tools are now: ${names.join(", ")}. Call only these pi tools.`
+		: "No pi tools are active now.";
+	return `<pi-tools-update>\n${text}\n</pi-tools-update>`;
 }
 
 export function planTurn(context: TranscriptContext, cwd: string, warm: WarmSession | undefined): TurnPlan {

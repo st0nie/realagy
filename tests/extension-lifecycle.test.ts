@@ -3,6 +3,10 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
 	ensure: vi.fn(), listModels: vi.fn(), close: vi.fn(), register: vi.fn(), fetchCliUsage: vi.fn(),
 	driverOptions: undefined as undefined | Record<string, any>,
+	driver: undefined as undefined | Record<string, any>,
+	bridge: undefined as undefined | Record<string, any>,
+	roundTrips: undefined as undefined | Record<string, any>,
+	onToolCall: vi.fn(), failParkedCalls: vi.fn(),
 }));
 vi.mock("../src/acp/setup.js", () => ({ ensureAgyReady: mocks.ensure, resolveAgyBinary: () => "agy", MANUAL_SETUP: "curl -fsSL https://antigravity.google/cli/install.sh | bash" }));
 vi.mock("../src/acp/connection.js", () => ({ resolveAcpBinary: () => "agy" }));
@@ -11,10 +15,25 @@ vi.mock("../src/acp/driver.js", () => ({ AcpDriver: class {
 	pid = 4242;
 	listModels = mocks.listModels;
 	close = mocks.close;
-	constructor(options: Record<string, any>) { mocks.driverOptions = options; }
+	constructor(options: Record<string, any>) { mocks.driverOptions = options; mocks.driver = this; }
 } }));
-vi.mock("../src/mcp-server.js", () => ({ startMcpServer: async () => ({ ok: true, handle: { port: 1, token: "test", close: vi.fn() } }), TOKEN_HEADER: "token" }));
-vi.mock("../src/provider.js", () => ({ createStreamSimple: vi.fn(), POLL_TOOL_NAME: "poll", ToolRoundTrips: class { failAll() {} } }));
+vi.mock("../src/mcp-server.js", () => ({
+	startMcpServer: async (deps: Record<string, any>) => {
+		mocks.bridge = deps;
+		return { ok: true, handle: { port: 1, token: "test", close: vi.fn() } };
+	},
+	TOKEN_HEADER: "token",
+}));
+vi.mock("../src/provider.js", () => ({
+	createStreamSimple: vi.fn(),
+	failParkedCalls: mocks.failParkedCalls,
+	POLL_TOOL_NAME: "poll",
+	ToolRoundTrips: class {
+		constructor() { mocks.roundTrips = this; }
+		onToolCall = mocks.onToolCall;
+		failAll() {}
+	},
+}));
 
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import extension from "../extensions/index.js";
@@ -25,7 +44,9 @@ function deferred<T>() {
 	return { promise, resolve };
 }
 
-async function start() {
+type FakeTool = { name: string; description?: string; exposure?: string; parameters?: object };
+
+async function start(tools: { all: FakeTool[]; active: string[] } = { all: [], active: [] }) {
 	const handlers = new Map<string, (...args: any[]) => void>();
 	const commands = new Map<string, any>();
 	const renderers = new Map<string, any>();
@@ -36,15 +57,17 @@ async function start() {
 		registerCommand: (name: string, command: unknown) => commands.set(name, command),
 		registerMessageRenderer: (type: string, renderer: unknown) => renderers.set(type, renderer),
 		sendMessage,
-		getAllTools: () => [],
-		getActiveTools: () => [],
+		getAllTools: () => tools.all,
+		getActiveTools: () => [...tools.active],
+		setActiveTools: vi.fn((names: string[]) => { tools.active = [...names]; }),
+		appendEntry: vi.fn(),
 	};
 	await extension(pi as never);
 	let stale = false;
 	const ui = { setStatus: vi.fn(), notify: vi.fn(), setWidget: vi.fn(), theme: undefined };
 	const ctx = { hasUI: true, model: undefined, get ui() { if (stale) throw new Error("stale context"); return ui; } };
 	handlers.get("session_start")!({}, ctx);
-	return { shutdown: () => { handlers.get("session_shutdown")!(); stale = true; }, ui, commands, ctx, renderers, sendMessage, driver: mocks.driverOptions! };
+	return { shutdown: () => { handlers.get("session_shutdown")!(); stale = true; }, ui, commands, ctx, renderers, sendMessage, driver: mocks.driverOptions!, handlers, pi, tools };
 }
 
 beforeEach(() => { vi.clearAllMocks(); mocks.close.mockResolvedValue(undefined); mocks.fetchCliUsage.mockResolvedValue([]); });
@@ -188,6 +211,74 @@ describe("extension session lifecycle", () => {
 		mocks.listModels.mockResolvedValue([{ modelId: "gemini-3.8-flash-low" }, { modelId: "gemini-3.8-flash-high" }]);
 		await agy.handler("setup", session.ctx);
 		expect(session.ui.notify.mock.lastCall?.[0]).toMatch(/ready: \/bin\/agy is signed in and offers 1 models/);
+	});
+
+	it("bridges every tool an extension may activate, with a stable policy, and dispatches only active tools", async () => {
+		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
+		const session = await start({
+			all: [
+				{ name: "bash", exposure: "direct" },
+				{ name: "read", exposure: "direct" },
+				{ name: "pi_lens_activate_tools", exposure: "direct" },
+				{ name: "lens_symbols", exposure: "direct" },
+				{ name: "mcp__docs__search", exposure: "deferred" },
+			],
+			active: ["bash", "read", "pi_lens_activate_tools"],
+		});
+		const listed = () => mocks.bridge!.listTools().map((tool: { name: string }) => tool.name);
+		expect(listed()).toEqual(["bash", "read", "pi_lens_activate_tools", "lens_symbols", "poll"]);
+		const policy = session.driver.systemPrompt();
+		expect(policy).toMatch(/bash, read, pi_lens_activate_tools, lens_symbols/);
+
+		const inactive = await mocks.bridge!.onToolCall("c1", "lens_symbols", {}, new AbortController().signal);
+		expect(inactive).toEqual({ content: [{ type: "text", text: "Pi tool lens_symbols is not active in pi right now. Active pi tools: bash, read, pi_lens_activate_tools." }], isError: true });
+		expect(mocks.onToolCall).not.toHaveBeenCalled();
+
+		// pi_lens_activate_tools mid-session: same list and policy, now callable.
+		session.tools.active.push("lens_symbols");
+		expect(listed()).toEqual(["bash", "read", "pi_lens_activate_tools", "lens_symbols", "poll"]);
+		expect(session.driver.systemPrompt()).toBe(policy);
+		mocks.onToolCall.mockResolvedValueOnce({ content: [{ type: "text", text: "ok" }] });
+		const signal = new AbortController().signal;
+		await mocks.bridge!.onToolCall("c2", "lens_symbols", { name: "x" }, signal);
+		expect(mocks.onToolCall).toHaveBeenCalledWith("c2", "lens_symbols", { name: "x" }, signal);
+	});
+
+	it("fails a settled turn's parked calls through failParkedCalls", async () => {
+		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
+		await start();
+		const outcome = { status: "OK", response: "", aborted: true };
+		mocks.driver!.onTurnEnd(outcome);
+		expect(mocks.failParkedCalls).toHaveBeenCalledWith(mocks.roundTrips, outcome);
+	});
+
+	it("/tree rewind deactivates the pi-lens tools pi's restore activated, keeping tools active before or declared by the branch", async () => {
+		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
+		const lens = ["lens_symbols", "lens_references", "lens_diagnostics", "lens_rename", "lens_outline"];
+		const session = await start({
+			all: ["bash", "read", "new_ext_tool", "lens_declared", ...lens].map((name) => ({ name })),
+			active: ["bash", "read", "new_ext_tool"],
+		});
+		const warm = { sessionId: "s1", cwd: "/w", count: 3, hash: "h", systemPrompt: "Rules", tools: "bash,lens_declared,read" };
+		const branch = [
+			{ type: "message", message: { role: "system", content: "Rules", toolsAdded: [{ name: "bash" }, { name: "read" }] } },
+			{ type: "message", message: { role: "user", content: "hi" } },
+			{ type: "message", message: { role: "system", content: "", toolsAdded: [{ name: "lens_declared" }] } },
+			{ type: "custom", customType: "realagy-warm-session", data: warm },
+		];
+		const ctx = { ...session.ctx, sessionManager: { getBranch: () => branch, getEntries: () => branch } };
+		session.handlers.get("session_before_tree")!({}, ctx);
+		// pi's _restoreToolsFromTranscript(): the recorded loadout plus every
+		// extension tool the branch never mentions.
+		session.tools.active = ["bash", "read", "lens_declared", "new_ext_tool", ...lens];
+		session.handlers.get("session_tree")!({}, ctx);
+		expect(session.pi.setActiveTools).toHaveBeenCalledTimes(1);
+		expect(session.tools.active).toEqual(["bash", "read", "lens_declared", "new_ext_tool"]);
+
+		// Nothing to undo when the navigation activated nothing new.
+		session.handlers.get("session_before_tree")!({}, ctx);
+		session.handlers.get("session_tree")!({}, ctx);
+		expect(session.pi.setActiveTools).toHaveBeenCalledTimes(1);
 	});
 
 	it("registers a provider whose auth is ambient (no /login key prompt)", async () => {

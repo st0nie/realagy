@@ -22,14 +22,23 @@ export interface DriverTurnRequest {
 	images?: Array<{ data: string; mimeType: string }>;
 	/** Pi-side context delivered as an embedded `resource` block. */
 	contextBlock?: { uri: string; text: string };
+	/** Earlier parts of a context too large for one `session/prompt`. Each is
+	 *  sent as its own prompt before `prompt`; their replies are dropped. */
+	parts?: TurnPart[];
 	/** The complete input to send instead when `conversationId` cannot be
 	 *  continued and a fresh session is created. Without it a delta prompt
 	 *  would reach a session that never saw the earlier turns. */
-	fallback?: { prompt: string; images?: Array<{ data: string; mimeType: string }>; contextBlock?: { uri: string; text: string } };
+	fallback?: { prompt: string; images?: Array<{ data: string; mimeType: string }>; contextBlock?: { uri: string; text: string }; parts?: TurnPart[] };
 	signal?: AbortSignal;
 	/** Inactivity cap in minutes (default 5; parked tool calls pause it).
 	 *  Fractional values are valid. 0 disables the cap. */
 	inactivityMin?: number;
+}
+
+/** One earlier part of an oversized context, sent as its own prompt. */
+export interface TurnPart {
+	prompt: string;
+	contextBlock: { uri: string; text: string };
 }
 
 export type AgyUsage = {
@@ -82,7 +91,17 @@ export type DriverActivity =
 	/** Injected by the round-trip store when the MCP bridge receives a pi tool
 	 *  call. Parks the turn: output is expected to stall while pi executes
 	 *  the tool, so the driver suspends its inactivity guard. */
-	| { type: "bridge_call"; callId: string; name: string; args: Record<string, unknown> };
+	| {
+			type: "bridge_call";
+			callId: string;
+			name: string;
+			args: Record<string, unknown>;
+			/** Set by the driver: the session the call came from, and the
+			 *  store's highest step index when it arrived. The session then holds
+			 *  the transcript up to this call's toolUse message. */
+			sessionId?: string;
+			maxStepIdx?: number;
+	  };
 
 export interface TurnOutcome {
 	conversationId?: string;
@@ -94,6 +113,10 @@ export interface TurnOutcome {
 	aborted: boolean;
 	/** Highest `steps.idx` in `<conversationId>.db` when this turn settled. */
 	maxStepIdx?: number;
+	/** Whether the session recorded this turn's (final) prompt: always for a
+	 *  completed turn; for an aborted one, when the conversation store holds
+	 *  its user-input step (without a store: when the prompt was sent). */
+	promptDelivered?: boolean;
 }
 
 export interface TurnHandle {
@@ -108,6 +131,9 @@ export interface TurnHandle {
 
 export interface TurnDriver {
 	readonly activeHandle: TurnHandle | null;
+	/** True while the active turn delivers earlier context parts: the model
+	 *  only acknowledges them, so pi tool calls are refused. */
+	readonly priming?: boolean;
 	/** Start a turn. Turns are serialized: this waits for the previous one. */
 	run(request: DriverTurnRequest): Promise<TurnHandle>;
 	/** Re-attach to the active turn (pi toolUse continuation). */

@@ -4,14 +4,30 @@ export interface BridgeToolInfo {
 	name: string;
 	description?: string;
 	parameters?: object;
+	/** pi's ToolExposure; absent means `direct`. */
+	exposure?: string;
 }
 
-/** Catalog and dispatch both read pi's CURRENT active set. Builtins are
+/** Exposures pi declares to the model whenever the tool is active. */
+const MODEL_FACING = new Set(["direct", "model-only"]);
+const INTERNAL = new Set(["bridge_poll_result", "antigravity", "AskAntigravity"]);
+
+/** The catalog the bridge lists: every registered model-facing pi tool,
+ * active or not, plus any other tool that is active now. Builtins are
  * included, so pi's read/bash/edit/write are offered next to agy's own native
- * tools and run as genuine pi tools when the model picks them. */
+ * tools and run as genuine pi tools when the model picks them. agy keeps a
+ * session's tool list, so listing tools an extension may activate later
+ * (pi-lens's situational tools) keeps them callable without a new session,
+ * and the list stays stable for agy's prompt cache. Dispatch is limited to
+ * pi's CURRENT active set (dispatchablePiTool). */
 export function bridgedPiTools(all: BridgeToolInfo[], active: readonly string[]): BridgeToolInfo[] {
 	const enabled = new Set(active);
-	return all.filter((tool) => enabled.has(tool.name) && tool.name !== "bridge_poll_result" && tool.name !== "antigravity" && tool.name !== "AskAntigravity");
+	return all.filter((tool) => !INTERNAL.has(tool.name) && (enabled.has(tool.name) || MODEL_FACING.has(tool.exposure ?? "direct")));
+}
+
+/** Whether a bridged call may run: pi only executes its active tools. */
+export function dispatchablePiTool(all: BridgeToolInfo[], active: readonly string[], name: string): boolean {
+	return active.includes(name) && bridgedPiTools(all, active).some((tool) => tool.name === name);
 }
 
 const schemaCache = new WeakMap<object, Record<string, unknown>>();

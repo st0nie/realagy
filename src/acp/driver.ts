@@ -22,13 +22,18 @@
 //     dropped.
 //   - usage: exact per-model-call tokens from agy's conversation store at
 //     each bridge_call and at prompt end (src/acp/step-usage.ts).
+//   - parts: context too large for one prompt arrives in earlier parts, each
+//     sent as its own prompt whose reply is dropped (priming).
+//   - checkpoints: each bridge_call carries the session id and store step it
+//     reached; a settled turn reports whether agy recorded its prompt, so an
+//     aborted turn can still be continued warm.
 
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { BackgroundMessages, type BackgroundItem, type BackgroundNotice } from "./background.js";
 import { AcpConnection, type AcpExitInfo, type AcpMcpServer } from "./connection.js";
 import { isAgyRetryNotice, mapStopReason, mapUpdate, TextAccumulator, type AcpEditDiff } from "./events.js";
-import { conversationDbPath, lastStepIdx, readStepState, siblingUsage, summarizeSteps, type StepTokens, type StepUsage } from "./step-usage.js";
+import { conversationDbPath, lastStepIdx, readStepState, siblingUsage, summarizeSteps, userInputSince, type StepTokens, type StepUsage } from "./step-usage.js";
 import { nativeToolLabel, nativeToolTarget, PI_BRIDGE_SERVER, type NativeToolEvent } from "../native-tools.js";
 import { traceUsage } from "../usage-trace.js";
 import type { AgyStepUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../driver-types.js";
@@ -68,7 +73,7 @@ export interface AcpDriverOptions {
 	backgroundPollMs?: number;
 }
 
-type TurnInput = Pick<DriverTurnRequest, "prompt" | "images" | "contextBlock">;
+type TurnInput = Pick<DriverTurnRequest, "prompt" | "images" | "contextBlock" | "parts">;
 
 interface ActiveTurn {
 	id: string;
@@ -91,9 +96,15 @@ interface ActiveTurn {
 	outcome: Promise<TurnOutcome>;
 	response: TextAccumulator;
 	contextUsage?: { used: number; size: number };
-	/** True once the prompt RPC was issued: only then is there anything for
-	 *  session/cancel to end. */
+	/** True once the first prompt RPC (a part or the prompt) was issued: only
+	 *  then is there anything for session/cancel to end. */
 	promptStarted: boolean;
+	/** True while earlier context parts are delivered; their frames are dropped. */
+	priming: boolean;
+	/** True once the final prompt RPC was issued. */
+	finalPromptSent: boolean;
+	/** Highest store step before the final prompt was sent. */
+	promptCursor: number;
 	aborted: boolean;
 	parks: number;
 	idleTimer?: ReturnType<typeof setTimeout>;
@@ -162,6 +173,11 @@ export class AcpDriver implements TurnDriver {
 		return t && !t.closed ? this.#makeHandle(t) : null;
 	}
 
+	get priming(): boolean {
+		const t = this.#active;
+		return t !== undefined && !t.closed && t.priming;
+	}
+
 	set onTurnEnd(fn: ((outcome: TurnOutcome) => void) | undefined) {
 		this.#onTurnEnd = fn;
 	}
@@ -177,9 +193,18 @@ export class AcpDriver implements TurnDriver {
 			// exact usage on the pi message that this bridge call completes.
 			// A parallel sibling call of the same model call finds no new step
 			// and gets a ratio-only placeholder instead of zero usage.
-			if (!this.#collectStepUsage(t) && t.lastStep) this.#emit(t, { type: "step_usage", usage: stripIdx(siblingUsage(t.lastStep)) });
+			const collected = this.#collectStepUsage(t);
+			if (!collected.measured && t.lastStep) this.#emit(t, { type: "step_usage", usage: stripIdx(siblingUsage(t.lastStep)) });
 			t.parks += 1;
 			this.#clearIdle(t);
+			// The session now holds the transcript up to this call's toolUse
+			// message: the provider records a step checkpoint from it.
+			this.#emit(t, {
+				...activity,
+				sessionId: t.sessionId,
+				...(collected.maxIdx !== undefined && collected.maxIdx >= 0 ? { maxStepIdx: collected.maxIdx } : {}),
+			});
+			return;
 		}
 		this.#emit(t, activity);
 	}
@@ -270,6 +295,7 @@ export class AcpDriver implements TurnDriver {
 			model: acpModelSlug(request.model, request.effort),
 			promptChars: turn.input.prompt.length,
 			contextChars: turn.input.contextBlock?.text.length ?? 0,
+			parts: turn.input.parts?.length ?? 0,
 			images: turn.input.images?.length ?? 0,
 			stepCursor: turn.stepCursor,
 		});
@@ -293,13 +319,16 @@ export class AcpDriver implements TurnDriver {
 		turn.promptStarted = true;
 		turn.promptStartedAt = Date.now();
 		try {
+			if (!(await this.#deliverParts(turn, conn))) return;
+			turn.promptCursor = turn.dbPath ? lastStepIdx(turn.dbPath) : -1;
+			turn.finalPromptSent = true;
 			const result = await conn.prompt(turn.sessionId, turn.input.prompt, turn.input.images, turn.input.contextBlock);
 			if (turn.closed) return;
 			traceUsage("prompt-result", { sessionId: turn.sessionId, stopReason: result.stopReason, usage: result.usage, usageUpdate: turn.contextUsage });
 			this.#finishPrompt(turn);
 			// Exact per-call steps first; the turn-cumulative total is only a
 			// fallback for messages no step measurement covered.
-			const maxStepIdx = this.#collectStepUsage(turn);
+			const maxStepIdx = this.#collectStepUsage(turn).maxIdx;
 			if (result.usage && !turn.stepUsageSeen) this.#emit(turn, { type: "usage", usage: result.usage });
 			const mapped = mapStopReason(result.stopReason);
 			const aborted = mapped.aborted || turn.aborted;
@@ -317,6 +346,29 @@ export class AcpDriver implements TurnDriver {
 			if (turn.aborted) this.#settleAborted(turn);
 			else this.#failTurn(turn, `Antigravity prompt failed: ${describe(err)}`);
 		}
+	}
+
+	/** Send the input's earlier parts, one prompt each, dropping their
+	 *  replies. false = the turn settled (aborted or failed) meanwhile. */
+	async #deliverParts(turn: ActiveTurn, conn: AcpConnection): Promise<boolean> {
+		const parts = turn.input.parts ?? [];
+		for (const [index, part] of parts.entries()) {
+			turn.priming = true;
+			const result = await conn.prompt(turn.sessionId, part.prompt, [], part.contextBlock);
+			if (turn.closed) return false;
+			const mapped = mapStopReason(result.stopReason);
+			if (turn.aborted || mapped.aborted) {
+				this.#settleAborted(turn);
+				return false;
+			}
+			if (mapped.status === "ERROR") {
+				this.#failTurn(turn, `Antigravity rejected part ${index + 1} of ${parts.length + 1} of the transcript: ${mapped.error ?? result.stopReason}`);
+				return false;
+			}
+		}
+		if (parts.length > 0) this.#log("parts-delivered", { sessionId: turn.sessionId, parts: parts.length });
+		turn.priming = false;
+		return true;
 	}
 
 	/** Pick the turn's session. undefined = the turn already settled. */
@@ -397,6 +449,12 @@ export class AcpDriver implements TurnDriver {
 		if (sessionId !== null && sessionId !== turn.sessionId) return;
 		turn.idleTimer?.refresh();
 		const kind = record(update).sessionUpdate;
+		// A part's echo and acknowledgement are not pi's reply. The final
+		// prompt's echo is awaited afresh (echoSeen stays false until then).
+		if (turn.priming) {
+			if (kind === "usage_update") this.#applyUpdate(turn, update);
+			return;
+		}
 		if (turn.promptStarted && !turn.echoSeen && (kind === "user_message_chunk" || LEFTOVER_KINDS.has(String(kind)))) {
 			if (kind === "user_message_chunk") {
 				turn.echoSeen = true;
@@ -669,7 +727,7 @@ export class AcpDriver implements TurnDriver {
 		return {
 			id: randomUUID().slice(0, 8),
 			request,
-			input: { prompt: request.prompt, images: request.images, contextBlock: request.contextBlock },
+			input: { prompt: request.prompt, images: request.images, contextBlock: request.contextBlock, parts: request.parts },
 			stepCursor: -1,
 			stepUsageSeen: false,
 			sessionId: "",
@@ -680,6 +738,9 @@ export class AcpDriver implements TurnDriver {
 			outcome,
 			response: new TextAccumulator(),
 			promptStarted: false,
+			priming: false,
+			finalPromptSent: false,
+			promptCursor: -1,
 			aborted: false,
 			parks: 0,
 			toolCalls: new Map(),
@@ -718,8 +779,13 @@ export class AcpDriver implements TurnDriver {
 		const flushed = turn.response.flush();
 		if (flushed) this.#emit(turn, { type: "text", delta: flushed });
 		outcome.response = turn.response.text;
-		// Tokens spent by an aborted or failed prompt are still reported.
-		if (turn.promptStarted && !opts.collected) this.#collectStepUsage(turn);
+		// Tokens spent by an aborted or failed prompt are still reported, and
+		// the store's progress lets an aborted turn be continued.
+		if (turn.promptStarted && !opts.collected) {
+			const maxIdx = this.#collectStepUsage(turn).maxIdx;
+			if (outcome.maxStepIdx === undefined && maxIdx !== undefined && maxIdx >= 0) outcome.maxStepIdx = maxIdx;
+		}
+		outcome.promptDelivered = this.#promptDelivered(turn, outcome);
 		if (turn.contextUsage) outcome.contextUsage = turn.contextUsage;
 		turn.closed = true;
 		this.#clearIdle(turn);
@@ -738,6 +804,16 @@ export class AcpDriver implements TurnDriver {
 		}
 	}
 
+	/** Whether the session recorded the turn's final prompt. agy stores a
+	 *  prompt's user-input step on arrival and keeps it when the prompt is
+	 *  cancelled, so for an unfinished turn that step is the evidence. */
+	#promptDelivered(turn: ActiveTurn, outcome: TurnOutcome): boolean {
+		if (!turn.finalPromptSent) return false;
+		if (outcome.status === "OK" && !outcome.aborted) return true;
+		if (!turn.dbPath) return true;
+		return userInputSince(turn.dbPath, turn.promptCursor) === true;
+	}
+
 	#settleAborted(turn: ActiveTurn): void {
 		this.#settle(turn, { conversationId: turn.sessionId || undefined, status: "OK", response: "", aborted: true });
 	}
@@ -754,13 +830,14 @@ export class AcpDriver implements TurnDriver {
 
 	/** Emit exact usage for model calls the server persisted since the last
 	 *  report. Returns the store's highest step index (undefined when the
-	 *  store is unreadable); a missing store silently reports nothing. */
-	#collectStepUsage(turn: ActiveTurn): number | undefined {
-		if (!turn.dbPath || turn.closed) return undefined;
+	 *  store is unreadable) and whether new model calls were measured; a
+	 *  missing store silently reports nothing. */
+	#collectStepUsage(turn: ActiveTurn): { maxIdx?: number; measured: boolean } {
+		if (!turn.dbPath || turn.closed) return { measured: false };
 		const state = readStepState(turn.dbPath, turn.stepCursor);
-		if (!state) return undefined;
+		if (!state) return { measured: false };
 		const usage = summarizeSteps(state.steps);
-		if (!usage) return state.maxIdx;
+		if (!usage) return { maxIdx: state.maxIdx, measured: false };
 		turn.stepCursor = usage.lastIdx;
 		turn.lastStep = state.steps.at(-1);
 		turn.stepUsageSeen = true;
@@ -771,7 +848,7 @@ export class AcpDriver implements TurnDriver {
 			usageUpdate: turn.contextUsage?.used,
 		});
 		this.#emit(turn, { type: "step_usage", usage: stripIdx(usage) });
-		return state.maxIdx;
+		return { maxIdx: state.maxIdx, measured: true };
 	}
 
 	#log(msg: string, data?: unknown): void {

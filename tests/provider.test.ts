@@ -428,10 +428,19 @@ test("bounded transcript keeps system prompt, realctx-history summaries, and new
 	assert.ok(!bounded.text.includes("old old old"));
 	assert.deepEqual(bounded.images, [{ data: "bmV3", mimeType: "image/png" }]);
 
+	// Past one prompt's cap the transcript is delivered in parts, not cut.
 	const huge = freshInput(context([system(), hist, user("x".repeat(MAX_TRANSCRIPT_BYTES + 20_000)), user("tail prompt")]));
-	assert.ok(Buffer.byteLength(huge.contextBlock!.text, "utf8") <= MAX_TRANSCRIPT_BYTES);
-	assert.match(huge.contextBlock!.text, /<realctx-history part="h1"/);
+	assert.equal(huge.parts?.length, 1);
+	for (const block of [huge.parts![0].contextBlock, huge.contextBlock!]) {
+		assert.equal(block.uri, "pi://transcript");
+		assert.ok(Buffer.byteLength(block.text, "utf8") <= MAX_TRANSCRIPT_BYTES);
+	}
+	assert.match(huge.parts![0].contextBlock.text, /<realctx-history part="h1"/);
+	assert.match(huge.parts![0].prompt, /Part 1 of 2 of the pi transcript[\s\S]*reply with only "OK"/);
 	assert.match(huge.contextBlock!.text, /tail prompt/);
+	assert.match(huge.prompt, /part 2 of 2 of the pi transcript/);
+	assert.equal(huge.parts![0].contextBlock.text + huge.contextBlock!.text, serializeBounded("<pi-system>\nTest system\n</pi-system>", [system(), hist, user("x".repeat(MAX_TRANSCRIPT_BYTES + 20_000)), user("tail prompt")], 10 * MAX_TRANSCRIPT_BYTES).text);
+	assert.ok(!huge.contextBlock!.text.includes("<pi-transcript-omitted"));
 });
 
 test("warm session survives realctx drops, path-notes, history chunks, tag stripping, and ephemeral pi-lens messages", () => {
