@@ -795,3 +795,24 @@ test("a reply split by native-tool thinking lines is one assistant reply in the 
 	assert.ok(text.indexOf("Hello world") < text.indexOf("assistant-tool-call") && text.indexOf("assistant-tool-call") < text.indexOf("<assistant>\nafter"));
 	assert.ok(!text.includes("agy →"));
 });
+
+test("agy's high-traffic notice fails the turn as a retryable overload instead of becoming the answer", async () => {
+	const driver = new FakeDriver();
+	const roundTrips = new ToolRoundTrips(driver);
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips });
+	const entry = FALLBACK_MODELS.find((candidate) => candidate.id === "gpt-oss-120b")!;
+	const notice = "\n⚠ Our servers are experiencing high traffic right now, please try again in a minute.\n";
+	driver.autoFinish = false;
+	driver.script = [{ type: "text", delta: notice }];
+	const pending = collect(stream(toPiModel(entry), context([system(), user("go")])));
+	await vi.waitFor(() => assert.ok(driver.activeHandle));
+	(driver.activeHandle as FakeHandle).complete({ status: "OK", response: notice, aborted: false, conversationId: "s" });
+	const events = await pending;
+	const error = events.find((event) => event.type === "error");
+	assert.equal(error?.type, "error");
+	if (error?.type !== "error") return;
+	assert.equal(error.error.stopReason, "error");
+	assert.equal(error.error.errorMessage, "Antigravity servers are overloaded: Our servers are experiencing high traffic right now, please try again in a minute.");
+	// pi's auto-retry keys on "overloaded" in the error message.
+	assert.match(error.error.errorMessage ?? "", /overloaded/);
+});

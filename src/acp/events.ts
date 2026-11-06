@@ -201,6 +201,15 @@ export function isAgyRetryNotice(delta: string): boolean {
 	return delta.trim() === AGY_RETRY_NOTICE;
 }
 
+/** agy answers with this notice as reply text, and stopReason end_turn, when
+ *  its backend is out of capacity (seen on agy 1.5.1). */
+const AGY_CAPACITY_NOTICE = /^⚠\s*(Our servers are experiencing high traffic[^\n]*)$/;
+
+/** The capacity notice when it is the whole reply, else undefined. */
+export function agyCapacityNotice(response: string): string | undefined {
+	return AGY_CAPACITY_NOTICE.exec(response.trim())?.[1];
+}
+
 /** Map a `session/prompt` result stopReason to a TurnOutcome shape.
  *  Verified live: `end_turn`, and `cancelled` after a session/cancel
  *  notification. The schema also enumerates max_tokens / max_turn_requests /

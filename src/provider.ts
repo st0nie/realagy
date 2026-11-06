@@ -17,6 +17,7 @@ import { resolveSessionAtStep } from "./acp/step-usage.js";
 import type { AgyStepUsage, AgyUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "./driver-types.js";
 import { toAgyEffort, type AgyModelEntry } from "./models.js";
 import { nativeToolLine } from "./native-tools.js";
+import { agyCapacityNotice } from "./acp/events.js";
 import type { BridgeResult } from "./mcp-server.js";
 import {
 	formatToolResult,
@@ -363,6 +364,10 @@ async function consumeTurn(
 		meter?.setExhausted(exhausted);
 		return finish(stream, blocks, "error", `Antigravity quota exhausted for ${model.id}.${exhausted.resetAt ? ` Resets at ${exhausted.resetAt}.` : ""}`);
 	}
+	// agy's capacity notice is not an answer either. "overloaded" makes it
+	// match pi's retryable-provider-error pattern, so pi retries the turn.
+	const capacity = agyCapacityNotice(outcome.response);
+	if (capacity) return finish(stream, blocks, "error", `Antigravity servers are overloaded: ${capacity}`);
 	// Every response character already streamed as a text delta (the driver
 	// flushes its sanitizer before settling); only an empty message needs a block.
 	if (blocks.partial.content.length === 0) appendText(stream, blocks, "");

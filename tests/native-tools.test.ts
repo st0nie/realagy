@@ -47,8 +47,8 @@ test("tool policy names the active pi tools and is absent without them", () => {
 	assert.match(policy, /^read, bash, edit$/m);
 	assert.match(policy, /Use these pi tools for all file and shell work/);
 	assert.match(policy, /including images/);
-	assert.match(policy, /Do not use your built-in run_command, read_file, write_file, edit_file, list_dir tools/);
-	assert.match(policy, /do not delegate work to subagents/);
+	assert.match(policy, /Do not use your built-in run_command, read_file, write_file, edit_file tools/);
+	assert.match(policy, /do not start subagents, the browser agent, background tasks, or scheduled tasks \(invoke_subagent, define_subagent, manage_subagents, schedule, manage_task\)/);
 	assert.match(policy, /only for a job no pi tool can do/);
 	assert.equal(toolPolicyPrompt([]), undefined);
 });

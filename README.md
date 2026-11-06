@@ -40,7 +40,7 @@ Quota is fetched only when you run `/agy usage`. There is no settings panel, eng
 
 ## Pi tools and agy's own tools
 
-The model sees pi's active tools next to agy's built-in ones (`read_file`, `run_command`, `write_file`, subagents, web search, …); agy cannot switch its own tools off. realagy adds a short policy to agy's system prompt that asks the model to prefer pi's tools for reading files (images included), running commands, and changing files, so that work goes through pi's permissions and shows up as pi tool calls. agy's own tools still work when the model picks them, and pi always shows it:
+The model sees pi's active tools next to agy's built-in ones (`read_file`, `run_command`, `write_file`, subagents, web search, …); agy cannot switch its own tools off. realagy adds a short policy to agy's system prompt that asks the model to use pi's tools for reading files (images included), running commands, and changing files, so that work goes through pi's permissions and shows up as pi tool calls, and to work itself instead of starting subagents, background tasks, or scheduled tasks. agy's own tools still work when the model picks them, and pi always shows it:
 
 - each finished call adds a line to the reply's thinking, for example `agy → run_command npm test ✓ 2.1s`;
 - while a call runs, the status line shows `agy: run_command npm test … 12s` (the 5-minute inactivity limit waits for it);
@@ -50,6 +50,7 @@ The model sees pi's active tools next to agy's built-in ones (`read_file`, `run_
 
 - Esc cancels the running Antigravity turn through ACP. agy keeps running, and the next prompt continues in the same session. agy is restarted only if it ignores the cancel for 10 seconds.
 - Starting a new prompt while Antigravity still waits on pi tool results (for example, after the tool calls were interrupted) ends that stale turn instead of waiting for it to time out.
+- When agy answers that its servers are busy ("high traffic"), the turn fails as an overload error, so pi retries it instead of keeping the notice as the answer.
 - If agy cannot start or exits mid-turn, the turn fails with the binary path, the exit code, and agy's last error line. The next prompt starts it again. A turn with no output for 5 minutes is stopped, unless one of agy's own tools is still running.
 - After `/reload`, `pi -c`, or `/tree`, realagy resumes the matching Antigravity session. If agy's copy of that conversation is gone, the next prompt starts a new session with the full pi transcript.
 
