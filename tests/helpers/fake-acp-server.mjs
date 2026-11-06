@@ -19,6 +19,8 @@ const brainDir = process.env.FAKE_ACP_BRAIN_DIR;
 /** sessionId → frames agy buffered while no prompt ran (sent at the next
  *  prompt's start, before the prompt echo). */
 const leftovers = new Map();
+/** agy 1.5's session modes (session/new modes.availableModes). */
+const MODES = ["default", "accept-edits", "plan"];
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 function writeMessage(sessionId, message) {
 	const dir = `${brainDir}/${sessionId}/.system_generated/messages`;
@@ -60,6 +62,7 @@ rl.on("line", async (line) => {
 	if (method === "session/new") {
 		result(id, {
 			sessionId: `session-${++sessionCount}`,
+			modes: { currentModeId: "default", availableModes: MODES.map((modeId) => ({ id: modeId, name: modeId })) },
 			models: {
 				currentModelId: "gemini-3.8-flash-medium",
 				availableModels: [
@@ -88,6 +91,11 @@ rl.on("line", async (line) => {
 		return;
 	}
 	if (method === "session/set_config_option") {
+		// Like agy 1.5: only the advertised modes exist.
+		if (params.configId === "mode" && !MODES.includes(params.value)) {
+			fail(id, -32602, `Unknown mode: ${params.value}`);
+			return;
+		}
 		result(id, { configOptions: [] });
 		return;
 	}

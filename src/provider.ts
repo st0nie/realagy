@@ -457,9 +457,9 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					model: entry?.full ?? model.id,
 					effort: entry?.efforts?.length ? toAgyEffort(options?.reasoning, entry.efforts) : undefined,
 					mode: "default",
-					// agy's native tools are approved (agy session mode
-					// accept-edits); the tool policy steers the model to pi's
-					// tools, which run under pi's permission policy.
+					// agy's permission requests for its native tools are
+					// approved; the tool policy steers the model to pi's tools,
+					// which run under pi's permission policy.
 					skipPermissions: true,
 					conversationId: plan.kind === "warm" ? plan.sessionId : null,
 					prompt: plan.input.prompt,

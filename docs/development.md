@@ -19,6 +19,7 @@ Protocol tests run against `tests/helpers/fake-acp-server.mjs` instead of agy. I
 | session id `missing` | `session/load` and `session/resume` fail, which exercises the fresh-session fallback |
 | prompt text containing `[hang]` | The prompt never ends on its own; a `session/cancel` notification ends it with `stopReason: "cancelled"` |
 | prompt text containing `[silent-cancel]` | Like `[hang]`, but `session/cancel` is ignored, which exercises the teardown safety net |
+| `session/set_config_option` mode | Only agy 1.5's advertised modes (`default`, `accept-edits`, `plan`); others fail with `-32602 Unknown mode` |
 | `FAKE_ACP_BRAIN_DIR` | Where background work reports completion, as agy does in `brain/<sessionId>/.system_generated/messages/<id>.json` |
 | any prompt | Echoed as `user_message_chunk` first, after the leftovers of earlier background work, as agy does; `[no-echo]` skips the echo |
 | prompt text containing `[native]` | agy's own `read_file` (completed) and `run_command` (failed) plus one `mcp_pi-bridge_bash` call |

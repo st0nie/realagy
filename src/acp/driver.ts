@@ -122,10 +122,11 @@ export function acpModelSlug(model: string, effort?: string): string {
 }
 
 /** Map our knobs onto ACP session modes. */
-export function acpMode(mode: DriverTurnRequest["mode"], skipPermissions: boolean): string {
-	// agy 1.5 offers only default, accept-edits, and plan.
-	if (mode === "plan") return "plan";
-	return skipPermissions ? "accept-edits" : "default";
+export function acpMode(mode: DriverTurnRequest["mode"]): string {
+	// agy 1.5 offers only default, accept-edits, and plan. In `default`, agy
+	// asks before native commands and edits, so every such request passes
+	// the turn's permission policy (skipPermissions approves it).
+	return mode === "plan" ? "plan" : "default";
 }
 
 export class AcpDriver implements TurnDriver {
@@ -278,7 +279,7 @@ export class AcpDriver implements TurnDriver {
 			return;
 		}
 		try {
-			await conn.setConfigOption(turn.sessionId, "mode", acpMode(request.mode, request.skipPermissions));
+			await conn.setConfigOption(turn.sessionId, "mode", acpMode(request.mode));
 		} catch (err) {
 			this.#log("mode-apply-failed", { message: describe(err) });
 		}

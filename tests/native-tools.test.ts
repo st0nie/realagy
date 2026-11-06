@@ -102,13 +102,12 @@ test("live status shows the oldest running call with its elapsed time and clears
 });
 
 test("ACP modes are ones agy 1.5 offers", () => {
-	assert.equal(acpMode("default", true), "accept-edits");
-	assert.equal(acpMode("default", false), "default");
-	assert.equal(acpMode("plan", true), "plan");
+	assert.equal(acpMode("default"), "default");
+	assert.equal(acpMode("plan"), "plan");
 });
 
 test("the tool policy rides on session/new and session/resume, and turns use valid modes", async () => {
-	const { driver, wire, dir } = fixture({ FAKE_ACP_RESUME: "1", FAKE_ACP_DB_DIR: "" }, (tmp) => ({
+	const { driver, wire, dir, logs } = fixture({ FAKE_ACP_RESUME: "1", FAKE_ACP_DB_DIR: "" }, (tmp) => ({
 		systemPrompt: () => "POLICY",
 		conversationsDir: () => tmp,
 	}));
@@ -125,7 +124,23 @@ test("the tool policy rides on session/new and session/resume, and turns use val
 		assert.deepEqual(meta("session/new"), { antigravity: { eagerMcpServers: ["pi-bridge"], systemPrompt: { append: "POLICY" } } });
 		assert.deepEqual(meta("session/resume"), { antigravity: { eagerMcpServers: ["pi-bridge"], systemPrompt: { append: "POLICY" } } });
 		const modes = wire().filter((request) => request.method === "session/set_config_option" && request.params.configId === "mode").map((request) => request.params.value);
-		assert.deepEqual(modes, ["accept-edits", "accept-edits"]);
+		assert.deepEqual(modes, ["default", "default"]);
+		assert.ok(!logs.includes("mode-apply-failed"), "agy accepts the mode");
+	} finally {
+		await driver.close();
+	}
+});
+
+test("the tool policy rides on session/load when agy cannot resume", async () => {
+	const { driver, wire, dir } = fixture({ FAKE_ACP_DB_DIR: "" }, (tmp) => ({ systemPrompt: () => "POLICY", conversationsDir: () => tmp }));
+	try {
+		const first = await driver.run({ ...base, prompt: "one" });
+		await drain(first);
+		const sessionId = (await first.outcome).conversationId!;
+		fs.writeFileSync(path.join(dir, `${sessionId}.db`), "");
+		await driver.close();
+		await drain(await driver.run({ ...base, conversationId: sessionId, prompt: "two" }));
+		assert.deepEqual(wire().find((request) => request.method === "session/load")?.params._meta, { antigravity: { eagerMcpServers: ["pi-bridge"], systemPrompt: { append: "POLICY" } } });
 	} finally {
 		await driver.close();
 	}

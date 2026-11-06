@@ -9,8 +9,8 @@ export interface DriverTurnRequest {
 	/** Base model slug (effort tier separate) or the exact ACP model id. */
 	model: string;
 	effort?: string;
-	/** pi's agent mode: "plan" maps to agy's `plan` mode, "default" to
-	 *  `accept-edits` with skipPermissions, else agy's `default`. */
+	/** pi's agent mode: "plan" maps to agy's `plan` mode, "default" to agy's
+	 *  `default` (agy asks before native commands and edits). */
 	mode: "default" | "plan";
 	/** Approve agy's permission requests for its native tools. */
 	skipPermissions: boolean;
