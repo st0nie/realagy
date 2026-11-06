@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
 	ensure: vi.fn(), listModels: vi.fn(), close: vi.fn(), register: vi.fn(), fetchCliUsage: vi.fn(),
+	driverOptions: undefined as undefined | Record<string, any>,
 }));
 vi.mock("../src/acp/setup.js", () => ({ ensureAgyReady: mocks.ensure, resolveAgyBinary: () => "agy", MANUAL_SETUP: "curl -fsSL https://antigravity.google/cli/install.sh | bash" }));
 vi.mock("../src/acp/connection.js", () => ({ resolveAcpBinary: () => "agy" }));
@@ -9,6 +10,7 @@ vi.mock("../src/quota.js", () => ({ fetchCliUsage: mocks.fetchCliUsage, UsageMet
 vi.mock("../src/acp/driver.js", () => ({ AcpDriver: class {
 	listModels = mocks.listModels;
 	close = mocks.close;
+	constructor(options: Record<string, any>) { mocks.driverOptions = options; }
 } }));
 vi.mock("../src/mcp-server.js", () => ({ startMcpServer: async () => ({ ok: true, handle: { port: 1, token: "test", close: vi.fn() } }), TOKEN_HEADER: "token" }));
 vi.mock("../src/provider.js", () => ({ createStreamSimple: vi.fn(), POLL_TOOL_NAME: "poll", ToolRoundTrips: class { failAll() {} } }));
@@ -25,16 +27,79 @@ function deferred<T>() {
 async function start() {
 	const handlers = new Map<string, (...args: any[]) => void>();
 	const commands = new Map<string, any>();
-	const pi = { on: (name: string, cb: (...args: any[]) => void) => handlers.set(name, cb), registerProvider: mocks.register, registerCommand: (name: string, command: unknown) => commands.set(name, command) };
+	const renderers = new Map<string, any>();
+	const sendMessage = vi.fn();
+	const pi = {
+		on: (name: string, cb: (...args: any[]) => void) => handlers.set(name, cb),
+		registerProvider: mocks.register,
+		registerCommand: (name: string, command: unknown) => commands.set(name, command),
+		registerMessageRenderer: (type: string, renderer: unknown) => renderers.set(type, renderer),
+		sendMessage,
+		getAllTools: () => [],
+		getActiveTools: () => [],
+	};
 	await extension(pi as never);
 	let stale = false;
-	const ui = { setStatus: vi.fn(), notify: vi.fn() };
+	const ui = { setStatus: vi.fn(), notify: vi.fn(), setWidget: vi.fn(), theme: undefined };
 	const ctx = { hasUI: true, model: undefined, get ui() { if (stale) throw new Error("stale context"); return ui; } };
 	handlers.get("session_start")!({}, ctx);
-	return { shutdown: () => { handlers.get("session_shutdown")!(); stale = true; }, ui, commands, ctx };
+	return { shutdown: () => { handlers.get("session_shutdown")!(); stale = true; }, ui, commands, ctx, renderers, sendMessage, driver: mocks.driverOptions! };
 }
 
 beforeEach(() => { vi.clearAllMocks(); mocks.close.mockResolvedValue(undefined); mocks.fetchCliUsage.mockResolvedValue([]); });
+
+const finished = {
+	sessionId: "s",
+	kind: "task" as const,
+	workId: "bg1",
+	tool: "run_command",
+	target: "sleep 15 && echo DONE",
+	title: "Sleep and print DONE finished",
+	exitCode: 0,
+	durationMs: 15_200,
+	tail: "DONE",
+	output: "DONE",
+	logPath: "/tmp/task-4.log",
+};
+
+describe("agy background work in pi", () => {
+	it("wakes pi's agent with a follow-up message that renders as a card", async () => {
+		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
+		const session = await start();
+		session.driver.onBackgroundMessages([finished]);
+		expect(session.sendMessage).toHaveBeenCalledTimes(1);
+		const [message, options] = session.sendMessage.mock.calls[0]!;
+		expect(options).toEqual({ deliverAs: "followUp", triggerTurn: true });
+		expect(message).toMatchObject({ customType: "agy-background", display: true, details: { items: [finished] } });
+		expect(message.content).toMatch(/^Antigravity background work .* finished:\n\n- Background command run_command `sleep 15 && echo DONE` .*exit code 0, ran 15s\.\nOutput \(last lines\):\n```\nDONE\n```\nFull log: \/tmp\/task-4\.log$/s);
+		expect(session.renderers.has("agy-background")).toBe(true);
+	});
+
+	it("shows running agy work in a widget above the editor and clears it on shutdown", async () => {
+		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
+		const session = await start();
+		session.driver.onNativeTool({ type: "start", id: "a", tool: "run_command", target: "npm test", startedAt: Date.now() });
+		const [key, factory] = session.ui.setWidget.mock.lastCall!;
+		expect(key).toBe("agy-work");
+		const requestRender = vi.fn();
+		const widget = factory({ requestRender }, { fg: (_color: string, text: string) => text });
+		expect(widget.render(80)).toEqual([expect.stringMatching(/agy {2}run_command {2}npm test {2}0\.0s$/)]);
+		session.driver.onNativeTool({ type: "start", id: "a2", tool: "read_file", startedAt: Date.now() });
+		expect(session.ui.setWidget).toHaveBeenCalledTimes(1);
+		expect(requestRender).toHaveBeenCalled();
+		session.driver.onNativeTool({ type: "end", id: "a2" });
+		session.driver.onNativeTool({ type: "end", id: "a" });
+		expect(session.ui.setWidget).toHaveBeenLastCalledWith("agy-work", undefined);
+		session.driver.onNativeTool({ type: "start", id: "b", tool: "read_file", startedAt: Date.now() });
+		session.shutdown();
+		expect(session.ui.setWidget).toHaveBeenLastCalledWith("agy-work", undefined);
+		const calls = session.ui.setWidget.mock.calls.length;
+		session.driver.onNativeTool({ type: "start", id: "c", tool: "read_file", startedAt: Date.now() });
+		session.driver.onBackgroundMessages([finished]);
+		expect(session.ui.setWidget).toHaveBeenCalledTimes(calls);
+		expect(session.sendMessage).not.toHaveBeenCalled();
+	});
+});
 
 describe("extension session lifecycle", () => {
 	it("prompts with install instructions when agy is missing and does not install", async () => {

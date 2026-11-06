@@ -3,10 +3,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test, vi } from "vitest";
-import { BackgroundMessages, formatBackgroundNotice, noticeFromMessage, type BackgroundNotice } from "../src/acp/background.js";
+import { visibleWidth } from "@earendil-works/pi-tui";
+import { BackgroundMessages, backgroundMessageText, noticeFromMessage, type BackgroundNotice } from "../src/acp/background.js";
 import { acpMode, AcpDriver, type AcpDriverOptions } from "../src/acp/driver.js";
 import type { DriverActivity, DriverTurnRequest, TurnHandle } from "../src/driver-types.js";
-import { formatDuration, nativeToolLabel, nativeToolLine, NativeToolStatus, type NativeToolEvent } from "../src/native-tools.js";
+import { AgyWorkPanel, formatDuration, nativeToolLabel, nativeToolLine, nativeToolTarget, type PanelHost, type PanelStyle, type PanelWidget, type NativeToolEvent } from "../src/native-tools.js";
 import { toolPolicyPrompt } from "../src/tool-policy.js";
 
 type WireRequest = { id?: number; method: string; params: Record<string, unknown> };
@@ -54,12 +55,13 @@ test("tool policy names the active pi tools and is absent without them", () => {
 });
 
 test("native call labels, durations, and lines", () => {
-	assert.equal(nativeToolLabel("run_command", { CommandLine: "npm   test\n--watch", WaitMsBeforeAsync: 500 }, "npm test"), "run_command npm test --watch");
-	assert.equal(nativeToolLabel("read_file", { Path: "/w/src/a.ts" }, "File a.ts"), "read_file /w/src/a.ts");
-	assert.equal(nativeToolLabel("invoke_subagent", { Role: "Checker", Prompt: "long" }, "Run invoke_subagent"), "invoke_subagent Checker");
-	assert.equal(nativeToolLabel("search_web", {}, "\"acp\" on Web"), "search_web \"acp\" on Web");
-	assert.equal(nativeToolLabel("list_dir", {}, "Run list_dir"), "list_dir");
-	assert.equal(nativeToolLabel("run_command", { CommandLine: "x".repeat(200) }).length, "run_command ".length + 80);
+	const label = (name: string, args: Record<string, unknown>, title?: string) => nativeToolLabel(name, nativeToolTarget(name, args, title));
+	assert.equal(label("run_command", { CommandLine: "npm   test\n--watch", WaitMsBeforeAsync: 500 }, "npm test"), "run_command npm test --watch");
+	assert.equal(label("read_file", { Path: "/w/src/a.ts" }, "File a.ts"), "read_file /w/src/a.ts");
+	assert.equal(label("invoke_subagent", { Role: "Checker", Prompt: "long" }, "Run invoke_subagent"), "invoke_subagent Checker");
+	assert.equal(label("search_web", {}, "\"acp\" on Web"), "search_web \"acp\" on Web");
+	assert.equal(label("list_dir", {}, "Run list_dir"), "list_dir");
+	assert.equal(label("run_command", { CommandLine: "x".repeat(200) }).length, "run_command ".length + 80);
 	assert.equal(formatDuration(420), "0.4s");
 	assert.equal(formatDuration(42_000), "42s");
 	assert.equal(formatDuration(125_000), "2m 5s");
@@ -70,35 +72,74 @@ test("native call labels, durations, and lines", () => {
 	assert.equal(nativeToolLine({ label: "run_command sleep 9", status: "running", background: true }), "agy → run_command sleep 9 … (runs in background)");
 });
 
-test("live status shows the oldest running call with its elapsed time and clears", () => {
+/** A fake widget slot: records mounts and redraw requests, renders like pi's TUI. */
+function panelHost(style: PanelStyle = { fg: (_color, text) => text }) {
+	const state = { mounts: 0, hides: 0, redraws: 0, disposed: 0, widget: undefined as undefined | ReturnType<PanelWidget> };
+	const host: PanelHost = {
+		show: (factory) => {
+			state.mounts += 1;
+			state.widget = factory({ requestRender: () => { state.redraws += 1; } }, style);
+		},
+		hide: () => {
+			state.hides += 1;
+			state.widget?.dispose();
+			state.disposed += 1;
+			state.widget = undefined;
+		},
+	};
+	return { host, state, render: (width = 120) => state.widget?.render(width) };
+}
+
+test("the live panel mounts once, redraws through pi's TUI while work runs, and unmounts when idle", () => {
 	vi.useFakeTimers();
 	try {
 		let now = 1000;
-		const shown: Array<string | undefined> = [];
-		const status = new NativeToolStatus((text) => shown.push(text), () => now, 1000);
-		status.update({ type: "start", id: "a", label: "run_command make", startedAt: 1000 });
+		const { host, state, render } = panelHost();
+		const panel = new AgyWorkPanel(host, { now: () => now, intervalMs: 1000 });
+		panel.update({ type: "start", id: "a", tool: "run_command", target: "make", startedAt: 1000 });
+		assert.equal(state.mounts, 1);
+		assert.deepEqual(render(), [" ⠋ agy  run_command  make  0.0s"]);
 		now = 3200;
 		vi.advanceTimersByTime(1000);
-		status.update({ type: "start", id: "b", label: "read_file x", startedAt: 3200 });
-		status.update({ type: "end", id: "a" });
-		status.update({ type: "end", id: "missing" });
-		status.update({ type: "end", id: "b" });
+		assert.equal(state.redraws, 1, "a tick only requests a redraw");
+		assert.deepEqual(render(), [" ⠙ agy  run_command  make  2.2s"], "the spinner turns and the time runs");
+		panel.update({ type: "start", id: "b", tool: "invoke_subagent", target: "Checker", startedAt: 3200 });
+		panel.update({ type: "background", id: "a", kind: "task" });
+		panel.update({ type: "background", id: "b", kind: "subagent" });
+		panel.update({ type: "background", id: "missing", kind: "task" });
+		assert.equal(state.mounts, 1, "changes redraw the mounted widget");
+		assert.deepEqual(render(), [" ⠙ agy  background  make  2.2s", " ⠙ agy  subagent    Checker  0.0s"]);
+		for (const line of render(20)!) assert.ok(visibleWidth(line) <= 20, line);
+		for (const id of ["c", "d", "e", "f"]) panel.update({ type: "start", id, tool: "read_file", startedAt: now });
+		assert.equal(render()?.length, 6, "five rows and a summary");
+		assert.equal(render()?.at(-1), "   … 1 more");
+		const redraws = state.redraws;
+		panel.update({ type: "end", id: "missing" });
+		assert.equal(state.redraws, redraws, "unknown ids change nothing");
+		for (const id of ["a", "b", "c", "d", "e", "f"]) panel.update({ type: "end", id });
+		assert.deepEqual([state.hides, state.disposed], [1, 1], "an empty panel is removed");
+		const settled = state.redraws;
 		vi.advanceTimersByTime(5000);
-		assert.deepEqual(shown, [
-			"agy: run_command make … 0.0s",
-			"agy: run_command make … 2.2s",
-			"agy: run_command make … 2.2s (+1 more)",
-			"agy: read_file x … 0.0s",
-			undefined,
-		]);
-		status.update({ type: "start", id: "c", label: "x", startedAt: now });
-		status.close();
+		assert.equal(state.redraws, settled, "no redraws while idle");
+		panel.update({ type: "start", id: "g", tool: "x", startedAt: now });
+		assert.equal(state.mounts, 2, "new work mounts it again");
+		panel.close();
 		vi.advanceTimersByTime(5000);
-		status.update({ type: "start", id: "d", label: "y", startedAt: now });
-		assert.equal(shown.length, 6, "nothing renders after close");
+		panel.update({ type: "start", id: "h", tool: "y", startedAt: now });
+		assert.equal(state.mounts, 2, "nothing mounts after close");
+		assert.equal(state.redraws, settled, "nothing redraws after close");
+		assert.equal(panel.size, 0);
 	} finally {
 		vi.useRealTimers();
 	}
+});
+
+test("the live panel uses pi's theme", () => {
+	const { host, render } = panelHost({ fg: (color, text) => `<${color}>${text}` });
+	const panel = new AgyWorkPanel(host, { now: () => 0 });
+	panel.update({ type: "start", id: "a", tool: "read_file", startedAt: 0 });
+	assert.deepEqual(render(), [" <accent>⠋ <muted>agy  <toolTitle>read_file  <dim>0.0s"]);
+	panel.close();
 });
 
 test("ACP modes are ones agy 1.5 offers", () => {
@@ -170,6 +211,7 @@ test("native calls are reported with status and live events; pi bridge calls are
 		const bridge = activities.find((a) => a.type === "tool_start" && a.toolCallId === "b1");
 		assert.deepEqual(bridge && bridge.type === "tool_start" ? { name: bridge.name, mcpServer: bridge.mcpServer } : undefined, { name: "bash", mcpServer: "pi-bridge" });
 		assert.deepEqual(events.map((event) => `${event.type}:${event.id}`), ["start:n1", "end:n1", "start:n2", "end:n2"]);
+		assert.deepEqual(events[0], { type: "start", id: "n1", tool: "read_file", target: "/w/a.txt", startedAt: (events[0] as { startedAt: number }).startedAt });
 		assert.equal(text(activities), "OK");
 	} finally {
 		await driver.close();
@@ -202,7 +244,11 @@ test("background work: marked at prompt end, reported from agy's messages, lefto
 	const { driver: bgDriver, logs } = fixture({ FAKE_ACP_BRAIN_DIR: brain }, () => ({
 		brainDir: () => brain,
 		backgroundPollMs: 20,
-		onBackgroundMessage: (notice) => notices.push(notice),
+		onBackgroundMessages: (items) => {
+			// the panel entry ends before pi hears of the result
+			assert.equal(events.at(-1)?.type, "end");
+			notices.push(...items);
+		},
 		onNativeTool: (event) => events.push(event),
 	}));
 	try {
@@ -212,9 +258,23 @@ test("background work: marked at prompt end, reported from agy's messages, lefto
 		assert.deepEqual(natives(activities).map(({ label, status, background }) => ({ label, status, background })), [
 			{ label: "run_command sleep 1; echo FINISHED", status: "running", background: true },
 		]);
-		assert.deepEqual(events.map((event) => event.type), ["start", "end"], "the live status clears when the turn settles");
+		assert.deepEqual(events.map((event) => event.type), ["start", "background"], "the call stays in the panel as background work");
 		await vi.waitFor(() => assert.equal(notices.length, 1), { timeout: 3000 });
-		assert.deepEqual(notices[0], { sessionId, title: "Sleep task finished", exitCode: 0, tail: "tick\nFINISHED" });
+		assert.deepEqual(events.map((event) => `${event.type}:${event.id}`), ["start:bg1", "background:bg1", "end:bg1"]);
+		const { durationMs, ...notice } = notices[0]!;
+		assert.ok(typeof durationMs === "number" && durationMs >= 0);
+		assert.deepEqual(notice, {
+			sessionId,
+			kind: "task",
+			workId: "bg1",
+			tool: "run_command",
+			target: "sleep 1; echo FINISHED",
+			title: "Sleep task finished",
+			exitCode: 0,
+			tail: "tick\nFINISHED",
+			output: "tick\nFINISHED",
+			logPath: "/tmp/task-1.log",
+		});
 
 		const second = await bgDriver.run({ ...base, conversationId: sessionId, prompt: "next" });
 		const next = await drain(second);
@@ -229,13 +289,56 @@ test("background work: marked at prompt end, reported from agy's messages, lefto
 	}
 });
 
+test("without a brain directory, background work leaves the panel when the turn settles", async () => {
+	const events: NativeToolEvent[] = [];
+	const brain = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-brain-"));
+	const { driver } = fixture({ FAKE_ACP_BRAIN_DIR: brain }, () => ({
+		brainDir: () => undefined,
+		onBackgroundMessages: () => assert.fail("nothing is watched"),
+		onNativeTool: (event) => events.push(event),
+	}));
+	try {
+		await drain(await driver.run({ ...base, prompt: "[background] [subagent]" }));
+		assert.deepEqual(events.map((event) => `${event.type}:${event.id}`).sort(), ["end:bg1", "end:sa1", "start:bg1", "start:sa1"]);
+	} finally {
+		await driver.close();
+	}
+});
+
+test("background work leaves the panel when the agy process that ran it exits", async () => {
+	const events: NativeToolEvent[] = [];
+	const notices: BackgroundNotice[] = [];
+	// agy writes its messages elsewhere, so only the exit can end the work.
+	const writes = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-brain-"));
+	const watched = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-brain-"));
+	const { driver } = fixture({ FAKE_ACP_BRAIN_DIR: writes }, () => ({
+		brainDir: () => watched,
+		backgroundPollMs: 20,
+		onBackgroundMessages: (items) => notices.push(...items),
+		onNativeTool: (event) => events.push(event),
+	}));
+	try {
+		await drain(await driver.run({ ...base, prompt: "[background]" }));
+		assert.deepEqual(events.map((event) => `${event.type}:${event.id}`), ["start:bg1", "background:bg1"]);
+		const crashed = await driver.run({ ...base, prompt: "[exit]" });
+		await drain(crashed);
+		assert.equal((await crashed.outcome).status, "ERROR");
+		assert.deepEqual(events.map((event) => `${event.type}:${event.id}`), ["start:bg1", "background:bg1", "end:bg1"]);
+		assert.deepEqual(notices, []);
+	} finally {
+		await driver.close();
+	}
+});
+
 test("subagents are marked as background work and their reply is reported", async () => {
 	const notices: BackgroundNotice[] = [];
+	const events: NativeToolEvent[] = [];
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-brain-"));
 	const { driver } = fixture({ FAKE_ACP_BRAIN_DIR: dir }, () => ({
 		brainDir: () => dir,
 		backgroundPollMs: 20,
-		onBackgroundMessage: (notice) => notices.push(notice),
+		onBackgroundMessages: (items) => notices.push(...items),
+		onNativeTool: (event) => events.push(event),
 	}));
 	try {
 		const activities = await drain(await driver.run({ ...base, prompt: "[subagent]" }));
@@ -244,8 +347,12 @@ test("subagents are marked as background work and their reply is reported", asyn
 		]);
 		await vi.waitFor(() => assert.equal(notices.length, 1), { timeout: 3000 });
 		assert.equal(notices[0]?.title, "Message from Checker (research)");
+		assert.equal(notices[0]?.kind, "subagent");
+		assert.equal(notices[0]?.workId, "sa1");
+		assert.equal(notices[0]?.target, "Checker");
 		assert.equal(notices[0]?.tail, "all good");
 		assert.equal(notices[0]?.exitCode, undefined);
+		assert.deepEqual(events.map((event) => `${event.type}:${event.id}`), ["start:sa1", "background:sa1", "end:sa1"]);
 	} finally {
 		await driver.close();
 	}
@@ -278,17 +385,30 @@ test("frames are not lost when agy does not echo the prompt", async () => {
 	}
 });
 
-test("agy messages become notices with exit code and output tail", () => {
-	const notice = noticeFromMessage("s", {
-		title: "Build finished",
-		content: `Command exited with code 2.\r\n\r\nCommand output:\r\n${Array.from({ length: 10 }, (_, i) => `line ${i}`).join("\r\n")}\r\n\nLog: file:///tmp/task-3.log`,
-	});
-	assert.deepEqual(notice, { sessionId: "s", title: "Build finished", exitCode: 2, tail: "line 4\nline 5\nline 6\nline 7\nline 8\nline 9" });
-	assert.equal(formatBackgroundNotice(notice), "Antigravity background: Build finished (exit code 2)\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9");
-	const untitled = noticeFromMessage("s", { sender: "sub-9", content: "x".repeat(2000) });
+test("agy messages become notices with exit code, output, and log path; the model reads them as text", () => {
+	const content = `Command exited with code 2.\r\n\r\nCommand output:\r\n${Array.from({ length: 100 }, (_, i) => `line ${i}`).join("\r\n")}\r\n\nLog: file:///tmp/my%20task-3.log`;
+	const item = { id: "t3", tool: "run_command", target: "make", startedAt: 1000 };
+	const notice = noticeFromMessage("s", { title: "Build finished", content, timestamp: 4500 }, { kind: "task", item });
+	assert.equal(notice.exitCode, 2);
+	assert.equal(notice.durationMs, 3500);
+	assert.equal(notice.logPath, "/tmp/my task-3.log");
+	assert.equal(notice.tail, "line 94\nline 95\nline 96\nline 97\nline 98\nline 99");
+	assert.equal(notice.output.split("\n").length, 80);
+	assert.equal(notice.output.split("\n")[0], "line 20");
+	const untitled = noticeFromMessage("s", { sender: "sub-9", content: "x".repeat(9000) });
 	assert.equal(untitled.title, "Message from sub-9");
+	assert.equal(untitled.kind, "message");
 	assert.equal(untitled.tail.length, 600);
-	assert.equal(formatBackgroundNotice({ sessionId: "s", title: "Done", tail: "" }), "Antigravity background: Done");
+	assert.equal(untitled.output.length, 8000);
+	const quiet = noticeFromMessage("s", { title: "Quiet", content: "Command exited with code 0." }, { kind: "task", item });
+	assert.equal(quiet.output, "", "the exit line is not output");
+	assert.equal(backgroundMessageText([notice, quiet]), [
+		"Antigravity background work started earlier in this conversation finished:",
+		`- Background command run_command \`make\` (agy: "Build finished") finished: exit code 2, ran 3.5s.\nOutput (last lines):\n\`\`\`\n${notice.output}\n\`\`\`\nFull log: /tmp/my task-3.log`,
+		"- Background command run_command `make` (agy: \"Quiet\") finished: exit code 0.\n(no output)",
+	].join("\n\n"));
+	assert.match(backgroundMessageText([{ sessionId: "s", kind: "subagent", tool: "invoke_subagent", target: "Checker", title: "Message from Checker (research)", tail: "ok", output: "ok" }]), /Subagent invoke_subagent `Checker`.*\nReply:\n```\nok\n```$/s);
+	assert.match(backgroundMessageText([{ sessionId: "s", kind: "message", title: "Hi", tail: "", output: "" }]), /- agy message "Hi" finished\.\n\(no output\)$/);
 });
 
 test("the watcher ignores old, foreign, and unreadable messages and stops when the work is done or expired", () => {
@@ -297,8 +417,21 @@ test("the watcher ignores old, foreign, and unreadable messages and stops when t
 	fs.mkdirSync(dir, { recursive: true });
 	const write = (name: string, body: unknown) => fs.writeFileSync(path.join(dir, name), typeof body === "string" ? body : JSON.stringify(body));
 	const notices: BackgroundNotice[] = [];
+	const forgotten: string[] = [];
+	let polls = 0;
 	let now = 10_000;
-	const watcher = new BackgroundMessages({ brainDir: () => root, onMessage: (notice) => notices.push(notice), intervalMs: 60_000, maxAgeMs: 5000, now: () => now });
+	const watcher = new BackgroundMessages({
+		brainDir: () => root,
+		onMessages: (items) => {
+			polls += 1;
+			notices.push(...items);
+		},
+		onForget: (ids) => forgotten.push(...ids),
+		intervalMs: 60_000,
+		maxAgeMs: 5000,
+		now: () => now,
+	});
+	const work = (id: string) => ({ id, tool: "run_command", startedAt: 9000 });
 	try {
 		const at = (ms: number) => new Date(ms).toISOString();
 		write("old.json", { recipient: "s1", sender: "s1/task-0", timestamp: at(1000), content: "old" });
@@ -306,26 +439,33 @@ test("the watcher ignores old, foreign, and unreadable messages and stops when t
 		write("foreign.json", { recipient: "other", sender: "s1/task-1", timestamp: at(20_000), content: "no" });
 		write("self.json", { recipient: "s1", sender: "s1", timestamp: at(20_000), content: "no" });
 		write("partial.json", "{\"recipient\":");
-		watcher.track("s1", { since: 9000, taskIds: ["t1"], subagents: 1 });
-		watcher.track("s1", { since: 9500, taskIds: [], subagents: 0 });
+		watcher.track("s1", { since: 9000, tasks: [work("t1")], subagents: [{ id: "sa", tool: "invoke_subagent", target: "Checker", startedAt: 9000 }] });
+		watcher.track("s1", { since: 9500, tasks: [], subagents: [] });
 		watcher.poll();
 		assert.equal(notices.length, 0);
 		write("task.json", { recipient: "s1", sender: "s1/task-1", timestamp: at(20_000), renderDetails: { messageTitle: "T" }, content: "Command exited with code 0.", sourceMetadata: { tool: { toolCall: { id: "t1" } } } });
 		watcher.poll();
-		assert.deepEqual(notices.map((notice) => notice.title), ["T"]);
+		assert.deepEqual(notices.map((notice) => [notice.title, notice.kind, notice.workId]), [["T", "task", "t1"]]);
 		assert.deepEqual(watcher.watching, ["s1"], "the subagent is still outstanding");
 		write("partial.json", { recipient: "s1", sender: "sub", timestamp: at(20_000), content: "done" });
 		watcher.poll();
 		assert.deepEqual(notices.map((notice) => notice.tail), ["", "done"]);
+		assert.deepEqual(notices.map((notice) => notice.workId), ["t1", "sa"], "a message from another conversation reports the subagent");
 		assert.deepEqual(watcher.watching, []);
+		assert.equal(polls, 2, "one callback per poll with news");
+		assert.deepEqual(forgotten, []);
 
-		watcher.track("s1", { since: 30_000, taskIds: ["t9"], subagents: 0 });
+		watcher.track("s1", { since: 30_000, tasks: [work("t9")], subagents: [] });
 		now += 6000;
 		watcher.poll();
 		assert.deepEqual(watcher.watching, [], "expired");
-		watcher.track("missing", { since: 0, taskIds: ["t"], subagents: 0 });
+		assert.deepEqual(forgotten, ["t9"], "expired work leaves the panel");
+		watcher.track("missing", { since: 0, tasks: [work("t")], subagents: [] });
 		watcher.poll();
 		assert.deepEqual(watcher.watching, ["missing"], "a directory agy has not created yet is retried");
+		watcher.forgetAll();
+		assert.deepEqual(forgotten, ["t9", "t"], "work of an exited agy is forgotten");
+		assert.deepEqual(watcher.watching, []);
 	} finally {
 		watcher.close();
 	}

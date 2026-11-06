@@ -43,8 +43,8 @@ Quota is fetched only when you run `/agy usage`. There is no settings panel, eng
 The model sees pi's active tools next to agy's built-in ones (`read_file`, `run_command`, `write_file`, subagents, web search, …); agy cannot switch its own tools off. realagy adds a short policy to agy's system prompt that asks the model to use pi's tools for reading files (images included), running commands, and changing files, so that work goes through pi's permissions and shows up as pi tool calls, and to work itself instead of starting subagents, background tasks, or scheduled tasks. agy's own tools still work when the model picks them, and pi always shows it:
 
 - each finished call adds a line to the reply's thinking, for example `agy → run_command npm test ✓ 2.1s`;
-- while a call runs, the status line shows `agy: run_command npm test … 12s` (the 5-minute inactivity limit waits for it);
-- a command agy moved to the background, or a subagent, is marked `(runs in background)`, and a notice appears when agy reports it finished, with the exit code and the end of its output. Its leftover output does not leak into your next reply.
+- while agy works on its own, a live panel above the editor lists each running call, background command, and subagent with a spinner and its elapsed time (the 5-minute inactivity limit waits for a running call);
+- a command agy moved to the background, or a subagent, is marked `(runs in background)`. When it finishes, a tool-style card with the exit code and the end of its output (expand it for the whole output and the log path) is added to the conversation and pi's agent reacts to it: right away when idle, otherwise after its current work. agy's own leftover output never leaks into your next reply.
 
 ## Interrupts and failures
 
@@ -74,7 +74,7 @@ The model sees pi's active tools next to agy's built-in ones (`read_file`, `run_
 | `src/acp/connection.ts`, `driver.ts`, `events.ts`, `jsonrpc.ts` | `agy acp` process, ACP protocol, serialized turns, frame mapping |
 | `src/acp/step-usage.ts` | Exact per-model-call tokens from agy's conversation store, and `/tree` forks of it |
 | `src/tool-policy.ts` | The tool policy appended to agy's system prompt |
-| `src/native-tools.ts`, `src/acp/background.ts` | Thinking lines and live status for agy's own tool calls; notices when its background work finishes |
+| `src/native-tools.ts`, `src/acp/background.ts`, `src/background-card.ts` | Thinking lines and the live panel for agy's own tool calls; finished background work as a conversation card that wakes pi's agent |
 | `src/stream-sanitizer.ts`, `src/frame-guard.ts`, `src/redact.ts` | Hiding injected `<SYSTEM_MESSAGE>` blocks, dropping stdout noise, redacting secrets from logs and errors |
 | `tests/` | Vitest suites; `tests/helpers/fake-acp-server.mjs` stands in for agy |
 | `scripts/` | Live smokes and probes (spend account quota) |

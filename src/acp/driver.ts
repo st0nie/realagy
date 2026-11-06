@@ -25,11 +25,11 @@
 
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
-import { BackgroundMessages, type BackgroundNotice } from "./background.js";
+import { BackgroundMessages, type BackgroundItem, type BackgroundNotice } from "./background.js";
 import { AcpConnection, type AcpExitInfo, type AcpMcpServer } from "./connection.js";
 import { isAgyRetryNotice, mapStopReason, mapUpdate, TextAccumulator, type AcpEditDiff } from "./events.js";
 import { conversationDbPath, lastStepIdx, readStepState, siblingUsage, summarizeSteps, type StepTokens, type StepUsage } from "./step-usage.js";
-import { nativeToolLabel, PI_BRIDGE_SERVER, type NativeToolEvent } from "../native-tools.js";
+import { nativeToolLabel, nativeToolTarget, PI_BRIDGE_SERVER, type NativeToolEvent } from "../native-tools.js";
 import { traceUsage } from "../usage-trace.js";
 import type { AgyStepUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../driver-types.js";
 
@@ -60,10 +60,10 @@ export interface AcpDriverOptions {
 	/** agy's `brain` directory, watched for background work that finishes
 	 *  after a prompt ended. undefined disables the watcher. */
 	brainDir?: () => string | undefined;
-	/** A native call started or ended (live status). */
+	/** A native call started, moved to the background, or ended (live panel). */
 	onNativeTool?: (event: NativeToolEvent) => void;
-	/** agy reported finished background work (command or subagent). */
-	onBackgroundMessage?: (notice: BackgroundNotice) => void;
+	/** agy reported finished background work (commands, subagents) in one poll. */
+	onBackgroundMessages?: (notices: BackgroundNotice[]) => void;
 	/** Background watcher poll interval (tests shrink it). */
 	backgroundPollMs?: number;
 }
@@ -102,9 +102,9 @@ interface ActiveTurn {
 	 *  on the pending tool_call frame; updates don't repeat it). */
 	toolCalls: Map<string, { name: string; args: Record<string, unknown>; diff?: AcpEditDiff; mcpServer?: string }>;
 	/** agy's own calls still running: they pause the inactivity guard. */
-	natives: Map<string, { name: string; label: string; startedAt: number }>;
+	natives: Map<string, BackgroundItem>;
 	/** Subagents started by this prompt (they finish in the background). */
-	subagents: number;
+	subagents: BackgroundItem[];
 	promptStartedAt: number;
 	/** agy echoes the prompt as user_message_chunk. Content frames before
 	 *  that echo are leftovers of background work that finished between
@@ -436,7 +436,7 @@ export class AcpDriver implements TurnDriver {
 			case "tool_start": {
 				turn.toolCalls.set(mapped.toolCallId, { name: mapped.name, args: mapped.args, diff: mapped.diff, mcpServer: mapped.mcpServer });
 				this.#emit(turn, { type: "tool_start", name: mapped.name, args: mapped.args, mcpServer: mapped.mcpServer, toolCallId: mapped.toolCallId });
-				if (mapped.mcpServer !== PI_BRIDGE_SERVER) this.#nativeStarted(turn, mapped.toolCallId, mapped.name, nativeToolLabel(mapped.name, mapped.args, mapped.title));
+				if (mapped.mcpServer !== PI_BRIDGE_SERVER) this.#nativeStarted(turn, mapped.toolCallId, mapped.name, nativeToolTarget(mapped.name, mapped.args, mapped.title));
 				return;
 			}
 			case "tool_done": {
@@ -475,12 +475,12 @@ export class AcpDriver implements TurnDriver {
 
 	/** One of agy's own tools started: show it live and pause the inactivity
 	 *  guard, since a long native command produces no frames. */
-	#nativeStarted(turn: ActiveTurn, id: string, name: string, label: string): void {
+	#nativeStarted(turn: ActiveTurn, id: string, name: string, target: string | undefined): void {
 		if (turn.natives.has(id)) return;
 		const startedAt = Date.now();
-		turn.natives.set(id, { name, label, startedAt });
+		turn.natives.set(id, { id, tool: name, target, startedAt });
 		this.#clearIdle(turn);
-		this.#notifyNative({ type: "start", id, label, startedAt });
+		this.#notifyNative({ type: "start", id, tool: name, ...(target ? { target } : {}), startedAt });
 	}
 
 	#nativeEnded(turn: ActiveTurn, id: string, status: "ok" | "failed"): void {
@@ -488,10 +488,21 @@ export class AcpDriver implements TurnDriver {
 		if (!native) return;
 		turn.natives.delete(id);
 		// invoke_subagent returns at once; the subagent keeps working.
-		const background = status === "ok" && native.name === "invoke_subagent";
-		if (background) turn.subagents += 1;
-		this.#emit(turn, { type: "native_tool", toolCallId: id, label: native.label, status, durationMs: Date.now() - native.startedAt, background });
-		this.#notifyNative({ type: "end", id });
+		const background = status === "ok" && native.tool === "invoke_subagent";
+		this.#emit(turn, {
+			type: "native_tool",
+			toolCallId: id,
+			label: nativeToolLabel(native.tool, native.target),
+			status,
+			durationMs: Date.now() - native.startedAt,
+			background,
+		});
+		if (background && this.#canWatchBackground()) {
+			turn.subagents.push(native);
+			this.#notifyNative({ type: "background", id, kind: "subagent" });
+		} else {
+			this.#notifyNative({ type: "end", id });
+		}
 		this.#armIdle(turn);
 	}
 
@@ -513,21 +524,41 @@ export class AcpDriver implements TurnDriver {
 			turn.echoSeen = true;
 			for (const update of held) this.#applyUpdate(turn, update);
 		}
-		const taskIds = [...turn.natives.keys()];
-		for (const [id, native] of turn.natives) {
-			this.#emit(turn, { type: "native_tool", toolCallId: id, label: native.label, status: "running", background: true });
+		const tasks = [...turn.natives.values()];
+		for (const native of tasks) {
+			this.#emit(turn, { type: "native_tool", toolCallId: native.id, label: nativeToolLabel(native.tool, native.target), status: "running", background: true });
 		}
-		if (taskIds.length > 0 || turn.subagents > 0) {
-			this.#backgroundWatcher()?.track(turn.sessionId, { since: turn.promptStartedAt, taskIds, subagents: turn.subagents });
+		if (tasks.length === 0 && turn.subagents.length === 0) return;
+		const watcher = this.#backgroundWatcher();
+		if (!watcher?.track(turn.sessionId, { since: turn.promptStartedAt, tasks, subagents: turn.subagents })) {
+			// Nothing will report these: settling ends them in the panel.
+			for (const subagent of turn.subagents) this.#notifyNative({ type: "end", id: subagent.id });
+			return;
+		}
+		// Watched from now on: they stay in the panel until agy reports them.
+		for (const native of tasks) {
+			turn.natives.delete(native.id);
+			this.#notifyNative({ type: "background", id: native.id, kind: "task" });
 		}
 	}
 
+	/** Whether agy's reports of finished background work can be read. */
+	#canWatchBackground(): boolean {
+		return this.#backgroundWatcher() !== undefined && this.#opts.brainDir?.() !== undefined;
+	}
+
 	#backgroundWatcher(): BackgroundMessages | undefined {
-		const { brainDir, onBackgroundMessage } = this.#opts;
-		if (!brainDir || !onBackgroundMessage) return undefined;
+		const { brainDir, onBackgroundMessages } = this.#opts;
+		if (!brainDir || !onBackgroundMessages) return undefined;
 		this.#background ??= new BackgroundMessages({
 			brainDir,
-			onMessage: onBackgroundMessage,
+			onMessages: (notices) => {
+				for (const notice of notices) if (notice.workId) this.#notifyNative({ type: "end", id: notice.workId });
+				onBackgroundMessages(notices);
+			},
+			onForget: (ids) => {
+				for (const id of ids) this.#notifyNative({ type: "end", id });
+			},
 			log: (msg, data) => this.#log(msg, data),
 			intervalMs: this.#opts.backgroundPollMs,
 		});
@@ -538,6 +569,8 @@ export class AcpDriver implements TurnDriver {
 		if (this.#conn === conn) {
 			this.#conn = undefined;
 			this.#liveSessions.clear();
+			// agy's background tasks and subagents died with it.
+			this.#background?.forgetAll();
 		}
 		const turn = this.#active;
 		this.#log("connection-exited", { code: info.code, signal: info.signal, ownsTurn: turn?.conn === conn });
@@ -647,7 +680,7 @@ export class AcpDriver implements TurnDriver {
 			parks: 0,
 			toolCalls: new Map(),
 			natives: new Map(),
-			subagents: 0,
+			subagents: [],
 			promptStartedAt: 0,
 			echoSeen: false,
 			held: [],

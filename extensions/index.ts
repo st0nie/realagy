@@ -6,7 +6,8 @@
 import { createProvider } from "@earendil-works/pi-ai";
 import { BorderedLoader, type ExtensionAPI, type ExtensionCommandContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { AcpDriver } from "../src/acp/driver.js";
-import { defaultBrainDir, formatBackgroundNotice } from "../src/acp/background.js";
+import { backgroundMessageText, defaultBrainDir } from "../src/acp/background.js";
+import { AGY_BACKGROUND_MESSAGE, renderBackgroundCard, type BackgroundCardDetails } from "../src/background-card.js";
 import { fetchCliUsage, UsageMeter } from "../src/quota.js";
 import type { AcpSessions } from "../src/provider.js";
 import { defaultConversationsDir } from "../src/acp/step-usage.js";
@@ -14,10 +15,13 @@ import { ensureAgyReady, MANUAL_SETUP, resolveAgyBinary } from "../src/acp/setup
 import { bridgedPiTools, bridgeInputSchema } from "../src/bridge-catalog.js";
 import { startMcpServer, TOKEN_HEADER, type McpServerHandle } from "../src/mcp-server.js";
 import { entriesFromAcpModels, FALLBACK_MODELS, toPiModel, type AgyModelEntry } from "../src/models.js";
-import { NativeToolStatus } from "../src/native-tools.js";
+import { AgyWorkPanel } from "../src/native-tools.js";
 import { createStreamSimple, POLL_TOOL_NAME, ToolRoundTrips } from "../src/provider.js";
 import { toolPolicyPrompt } from "../src/tool-policy.js";
 import { restoreWarmSessions, WARM_SESSION_ENTRY, type SessionEntryLike, type WarmSession } from "../src/transcript.js";
+/** Widget key of the live panel of running agy work. */
+const AGY_WORK_WIDGET = "agy-work";
+
 const SIGN_IN = [
 	"Sign in with the Antigravity CLI in a terminal (realagy never handles credentials):",
 	"  agy                # interactive sign-in on first run",
@@ -27,6 +31,7 @@ const SIGN_IN = [
 
 export default async function (pi: ExtensionAPI): Promise<void> {
 	const entries: AgyModelEntry[] = [...FALLBACK_MODELS];
+	pi.registerMessageRenderer(AGY_BACKGROUND_MESSAGE, renderBackgroundCard);
 	// Re-resolved by /agy setup; a missing binary fails the spawn with a
 	// pointer to /agy setup.
 	let bin = resolveAgyBinary() ?? "agy";
@@ -35,12 +40,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const shutdownController = new AbortController();
 
 	const activeTools = () => bridgedPiTools(pi.getAllTools(), pi.getActiveTools());
-	// UI of this runtime, for notices outside an event (background work) and
-	// the live native-tool status. pi replaces the runtime on /new, /resume,
-	// /fork, and /reload after session_shutdown, so `stopped` guards every use.
+	// UI of this runtime, for the live agy panel. pi replaces the runtime on
+	// /new, /resume, /fork, and /reload after session_shutdown, so `stopped`
+	// guards every use.
 	let ui: ExtensionUIContext | undefined;
-	const nativeStatus = new NativeToolStatus((text) => {
-		if (!stopped) ui?.setStatus("agy-native-tools", text);
+	const workPanel = new AgyWorkPanel({
+		show: (widget) => {
+			if (!stopped) ui?.setWidget(AGY_WORK_WIDGET, widget);
+		},
+		hide: () => {
+			if (!stopped) ui?.setWidget(AGY_WORK_WIDGET, undefined);
+		},
 	});
 
 	const driver = new AcpDriver({
@@ -55,10 +65,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		// unmeasured messages are left to pi's own transcript estimate.
 		conversationsDir: () => defaultConversationsDir(),
 		systemPrompt: () => toolPolicyPrompt(activeTools().map((tool) => tool.name)),
-		onNativeTool: (event) => nativeStatus.update(event),
+		onNativeTool: (event) => workPanel.update(event),
 		brainDir: () => defaultBrainDir(),
-		onBackgroundMessage: (notice) => {
-			if (!stopped) ui?.notify(formatBackgroundNotice(notice), "info");
+		// Finished background work wakes pi's agent: an idle agent starts a
+		// turn now, a busy one gets the message after its current work.
+		onBackgroundMessages: (items) => {
+			if (stopped) return;
+			pi.sendMessage<BackgroundCardDetails>(
+				{ customType: AGY_BACKGROUND_MESSAGE, content: backgroundMessageText(items), display: true, details: { items } },
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
 		},
 	});
 	const roundTrips = new ToolRoundTrips(driver);
@@ -177,9 +193,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		} catch { /* ephemeral or read-only session */ }
 	});
 	pi.on("session_shutdown", () => {
+		// The event's context is still valid here: clear the panel before
+		// this runtime lets go of the UI.
+		workPanel.close();
+		if (!stopped) ui?.setWidget(AGY_WORK_WIDGET, undefined);
 		stopped = true;
 		ui = undefined;
-		nativeStatus.close();
 		shutdownController.abort();
 		pendingWarmEntry = null;
 		sessions.warm = undefined;
