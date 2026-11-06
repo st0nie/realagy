@@ -57,7 +57,6 @@ const finished = {
 	title: "Sleep and print DONE finished",
 	exitCode: 0,
 	durationMs: 15_200,
-	tail: "DONE",
 	output: "DONE",
 	logPath: "/tmp/task-4.log",
 };

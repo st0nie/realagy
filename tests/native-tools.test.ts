@@ -271,7 +271,6 @@ test("background work: marked at prompt end, reported from agy's messages, lefto
 			target: "sleep 1; echo FINISHED",
 			title: "Sleep task finished",
 			exitCode: 0,
-			tail: "tick\nFINISHED",
 			output: "tick\nFINISHED",
 			logPath: "/tmp/task-1.log",
 		});
@@ -350,7 +349,7 @@ test("subagents are marked as background work and their reply is reported", asyn
 		assert.equal(notices[0]?.kind, "subagent");
 		assert.equal(notices[0]?.workId, "sa1");
 		assert.equal(notices[0]?.target, "Checker");
-		assert.equal(notices[0]?.tail, "all good");
+		assert.equal(notices[0]?.output, "all good");
 		assert.equal(notices[0]?.exitCode, undefined);
 		assert.deepEqual(events.map((event) => `${event.type}:${event.id}`), ["start:sa1", "background:sa1", "end:sa1"]);
 	} finally {
@@ -392,13 +391,11 @@ test("agy messages become notices with exit code, output, and log path; the mode
 	assert.equal(notice.exitCode, 2);
 	assert.equal(notice.durationMs, 3500);
 	assert.equal(notice.logPath, "/tmp/my task-3.log");
-	assert.equal(notice.tail, "line 94\nline 95\nline 96\nline 97\nline 98\nline 99");
 	assert.equal(notice.output.split("\n").length, 80);
 	assert.equal(notice.output.split("\n")[0], "line 20");
 	const untitled = noticeFromMessage("s", { sender: "sub-9", content: "x".repeat(9000) });
 	assert.equal(untitled.title, "Message from sub-9");
 	assert.equal(untitled.kind, "message");
-	assert.equal(untitled.tail.length, 600);
 	assert.equal(untitled.output.length, 8000);
 	const quiet = noticeFromMessage("s", { title: "Quiet", content: "Command exited with code 0." }, { kind: "task", item });
 	assert.equal(quiet.output, "", "the exit line is not output");
@@ -407,8 +404,8 @@ test("agy messages become notices with exit code, output, and log path; the mode
 		`- Background command run_command \`make\` (agy: "Build finished") finished: exit code 2, ran 3.5s.\nOutput (last lines):\n\`\`\`\n${notice.output}\n\`\`\`\nFull log: /tmp/my task-3.log`,
 		"- Background command run_command `make` (agy: \"Quiet\") finished: exit code 0.\n(no output)",
 	].join("\n\n"));
-	assert.match(backgroundMessageText([{ sessionId: "s", kind: "subagent", tool: "invoke_subagent", target: "Checker", title: "Message from Checker (research)", tail: "ok", output: "ok" }]), /Subagent invoke_subagent `Checker`.*\nReply:\n```\nok\n```$/s);
-	assert.match(backgroundMessageText([{ sessionId: "s", kind: "message", title: "Hi", tail: "", output: "" }]), /- agy message "Hi" finished\.\n\(no output\)$/);
+	assert.match(backgroundMessageText([{ sessionId: "s", kind: "subagent", tool: "invoke_subagent", target: "Checker", title: "Message from Checker (research)", output: "ok" }]), /Subagent invoke_subagent `Checker`.*\nReply:\n```\nok\n```$/s);
+	assert.match(backgroundMessageText([{ sessionId: "s", kind: "message", title: "Hi", output: "" }]), /- agy message "Hi" finished\.\n\(no output\)$/);
 });
 
 test("the watcher ignores old, foreign, and unreadable messages and stops when the work is done or expired", () => {
@@ -449,7 +446,7 @@ test("the watcher ignores old, foreign, and unreadable messages and stops when t
 		assert.deepEqual(watcher.watching, ["s1"], "the subagent is still outstanding");
 		write("partial.json", { recipient: "s1", sender: "sub", timestamp: at(20_000), content: "done" });
 		watcher.poll();
-		assert.deepEqual(notices.map((notice) => notice.tail), ["", "done"]);
+		assert.deepEqual(notices.map((notice) => notice.output), ["", "done"]);
 		assert.deepEqual(notices.map((notice) => notice.workId), ["t1", "sa"], "a message from another conversation reports the subagent");
 		assert.deepEqual(watcher.watching, []);
 		assert.equal(polls, 2, "one callback per poll with news");

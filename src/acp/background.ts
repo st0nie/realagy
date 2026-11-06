@@ -44,9 +44,7 @@ export interface BackgroundNotice {
 	exitCode?: number;
 	/** From the call's start to agy's message. */
 	durationMs?: number;
-	/** Last lines for the collapsed card. */
-	tail: string;
-	/** Last 80 lines (at most 8 KB) for the model and the expanded card. */
+	/** Last 80 lines (at most 8 KB) for the model and the card. */
 	output: string;
 	/** agy's full task log. */
 	logPath?: string;
@@ -76,8 +74,6 @@ interface Tracked {
 
 const POLL_MS = 2000;
 const MAX_AGE_MS = 12 * 60 * 60_000;
-const TAIL_LINES = 6;
-const TAIL_CHARS = 600;
 const OUTPUT_LINES = 80;
 const OUTPUT_CHARS = 8000;
 
@@ -283,7 +279,6 @@ export function noticeFromMessage(
 		title: message.title ?? `Message from ${message.sender ?? "agy"}`,
 		...(exit ? { exitCode: Number(exit[1]) } : {}),
 		...(item && message.timestamp !== undefined ? { durationMs: Math.max(0, message.timestamp - item.startedAt) } : {}),
-		tail: lastLines(lines.filter((line) => line.trim()), TAIL_LINES, TAIL_CHARS),
 		output: lastLines(lines, OUTPUT_LINES, OUTPUT_CHARS),
 		...(log ? { logPath: decodeURI(log[1]!) } : {}),
 	};

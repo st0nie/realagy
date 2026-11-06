@@ -44,7 +44,7 @@ The model sees pi's active tools next to agy's built-in ones (`read_file`, `run_
 
 - each finished call adds a line to the reply's thinking, for example `agy → run_command npm test ✓ 2.1s`;
 - while agy works on its own, a live panel above the editor lists each running call, background command, and subagent with a spinner and its elapsed time (the 5-minute inactivity limit waits for a running call);
-- a command agy moved to the background, or a subagent, is marked `(runs in background)`. When it finishes, a tool-style card with the exit code and the end of its output (expand it for the whole output and the log path) is added to the conversation and pi's agent reacts to it: right away when idle, otherwise after its current work. agy's own leftover output never leaks into your next reply.
+- a command agy moved to the background, or a subagent, is marked `(runs in background)`. When it finishes, a tool card with the exit code and the last 5 lines of its output (expand it with ctrl+o or a left click for the whole output and the log path) is added to the conversation and pi's agent reacts to it: right away when idle, otherwise after its current work. agy's own leftover output never leaks into your next reply.
 
 ## Interrupts and failures
 
