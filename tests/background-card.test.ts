@@ -75,12 +75,12 @@ test("failed, subagent, other-tool and plain message items", () => {
 	assert.equal(backgroundItemText(note, { expanded: true, keyHint }, tagTheme), "<success>✓</success> <toolTitle>*agy message*</toolTitle> <accent>Note</accent>");
 });
 
-test("one tool card per message: padded tool background, red when any item failed", () => {
+test("one card per message: padded custom-message background", () => {
 	const ok = text(renderBackgroundCard(message([task]), opts(false), bgTheme)).split("\n");
-	assert.ok(ok.every((line) => line.startsWith("[toolSuccessBg]")), "success background on every row, padding included");
-	assert.ok(ok[0]!.replace("[toolSuccessBg]", "").trim() === "", "vertical padding");
+	assert.ok(ok.every((line) => line.startsWith("[customMessageBg]")), "custom-message background on every row, padding included");
+	assert.ok(ok[0]!.replace("[customMessageBg]", "").trim() === "", "vertical padding");
 	const both = text(renderBackgroundCard(message([task, { ...task, workId: "bg2", exitCode: 1, output: "boom" }]), opts(false), bgTheme));
-	assert.ok(both.split("\n").every((line) => line.startsWith("[toolErrorBg]")));
+	assert.ok(both.split("\n").every((line) => line.startsWith("[customMessageBg]")));
 	assert.ok(both.indexOf("exit 0") < both.indexOf("exit 1"), "items in message order");
 	assert.equal(renderBackgroundCard(message([]), opts(false), bgTheme), undefined);
 });

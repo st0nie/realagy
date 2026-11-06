@@ -70,15 +70,14 @@ export function backgroundItemText(notice: BackgroundNotice, opts: CardOptions, 
 const cardClicks = new WeakMap<BackgroundCardMessage, { base: boolean; expanded: boolean }>();
 
 /**
- * The message as a pi tool card: tool background, padding, one section per
+ * The message as a pi card: custom-message background, padding, one section per
  * item. A left click anywhere on the card toggles it; the toggle is keyed by
  * the message object, so it survives re-renders.
  */
 export function renderBackgroundCard(message: BackgroundCardMessage, opts: MessageRenderOptions, theme: Theme): Component | undefined {
 	const items = message.details?.items ?? [];
 	if (items.length === 0) return undefined;
-	const bg = items.some(noticeFailed) ? "toolErrorBg" : "toolSuccessBg";
-	const box = new Box(opts.outputPad, 1, (text) => theme.bg(bg, text));
+	const box = new Box(opts.outputPad, 1, (text) => theme.bg("customMessageBg", text));
 	const click = cardClicks.get(message);
 	if (click && click.base !== opts.expanded) cardClicks.delete(message);
 	let expanded = cardClicks.get(message)?.expanded ?? opts.expanded;
