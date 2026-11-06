@@ -1,12 +1,31 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 import http from "node:http";
-import { bridgedPiTools, bridgeInputSchema } from "../src/bridge-catalog.js";
+import { bridgedPiTools, bridgeInputSchema, dispatchablePiTool } from "../src/bridge-catalog.js";
 import { startMcpServer, TOKEN_HEADER } from "../src/mcp-server.js";
 
-test("bridge includes active pi builtins and rejects internal/inactive tools", () => {
-	const tools = [{ name: "read" }, { name: "bash" }, { name: "write" }, { name: "AskAntigravity" }, { name: "bridge_poll_result" }];
-	assert.deepEqual(bridgedPiTools(tools, ["read", "bash"]).map((tool) => tool.name), ["read", "bash"]);
+test("bridge lists every model-facing pi tool, active or not, and dispatches only active ones", () => {
+	const tools = [
+		{ name: "read", exposure: "direct" },
+		{ name: "bash" },
+		// pi-lens situational tool: registered, inactive until activated.
+		{ name: "lens_symbols", exposure: "direct" },
+		{ name: "ask", exposure: "model-only" },
+		{ name: "mcp__docs__search", exposure: "deferred" },
+		{ name: "memory_recall", exposure: "codemode" },
+		{ name: "secret", exposure: "hidden" },
+		{ name: "AskAntigravity" },
+		{ name: "bridge_poll_result" },
+	];
+	const active = ["read", "bash", "memory_recall"];
+	assert.deepEqual(bridgedPiTools(tools, active).map((tool) => tool.name), ["read", "bash", "lens_symbols", "ask", "memory_recall"]);
+	// Activating a situational tool mid-session does not change the list.
+	assert.deepEqual(bridgedPiTools(tools, [...active, "lens_symbols"]).map((tool) => tool.name), bridgedPiTools(tools, active).map((tool) => tool.name));
+	assert.equal(dispatchablePiTool(tools, active, "bash"), true);
+	assert.equal(dispatchablePiTool(tools, active, "lens_symbols"), false);
+	assert.equal(dispatchablePiTool(tools, [...active, "lens_symbols"], "lens_symbols"), true);
+	assert.equal(dispatchablePiTool(tools, [...active, "AskAntigravity"], "AskAntigravity"), false);
+	assert.equal(dispatchablePiTool(tools, active, "secret"), false);
 });
 
 test("loopback MCP requires its token and lists/calls pi tools", async () => {

@@ -14,7 +14,7 @@ Protocol tests run against `tests/helpers/fake-acp-server.mjs` instead of agy. I
 
 | Variable | Effect |
 | --- | --- |
-| `FAKE_ACP_DB_DIR` | Writes one agent step per prompt to `<dir>/<sessionId>.db`, the way agy's conversation store does |
+| `FAKE_ACP_DB_DIR` | Writes each prompt to `<dir>/<sessionId>.db` the way agy's conversation store does: its user-input step (14) on arrival, kept when the prompt is cancelled, and one agent step (15) when it completes |
 | `FAKE_ACP_RESUME` | Advertises `sessionCapabilities.resume` and answers `session/resume`; without it `session/load` replays a canned history first |
 | session id `missing` | `session/load` and `session/resume` fail, which exercises the fresh-session fallback |
 | prompt text containing `[hang]` | The prompt never ends on its own; a `session/cancel` notification ends it with `stopReason: "cancelled"` |

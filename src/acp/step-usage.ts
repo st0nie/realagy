@@ -14,8 +14,12 @@ import { createRequire } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
 import { agyDataDir } from "./setup.js";
-/** steps.step_type of a model (agent) response; 14 is user input. */
+/** steps.step_type of a model (agent) response. */
 const STEP_TYPE_AGENT = 15;
+/** steps.step_type of a prompt's user input. agy stores it as soon as the
+ *  prompt arrives, before any model output, and keeps it when the prompt is
+ *  cancelled (verified live with agy 1.5.1). */
+const STEP_TYPE_USER_INPUT = 14;
 /** node:sqlite is synchronous: a locked store must not stall pi's event loop. */
 const BUSY_TIMEOUT_MS = 100;
 
@@ -166,6 +170,13 @@ export function readStepState(dbPath: string, afterIdx = -1): { steps: StepToken
 		}
 		return { steps, maxIdx: maxIdx(db) };
 	});
+}
+
+/** Whether the store holds a user-input step after `afterIdx`: proof that a
+ *  prompt sent since then reached the session. undefined when unreadable. */
+export function userInputSince(dbPath: string, afterIdx: number): boolean | undefined {
+	return withDb(dbPath, true, (db) =>
+		db.prepare("SELECT 1 AS found FROM steps WHERE step_type = ? AND idx > ? LIMIT 1").get(STEP_TYPE_USER_INPUT, afterIdx) !== undefined);
 }
 
 /** Highest step index currently stored (−1 for an empty or missing store). */

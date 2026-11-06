@@ -12,13 +12,14 @@ import { fetchCliUsage, UsageMeter } from "../src/quota.js";
 import type { AcpSessions } from "../src/provider.js";
 import { defaultConversationsDir } from "../src/acp/step-usage.js";
 import { ensureAgyReady, MANUAL_SETUP, resolveAgyBinary } from "../src/acp/setup.js";
-import { bridgedPiTools, bridgeInputSchema } from "../src/bridge-catalog.js";
+import { bridgedPiTools, bridgeInputSchema, dispatchablePiTool } from "../src/bridge-catalog.js";
 import { startMcpServer, TOKEN_HEADER, type McpServerHandle } from "../src/mcp-server.js";
 import { entriesFromAcpModels, FALLBACK_MODELS, toPiModel, type AgyModelEntry } from "../src/models.js";
 import { AgyWorkPanel } from "../src/native-tools.js";
-import { createStreamSimple, POLL_TOOL_NAME, ToolRoundTrips } from "../src/provider.js";
+import { createStreamSimple, failParkedCalls, POLL_TOOL_NAME, ToolRoundTrips } from "../src/provider.js";
 import { toolPolicyPrompt } from "../src/tool-policy.js";
 import { restoreWarmSessions, WARM_SESSION_ENTRY, type SessionEntryLike, type WarmSession } from "../src/transcript.js";
+import { treeRestoreExtras, type LoadoutEntry } from "../src/tool-loadout.js";
 /** Widget key of the live panel of running agy work. */
 const AGY_WORK_WIDGET = "agy-work";
 
@@ -39,7 +40,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	let stopped = false;
 	const shutdownController = new AbortController();
 
-	const activeTools = () => bridgedPiTools(pi.getAllTools(), pi.getActiveTools());
+	// Every tool an extension may activate is listed, so a mid-session
+	// activation never needs a new ACP session; only active ones run.
+	const bridgedTools = () => bridgedPiTools(pi.getAllTools(), pi.getActiveTools());
 	// UI of this runtime, for the live agy panel. pi replaces the runtime on
 	// /new, /resume, /fork, and /reload after session_shutdown, so `stopped`
 	// guards every use.
@@ -64,7 +67,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		// Exact per-call usage comes from the server's conversation store;
 		// unmeasured messages are left to pi's own transcript estimate.
 		conversationsDir: () => defaultConversationsDir(),
-		systemPrompt: () => toolPolicyPrompt(activeTools().map((tool) => tool.name)),
+		systemPrompt: () => toolPolicyPrompt(bridgedTools().map((tool) => tool.name)),
 		onNativeTool: (event) => workPanel.update(event),
 		brainDir: () => defaultBrainDir(),
 		// Finished background work wakes pi's agent: an idle agent starts a
@@ -78,12 +81,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		},
 	});
 	const roundTrips = new ToolRoundTrips(driver);
-	driver.onTurnEnd = (outcome) => {
-		if (outcome.aborted || outcome.status === "ERROR") roundTrips.failAll(outcome.error ?? "Antigravity turn ended");
-	};
+	driver.onTurnEnd = (outcome) => failParkedCalls(roundTrips, outcome);
 	const started = await startMcpServer({
 		listTools: () => [
-			...activeTools().map((tool) => ({
+			...bridgedTools().map((tool) => ({
 				name: tool.name,
 				description: tool.description ?? tool.name,
 				inputSchema: bridgeInputSchema(tool.parameters),
@@ -95,8 +96,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			},
 		],
 		onToolCall: (callId, name, args, signal) => {
-			if (name !== POLL_TOOL_NAME && !activeTools().some((tool) => tool.name === name)) {
-				return Promise.resolve({ content: [{ type: "text" as const, text: `Pi tool ${name} is not active` }], isError: true });
+			const active = pi.getActiveTools();
+			if (name !== POLL_TOOL_NAME && !dispatchablePiTool(pi.getAllTools(), active, name)) {
+				const usable = bridgedTools().filter((tool) => active.includes(tool.name)).map((tool) => tool.name);
+				return Promise.resolve({
+					content: [{ type: "text" as const, text: `Pi tool ${name} is not active in pi right now. Active pi tools: ${usable.join(", ") || "none"}.` }],
+					isError: true,
+				});
 			}
 			return roundTrips.onToolCall(callId, name, args, signal);
 		},
@@ -163,6 +169,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const syncWarmFromSession = (ctx: { sessionManager?: { getBranch?: () => unknown[]; getEntries?: () => unknown[] } }): void => {
 		pendingWarmEntry = null;
 		sessions.parked = undefined;
+		sessions.step = undefined;
 		const branch = (ctx.sessionManager?.getBranch?.() ?? []) as readonly SessionEntryLike[];
 		const all = (ctx.sessionManager?.getEntries?.() ?? branch) as readonly SessionEntryLike[];
 		const restored = restoreWarmSessions(branch, all);
@@ -177,12 +184,26 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			if (!stopped && ctx.hasUI) ctx.ui.notify(`Antigravity setup failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
 		}).finally(() => { refresh = null; });
 	});
+	// Active tools before a /tree navigation, to undo the situational tools
+	// pi's restore activates (src/tool-loadout.ts).
+	let toolsBeforeTree: ReadonlySet<string> | undefined;
+	pi.on("session_before_tree", () => {
+		toolsBeforeTree = new Set(pi.getActiveTools());
+	});
 	pi.on("session_tree", (_event, ctx) => {
 		syncWarmFromSession(ctx);
+		const before = toolsBeforeTree;
+		toolsBeforeTree = undefined;
+		if (!before) return;
+		const active = pi.getActiveTools();
+		const branch = (ctx.sessionManager?.getBranch?.() ?? []) as readonly LoadoutEntry[];
+		const extras = new Set(treeRestoreExtras(branch, before, active));
+		if (extras.size > 0) pi.setActiveTools(active.filter((name) => !extras.has(name)));
 	});
 	pi.on("session_compact", () => {
 		pendingWarmEntry = null;
 		sessions.parked = undefined;
+		sessions.step = undefined;
 		sessions.warm = undefined;
 		sessions.checkpoints = undefined;
 	});
@@ -204,6 +225,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		shutdownController.abort();
 		pendingWarmEntry = null;
 		sessions.parked = undefined;
+		sessions.step = undefined;
 		sessions.warm = undefined;
 		sessions.checkpoints = undefined;
 		roundTrips.failAll("pi session shut down", { includeEscalated: true });

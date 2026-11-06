@@ -8,8 +8,9 @@ const result = (id, value) => send({ jsonrpc: "2.0", id, result: value });
 const fail = (id, code, message) => send({ jsonrpc: "2.0", id, error: { code, message } });
 const update = (sessionId, value) => send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update: value } });
 
-// FAKE_ACP_DB_DIR: persist one agent step per prompt like agy's conversation
-// store (steps.metadata field 9 = token usage).
+// FAKE_ACP_DB_DIR: persist each prompt like agy's conversation store: its
+// user-input step (14) on arrival, kept when the prompt is cancelled, and one
+// agent step (15, metadata field 9 = token usage) when it completes.
 const dbDir = process.env.FAKE_ACP_DB_DIR;
 // FAKE_ACP_RESUME: advertise and answer session/resume, as agy 1.5 does.
 const canResume = Boolean(process.env.FAKE_ACP_RESUME);
@@ -33,15 +34,18 @@ const hanging = new Map();
 const varint = (n) => { const out = []; while (n > 127) { out.push((n & 127) | 128); n = Math.floor(n / 128); } out.push(n); return out; };
 const field = (n, value) => [...varint(n * 8), ...varint(value)];
 const bytesField = (n, bytes) => [...varint(n * 8 + 2), ...varint(bytes.length), ...bytes];
-async function writeStep(sessionId, tokens) {
+async function appendStep(sessionId, stepType, metadata) {
 	const { DatabaseSync } = await import("node:sqlite");
 	const db = new DatabaseSync(`${dbDir}/${sessionId}.db`);
 	db.exec("CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB)");
 	const next = (db.prepare("SELECT COALESCE(MAX(idx), -1) + 1 AS idx FROM steps").get()).idx;
-	db.prepare("INSERT INTO steps (idx, step_type, metadata) VALUES (?, 14, NULL)").run(next);
-	const usage = [...field(1, 7), ...field(2, tokens.input), ...field(3, tokens.output), ...field(5, tokens.cacheRead)];
-	db.prepare("INSERT INTO steps (idx, step_type, metadata) VALUES (?, 15, ?)").run(next + 1, Uint8Array.from([...field(1, 3), ...bytesField(9, usage)]));
+	db.prepare("INSERT INTO steps (idx, step_type, metadata) VALUES (?, ?, ?)").run(next, stepType, metadata);
 	db.close();
+}
+const writeUserInput = (sessionId) => appendStep(sessionId, 14, null);
+function writeStep(sessionId, tokens) {
+	const usage = [...field(1, 7), ...field(2, tokens.input), ...field(3, tokens.output), ...field(5, tokens.cacheRead)];
+	return appendStep(sessionId, 15, Uint8Array.from([...field(1, 3), ...bytesField(9, usage)]));
 }
 
 const rl = readline.createInterface({ input: process.stdin });
@@ -102,6 +106,7 @@ rl.on("line", async (line) => {
 	if (method === "session/prompt") {
 		const text = params.prompt.map((block) => block.text ?? block.resource?.text ?? "").join("\n");
 		const sid = params.sessionId;
+		if (dbDir) await writeUserInput(sid);
 		// Like agy: leftovers of finished background work first, then the
 		// prompt echo, then the live turn.
 		const pending = leftovers.get(sid);
