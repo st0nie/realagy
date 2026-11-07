@@ -42,6 +42,8 @@ export const DEFAULT_REALAGY_CONFIG: Readonly<RealagyConfig> = {
 
 export const MODEL_DEFAULT_LABEL = "model default";
 const CUSTOM_VALUE = "__custom__";
+const INHERIT_GLOBAL_LABEL = "inherit global";
+const MODEL_CONTEXT_SETTING_PREFIX = "contextWindowOverride:";
 
 const CONTEXT_PRESETS: readonly SelectItem[] = [
 	{
@@ -56,6 +58,17 @@ const CONTEXT_PRESETS: readonly SelectItem[] = [
 	{ value: "1,048,576", label: "1,048,576", description: "1Mi tokens" },
 	{ value: CUSTOM_VALUE, label: "Custom…", description: "Enter an exact positive token limit" },
 ];
+
+const MODEL_CONTEXT_PRESETS: readonly SelectItem[] = CONTEXT_PRESETS.map((item, index) =>
+	index === 0
+		? {
+			...item,
+			value: INHERIT_GLOBAL_LABEL,
+			label: INHERIT_GLOBAL_LABEL,
+			description: "Use the global contextWindow, then the catalog or family default",
+		}
+		: item,
+);
 
 const OUTPUT_PRESETS: readonly SelectItem[] = [
 	{
@@ -98,7 +111,7 @@ function normalizeContextWindowOverrides(value: unknown): Record<string, number>
 
 function parseLimitChoice(value: string): number | undefined {
 	const trimmed = value.trim().toLowerCase();
-	if (trimmed === "" || trimmed === "model" || trimmed === "default" || trimmed === MODEL_DEFAULT_LABEL) {
+	if (trimmed === "" || trimmed === "model" || trimmed === "default" || trimmed === MODEL_DEFAULT_LABEL || trimmed === INHERIT_GLOBAL_LABEL) {
 		return undefined;
 	}
 	return parsePositiveInt(value);
@@ -169,6 +182,18 @@ export function formatConfigSummary(config: RealagyConfig, file: string = realag
 }
 
 function withUpdatedSetting(current: RealagyConfig, id: string, rawValue: string): RealagyConfig {
+	if (id.startsWith(MODEL_CONTEXT_SETTING_PREFIX)) {
+		const modelId = id.slice(MODEL_CONTEXT_SETTING_PREFIX.length);
+		const contextWindowOverrides = { ...current.contextWindowOverrides };
+		const limit = parseLimitChoice(rawValue);
+		if (limit === undefined) delete contextWindowOverrides[modelId];
+		else contextWindowOverrides[modelId] = limit;
+		const next = { ...current };
+		if (Object.keys(contextWindowOverrides).length > 0) next.contextWindowOverrides = contextWindowOverrides;
+		else delete next.contextWindowOverrides;
+		return next;
+	}
+
 	let noAutoCompaction = current.noAutoCompaction;
 	let agentProfile = current.agentProfile;
 	let contextWindow = current.contextWindow;
@@ -302,6 +327,7 @@ export interface RealagySettingsDialogOptions {
 	tui: TUI;
 	theme: Theme;
 	config: RealagyConfig;
+	modelIds: readonly string[];
 	configPath: string;
 	onChange: (next: RealagyConfig) => void;
 	onClose: () => void;
@@ -344,7 +370,7 @@ export class RealagySettingsComponent implements Component, Focusable {
 			{
 				id: "contextWindow",
 				label: "Pi context window",
-				description: "Global fallback reported to Pi for planning/compaction; exact per-model overrides in config.json take precedence",
+				description: "Global fallback reported to Pi for planning/compaction; per-model rows below take precedence",
 				currentValue: formatConfigLimit(this.#state.contextWindow),
 				submenu: (currentValue, done) =>
 					new LimitSubmenu({
@@ -374,6 +400,27 @@ export class RealagySettingsComponent implements Component, Focusable {
 					}),
 			},
 		];
+
+		const modelIds = [...new Set([...opts.modelIds, ...Object.keys(this.#state.contextWindowOverrides ?? {})])];
+		for (const modelId of modelIds) {
+			const override = this.#state.contextWindowOverrides?.[modelId];
+			items.push({
+				id: `${MODEL_CONTEXT_SETTING_PREFIX}${modelId}`,
+				label: `Context · ${modelId}`,
+				description: "Per-model context window; takes precedence over the global Pi context window",
+				currentValue: override !== undefined ? formatConfigLimit(override) : INHERIT_GLOBAL_LABEL,
+				submenu: (currentValue, done) =>
+					new LimitSubmenu({
+						title: `Context · ${modelId}`,
+						currentValue,
+						presets: MODEL_CONTEXT_PRESETS,
+						theme: opts.theme,
+						tui: opts.tui,
+						setActiveInput,
+						done,
+					}),
+			});
+		}
 
 		this.#container.addChild(new DynamicBorder());
 		this.#container.addChild({
@@ -440,6 +487,7 @@ export interface SettingsMenuUI {
 export async function editRealagyConfigMenu(
 	ui: SettingsMenuUI,
 	initial: RealagyConfig,
+	modelIds: readonly string[],
 ): Promise<RealagyConfig | undefined> {
 	let draft = { ...initial };
 	for (;;) {
@@ -447,6 +495,7 @@ export async function editRealagyConfigMenu(
 			`Bypass Agy auto-compaction: ${draft.noAutoCompaction ? "ON" : "OFF"}`,
 			`Pi-only agent profile: ${draft.agentProfile ? "ON" : "OFF"}`,
 			`Pi context window: ${formatConfigLimit(draft.contextWindow)}`,
+			"Per-model context windows…",
 			`Pi max output tokens: ${formatConfigLimit(draft.maxOutputTokens)}`,
 			"Save and close",
 			"Cancel",
@@ -461,22 +510,46 @@ export async function editRealagyConfigMenu(
 			draft = withUpdatedSetting(draft, "agentProfile", draft.agentProfile ? "false" : "true");
 			continue;
 		}
-		const isContext = choice.startsWith("Pi context window:");
-		const id = isContext ? "contextWindow" : "maxOutputTokens";
-		const current = isContext ? draft.contextWindow : draft.maxOutputTokens;
-		const title = isContext
-			? "Pi context window (positive tokens, or empty for model default)"
-			: "Pi max output tokens (positive tokens, or empty for model default)";
-		const value = await ui.input(title, current !== undefined ? String(current) : MODEL_DEFAULT_LABEL);
+
+		let id: string;
+		let current: number | undefined;
+		let title: string;
+		if (choice === "Per-model context windows…") {
+			const modelChoice = await ui.select("Per-model context windows", [
+				...modelIds.map((modelId) => {
+					const limit = draft.contextWindowOverrides?.[modelId];
+					return `${modelId}: ${limit !== undefined ? formatConfigLimit(limit) : INHERIT_GLOBAL_LABEL}`;
+				}),
+				"Back",
+			]);
+			if (modelChoice === undefined) return undefined;
+			if (modelChoice === "Back") continue;
+			const modelId = modelIds.find((candidate) => modelChoice.startsWith(`${candidate}: `));
+			if (modelId === undefined) continue;
+			id = `${MODEL_CONTEXT_SETTING_PREFIX}${modelId}`;
+			current = draft.contextWindowOverrides?.[modelId];
+			title = `Context · ${modelId} (positive tokens, or empty to inherit global)`;
+		} else {
+			const isContext = choice.startsWith("Pi context window:");
+			id = isContext ? "contextWindow" : "maxOutputTokens";
+			current = isContext ? draft.contextWindow : draft.maxOutputTokens;
+			title = isContext
+				? "Pi context window (positive tokens, or empty for model default)"
+				: "Pi max output tokens (positive tokens, or empty for model default)";
+		}
+
+		const defaultLabel = id.startsWith(MODEL_CONTEXT_SETTING_PREFIX) ? INHERIT_GLOBAL_LABEL : MODEL_DEFAULT_LABEL;
+		const defaultAction = defaultLabel === INHERIT_GLOBAL_LABEL ? "inherit global" : "use the model default";
+		const value = await ui.input(title, current !== undefined ? String(current) : defaultLabel);
 		if (value === undefined) return undefined;
 		const trimmed = value.trim().toLowerCase();
-		if (trimmed === "" || trimmed === "model" || trimmed === "default" || trimmed === MODEL_DEFAULT_LABEL) {
+		if (trimmed === "" || trimmed === "model" || trimmed === "default" || trimmed === MODEL_DEFAULT_LABEL || trimmed === INHERIT_GLOBAL_LABEL) {
 			draft = withUpdatedSetting(draft, id, MODEL_DEFAULT_LABEL);
 			continue;
 		}
 		const parsed = parsePositiveInt(value);
 		if (parsed === undefined) {
-			ui.notify("Enter a positive whole number of tokens, or leave empty for model default.", "warning");
+			ui.notify(`Enter a positive whole number of tokens, or leave empty to ${defaultAction}.`, "warning");
 			continue;
 		}
 		draft = withUpdatedSetting(draft, id, String(parsed));

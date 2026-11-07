@@ -117,6 +117,7 @@ test("RealagySettingsComponent renders TUI list, toggles booleans, edits custom 
 		tui,
 		theme,
 		config: { ...DEFAULT_REALAGY_CONFIG, contextWindowOverrides: { "gemini-4-argon": 900_000 } },
+		modelIds: ["gemini-4-argon", "claude-sonnet-5-5"],
 		configPath: "/tmp/realagy/config.json",
 		onChange: (next) => changes.push(next),
 		onClose: () => { closed = true; },
@@ -129,6 +130,8 @@ test("RealagySettingsComponent renders TUI list, toggles booleans, edits custom 
 	assert.match(initialLines, /Bypass Agy auto-compaction.*true/);
 	assert.match(initialLines, /Pi-only agent profile.*true/);
 	assert.match(initialLines, /Pi context window.*model default/);
+	assert.match(initialLines, /Context · gemini-4-argon.*900,000/);
+	assert.match(initialLines, /Context · claude-sonnet-5-5.*inherit global/);
 
 	// Toggle noAutoCompaction (row 0) with Enter.
 	component.handleInput("\r");
@@ -165,15 +168,39 @@ test("RealagySettingsComponent renders TUI list, toggles booleans, edits custom 
 	component.handleInput("\r");
 	assert.equal(changes.at(-1)?.contextWindow, undefined);
 
+	// Clear argon's override (row 4), then add a custom override for Claude (row 5).
+	component.handleInput("\x1b[B");
+	component.handleInput("\x1b[B");
+	component.handleInput("\r");
+	for (let i = 0; i < 6; i++) component.handleInput("\x1b[A");
+	component.handleInput("\r");
+	assert.equal(changes.at(-1)?.contextWindowOverrides, undefined);
+
+	component.handleInput("\x1b[B");
+	component.handleInput("\r");
+	for (let i = 0; i < 6; i++) component.handleInput("\x1b[B");
+	component.handleInput("\r");
+	for (const ch of "450000") component.handleInput(ch);
+	component.handleInput("\r");
+	assert.deepEqual(changes.at(-1)?.contextWindowOverrides, { "claude-sonnet-5-5": 450_000 });
+	const perModelLines = component.render(100).join("\n");
+	assert.match(perModelLines, /Context · gemini-4-argon.*inherit global/);
+	assert.match(perModelLines, /Context · claude-sonnet-5-5.*450,000/);
+
 	// Esc closes the main settings list.
 	component.handleInput("\x1b");
 	assert.equal(closed, true);
 	assert.ok(renders > 0);
 });
 
-test("fallback menu edits all four settings, resets limits to model default, and cancels cleanly", async () => {
-	const ui = menuUi([0, 1, 2, 3, 4], ["300000", "32000"]);
-	const result = await editRealagyConfigMenu(ui, { ...DEFAULT_REALAGY_CONFIG, contextWindowOverrides: { "gemini-4-argon": 900_000 } });
+test("fallback menu edits global settings and per-model overrides, resets inheritance, and cancels cleanly", async () => {
+	const modelIds = ["gemini-4-argon", "claude-sonnet-5-5"];
+	const ui = menuUi([0, 1, 2, 4, 5], ["300000", "32000"]);
+	const result = await editRealagyConfigMenu(
+		ui,
+		{ ...DEFAULT_REALAGY_CONFIG, contextWindowOverrides: { "gemini-4-argon": 900_000 } },
+		modelIds,
+	);
 	assert.deepEqual(result, {
 		noAutoCompaction: false,
 		agentProfile: false,
@@ -183,8 +210,8 @@ test("fallback menu edits all four settings, resets limits to model default, and
 	});
 	assert.equal(ui.messages.length, 0);
 
-	const resetUi = menuUi([2, 2, 4], ["not-a-number", ""]);
-	const resetResult = await editRealagyConfigMenu(resetUi, result!);
+	const resetUi = menuUi([2, 2, 5], ["not-a-number", ""]);
+	const resetResult = await editRealagyConfigMenu(resetUi, result!, modelIds);
 	assert.deepEqual(resetResult, {
 		noAutoCompaction: false,
 		contextWindowOverrides: { "gemini-4-argon": 900_000 },
@@ -193,8 +220,14 @@ test("fallback menu edits all four settings, resets limits to model default, and
 	});
 	assert.equal(resetUi.messages.length, 1);
 
-	const cancelled = menuUi([5], []);
-	assert.equal(await editRealagyConfigMenu(cancelled, DEFAULT_REALAGY_CONFIG), undefined);
+	const perModelUi = menuUi([3, 1, 3, 1, 3, 0, 3, 2, 5], ["bad", "450000", ""]);
+	const perModelResult = await editRealagyConfigMenu(perModelUi, result!, modelIds);
+	assert.deepEqual(perModelResult?.contextWindowOverrides, { "claude-sonnet-5-5": 450_000 });
+	assert.equal(perModelUi.messages.length, 1);
+	assert.match(perModelUi.messages[0], /inherit global/);
+
+	const cancelled = menuUi([6], []);
+	assert.equal(await editRealagyConfigMenu(cancelled, DEFAULT_REALAGY_CONFIG, modelIds), undefined);
 });
 
 function menuUi(selections: number[], inputs: string[]): SettingsMenuUI & { messages: string[] } {

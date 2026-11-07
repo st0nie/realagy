@@ -170,6 +170,38 @@ describe("extension session lifecycle", () => {
 		expect(session.ui.notify).not.toHaveBeenCalled();
 	});
 
+	it("opens Settings, Usage, or Setup from bare /realagy and honors menu cancellation", async () => {
+		mocks.ensure.mockReturnValue({ ok: true, bin: "agy" });
+		mocks.listModels.mockResolvedValue([]);
+		const session = await start();
+		let selected: string | undefined;
+		const select = vi.fn(async (title: string, _options: string[]) => {
+			if (title === "Antigravity") return selected;
+			if (title === "Antigravity settings") return "Cancel";
+			throw new Error(`Unexpected menu: ${title}`);
+		});
+		const ui = { ...session.ui, select, input: vi.fn() };
+		const invoke = () => session.commands.get("realagy").handler("", { ...session.ctx, mode: "rpc", ui });
+
+		selected = "Settings";
+		await invoke();
+		expect(select).toHaveBeenCalledWith("Antigravity", ["Settings", "Usage", "Setup"]);
+		expect(select).toHaveBeenCalledWith("Antigravity settings", expect.any(Array));
+
+		selected = "Usage";
+		await invoke();
+		expect(session.ui.notify).toHaveBeenLastCalledWith("REPORT", "info");
+
+		selected = "Setup";
+		await invoke();
+		expect(session.ui.notify.mock.lastCall?.[0]).toMatch(/Antigravity is ready: agy is signed in/);
+
+		const callCount = select.mock.calls.length;
+		selected = undefined;
+		await invoke();
+		expect(select).toHaveBeenCalledTimes(callCount + 1);
+	});
+
 	it("registers /realagy with completions and notifies only after fresh quota resolves", async () => {
 		const quota = deferred<never[]>();
 		mocks.ensure.mockReturnValue({ ok: true, bin: "agy" });
@@ -265,11 +297,33 @@ describe("extension session lifecycle", () => {
 		expect(updatedModels.find((m: { id: string }) => m.id === "gemini-4-argon").contextWindow).toBe(700_000);
 		expect(updatedModels.find((m: { id: string }) => m.id === "claude-sonnet-5-5").contextWindow).toBe(500_000);
 		expect(mocks.restart).not.toHaveBeenCalled();
+		const perModelChoices = [
+			"Per-model context windows…",
+			"claude-sonnet-5-5: inherit global",
+			"Save and close",
+		];
+		await session.commands.get("realagy").handler("settings", {
+			...session.ctx,
+			mode: "rpc",
+			ui: {
+				...session.ui,
+				select: vi.fn(async () => perModelChoices.shift()),
+				input: vi.fn(async () => "250000"),
+			},
+		});
+		const perModelModels = mocks.register.mock.lastCall![0].getModels();
+		expect(perModelModels.find((m: { id: string }) => m.id === "gemini-4-argon").contextWindow).toBe(700_000);
+		expect(perModelModels.find((m: { id: string }) => m.id === "claude-sonnet-5-5").contextWindow).toBe(250_000);
+		expect(perModelModels.find((m: { id: string }) => m.id === "gpt-oss-120b").contextWindow).toBe(500_000);
+		expect(mocks.restart).not.toHaveBeenCalled();
 		expect(JSON.parse(fs.readFileSync(path.join(session.agentDir, "realagy", "config.json"), "utf8"))).toEqual({
 			noAutoCompaction: true,
 			agentProfile: true,
 			contextWindow: 500_000,
-			contextWindowOverrides: { "gemini-4-argon": 700_000 },
+			contextWindowOverrides: {
+				"gemini-4-argon": 700_000,
+				"claude-sonnet-5-5": 250_000,
+			},
 		});
 	});
 

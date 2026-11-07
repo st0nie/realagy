@@ -313,7 +313,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			return matches.length > 0 ? matches : null;
 		},
 		handler: async (args, ctx) => {
-			const sub = args.trim();
+			let sub = args.trim();
+			if (!sub && ctx.hasUI && typeof ctx.ui.select === "function") {
+				const selected = await ctx.ui.select("Antigravity", ["Settings", "Usage", "Setup"]);
+				if (stopped || selected === undefined) return;
+				sub = selected.toLowerCase();
+			}
 			if (sub === "settings") {
 				const before = { ...config };
 				if (ctx.mode === "tui" && typeof ctx.ui.custom === "function") {
@@ -323,6 +328,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 								tui,
 								theme,
 								config,
+								modelIds: entries.map((entry) => entry.id),
 								configPath,
 								onChange: (next) => {
 									applySavedConfig(next, ctx);
@@ -332,7 +338,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 						{ blocked: { kind: "question", message: "Antigravity settings" } },
 					);
 				} else if (ctx.hasUI && typeof ctx.ui.select === "function" && typeof ctx.ui.input === "function") {
-					const draft = await editRealagyConfigMenu(ctx.ui, config);
+					const draft = await editRealagyConfigMenu(ctx.ui, config, entries.map((entry) => entry.id));
 					if (stopped || !draft) return;
 					if (!applySavedConfig(draft, ctx)) return;
 				} else {
@@ -340,11 +346,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 					return;
 				}
 				if (stopped) return;
+				const beforeOverrides = before.contextWindowOverrides ?? {};
+				const afterOverrides = config.contextWindowOverrides ?? {};
+				const overridesChanged =
+					Object.keys(beforeOverrides).length !== Object.keys(afterOverrides).length ||
+					Object.entries(afterOverrides).some(([modelId, limit]) => beforeOverrides[modelId] !== limit);
 				const changed =
 					config.noAutoCompaction !== before.noAutoCompaction ||
 					config.agentProfile !== before.agentProfile ||
 					config.contextWindow !== before.contextWindow ||
-					config.maxOutputTokens !== before.maxOutputTokens;
+					config.maxOutputTokens !== before.maxOutputTokens ||
+					overridesChanged;
 				if (!changed) return;
 				const restartAgy =
 					config.noAutoCompaction !== before.noAutoCompaction ||

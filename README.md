@@ -33,6 +33,7 @@ The catalog comes live from agy and depends on the account.
 
 | Command | What it does |
 | --- | --- |
+| `/realagy` | Open an interactive Settings / Usage / Setup menu (cancel returns without running a command) |
 | `/realagy settings` | Configure Agy auto-compaction bypass, Pi-only agent profile, and optional Pi token-limit overrides (`~/.pi/agent/realagy/config.json`) |
 | `/realagy setup` | Checks agy: shows install steps when it is missing, sign-in steps when it cannot start a session, and reloads the model catalog when it is ready |
 | `/realagy usage` | Cache-hit rate for this session plus every quota group's 5-hour and weekly remaining share and reset times (from the live `agy acp` server, or `agy --print /usage`) |
@@ -69,7 +70,7 @@ Out of the box (`noAutoCompaction: true`), realagy starts an embedded loopback C
 
 Run `/realagy settings` (or edit `~/.pi/agent/realagy/config.json`) to toggle the compaction bypass (`noAutoCompaction`), toggle the Pi-only agent profile (`agentProfile`), or override Pi's reported global `contextWindow` and `maxOutputTokens`. Changes save atomically and apply without restarting Pi: model metadata refreshes immediately, and process-level changes (`noAutoCompaction` or `agentProfile`) restart `agy acp` cleanly for the next turn while preserving remembered sessions.
 
-For a model-specific context window, add `contextWindowOverrides` to `config.json`. Its keys are exact, case-sensitive Pi model IDs shown after `antigravity/` in `/model` (without the provider prefix); one entry covers every thinking tier grouped into that Pi model. A matching per-model value takes precedence over the global `contextWindow`; models without an entry use the global value, then the upstream catalog or family default. The settings menu continues to edit the global values and preserves this map. For example:
+For a model-specific context window, open `/realagy settings`: every available model has its own **Context** row below the global controls. The row shows either its override or `inherit global`; select it to choose a preset, enter a custom positive integer, or restore `inherit global`. RPC hosts expose the same controls under **Per-model context windows…**. Changes are stored in `contextWindowOverrides`, whose keys are exact, case-sensitive Pi model IDs shown after `antigravity/` in `/model` (without the provider prefix); one entry covers every thinking tier grouped into that Pi model. A matching per-model value takes precedence over the global `contextWindow`; models without an entry use the global value, then the upstream catalog or family default. The equivalent JSON configuration is:
 
 ```json
 {
