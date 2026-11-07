@@ -43,7 +43,11 @@ export const DEFAULT_REALAGY_CONFIG: Readonly<RealagyConfig> = {
 export const MODEL_DEFAULT_LABEL = "model default";
 const CUSTOM_VALUE = "__custom__";
 const INHERIT_GLOBAL_LABEL = "inherit global";
-const MODEL_CONTEXT_SETTING_PREFIX = "contextWindowOverride:";
+const MODEL_LIMIT_SETTING_PREFIXES = {
+	contextWindowOverrides: "contextWindowOverride:",
+	maxOutputTokensOverrides: "maxOutputTokenOverride:",
+} as const;
+type ModelLimitOverridesKey = keyof typeof MODEL_LIMIT_SETTING_PREFIXES;
 
 const CONTEXT_PRESETS: readonly SelectItem[] = [
 	{
@@ -83,6 +87,17 @@ const OUTPUT_PRESETS: readonly SelectItem[] = [
 	{ value: CUSTOM_VALUE, label: "Custom…", description: "Enter an exact positive token limit" },
 ];
 
+const MODEL_OUTPUT_PRESETS: readonly SelectItem[] = OUTPUT_PRESETS.map((item, index) =>
+	index === 0
+		? {
+			...item,
+			value: INHERIT_GLOBAL_LABEL,
+			label: INHERIT_GLOBAL_LABEL,
+			description: "Use the global maxOutputTokens, then the catalog or family default",
+		}
+		: item,
+);
+
 export function realagyConfigPath(agentDir: string = getAgentDir()): string {
 	return path.join(agentDir, "realagy", "config.json");
 }
@@ -100,7 +115,7 @@ export function parsePositiveInt(value: unknown): number | undefined {
 	return undefined;
 }
 
-function normalizeContextWindowOverrides(value: unknown): Record<string, number> | undefined {
+function normalizeModelLimitOverrides(value: unknown): Record<string, number> | undefined {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
 	const entries = Object.entries(value).flatMap(([modelId, rawLimit]) => {
 		const limit = parsePositiveInt(rawLimit);
@@ -128,12 +143,14 @@ export function normalizeRealagyConfig(raw: unknown): RealagyConfig {
 		? record.agentProfile
 		: DEFAULT_REALAGY_CONFIG.agentProfile;
 	const contextWindow = parsePositiveInt(record.contextWindow);
-	const contextWindowOverrides = normalizeContextWindowOverrides(record.contextWindowOverrides);
+	const contextWindowOverrides = normalizeModelLimitOverrides(record.contextWindowOverrides);
 	const maxOutputTokens = parsePositiveInt(record.maxOutputTokens);
+	const maxOutputTokensOverrides = normalizeModelLimitOverrides(record.maxOutputTokensOverrides);
 	const result: RealagyConfig = { noAutoCompaction, agentProfile };
 	if (contextWindow !== undefined) result.contextWindow = contextWindow;
 	if (contextWindowOverrides !== undefined) result.contextWindowOverrides = contextWindowOverrides;
 	if (maxOutputTokens !== undefined) result.maxOutputTokens = maxOutputTokens;
+	if (maxOutputTokensOverrides !== undefined) result.maxOutputTokensOverrides = maxOutputTokensOverrides;
 	return result;
 }
 
@@ -164,6 +181,17 @@ export function saveRealagyConfig(config: RealagyConfig, file: string = realagyC
 	return normalized;
 }
 
+function formatOverrideCount(overrides: Readonly<Record<string, number>> | undefined): string {
+	const count = Object.keys(overrides ?? {}).length;
+	return count === 0 ? "none" : `${count} override${count === 1 ? "" : "s"}`;
+}
+
+function modelLimitKeyForSettingId(id: string): ModelLimitOverridesKey | undefined {
+	if (id.startsWith(MODEL_LIMIT_SETTING_PREFIXES.contextWindowOverrides)) return "contextWindowOverrides";
+	if (id.startsWith(MODEL_LIMIT_SETTING_PREFIXES.maxOutputTokensOverrides)) return "maxOutputTokensOverrides";
+	return undefined;
+}
+
 export function formatConfigLimit(value: number | undefined): string {
 	return value !== undefined ? value.toLocaleString("en-US") : MODEL_DEFAULT_LABEL;
 }
@@ -178,19 +206,23 @@ export function formatConfigSummary(config: RealagyConfig, file: string = realag
 			([modelId, limit]) => `  Pi context window (${modelId}): ${formatConfigLimit(limit)}`,
 		),
 		`  Pi max output tokens: ${formatConfigLimit(config.maxOutputTokens)}`,
+		...Object.entries(config.maxOutputTokensOverrides ?? {}).map(
+			([modelId, limit]) => `  Pi max output tokens (${modelId}): ${formatConfigLimit(limit)}`,
+		),
 	].join("\n");
 }
 
 function withUpdatedSetting(current: RealagyConfig, id: string, rawValue: string): RealagyConfig {
-	if (id.startsWith(MODEL_CONTEXT_SETTING_PREFIX)) {
-		const modelId = id.slice(MODEL_CONTEXT_SETTING_PREFIX.length);
-		const contextWindowOverrides = { ...current.contextWindowOverrides };
+	const modelLimitKey = modelLimitKeyForSettingId(id);
+	if (modelLimitKey) {
+		const modelId = id.slice(MODEL_LIMIT_SETTING_PREFIXES[modelLimitKey].length);
+		const overrides = { ...current[modelLimitKey] };
 		const limit = parseLimitChoice(rawValue);
-		if (limit === undefined) delete contextWindowOverrides[modelId];
-		else contextWindowOverrides[modelId] = limit;
+		if (limit === undefined) delete overrides[modelId];
+		else overrides[modelId] = limit;
 		const next = { ...current };
-		if (Object.keys(contextWindowOverrides).length > 0) next.contextWindowOverrides = contextWindowOverrides;
-		else delete next.contextWindowOverrides;
+		if (Object.keys(overrides).length > 0) next[modelLimitKey] = overrides;
+		else delete next[modelLimitKey];
 		return next;
 	}
 
@@ -206,6 +238,7 @@ function withUpdatedSetting(current: RealagyConfig, id: string, rawValue: string
 	if (contextWindow !== undefined) next.contextWindow = contextWindow;
 	if (maxOutputTokens !== undefined) next.maxOutputTokens = maxOutputTokens;
 	if (current.contextWindowOverrides !== undefined) next.contextWindowOverrides = current.contextWindowOverrides;
+	if (current.maxOutputTokensOverrides !== undefined) next.maxOutputTokensOverrides = current.maxOutputTokensOverrides;
 	return next;
 }
 
@@ -323,6 +356,77 @@ class LimitSubmenu implements Component {
 	}
 }
 
+class ModelLimitSubmenu implements Component {
+	readonly capturesViewportInput = true;
+	#container = new Container();
+	#settingsList: SettingsList;
+	#tui: TUI;
+
+	constructor(opts: {
+		title: string;
+		modelIds: readonly string[];
+		overrides: Readonly<Record<string, number>> | undefined;
+		presets: readonly SelectItem[];
+		theme: Theme;
+		tui: TUI;
+		setActiveInput: (input: Input | undefined) => void;
+		onChange: (modelId: string, value: string) => void;
+		done: () => void;
+	}) {
+		this.#tui = opts.tui;
+		const items: SettingItem[] = opts.modelIds.map((modelId) => ({
+			id: modelId,
+			label: modelId,
+			currentValue: opts.overrides?.[modelId] !== undefined
+				? formatConfigLimit(opts.overrides[modelId])
+				: INHERIT_GLOBAL_LABEL,
+			submenu: (currentValue, done) => new LimitSubmenu({
+				title: `${opts.title} · ${modelId}`,
+				currentValue,
+				presets: opts.presets,
+				theme: opts.theme,
+				tui: opts.tui,
+				setActiveInput: opts.setActiveInput,
+				done,
+			}),
+		}));
+		this.#container.addChild({
+			render: () => [`  ${opts.theme.fg("accent", opts.theme.bold(opts.title))}`, ""],
+			invalidate: () => {},
+		});
+		this.#settingsList = new SettingsList(
+			items,
+			10,
+			getSettingsListTheme(),
+			(modelId, value) => {
+				opts.onChange(modelId, value);
+				opts.done();
+			},
+			() => opts.done(),
+		);
+		this.#container.addChild(this.#settingsList);
+	}
+
+	invalidate(): void {
+		this.#settingsList.invalidate();
+	}
+
+	render(width: number): string[] {
+		return this.#container.render(width);
+	}
+
+	handleInput(data: string): void {
+		this.#settingsList.handleInput(data);
+		this.#tui.requestRender();
+	}
+
+	handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+		const result = this.#settingsList.handleMouse(event);
+		this.#tui.requestRender();
+		return result;
+	}
+}
+
 export interface RealagySettingsDialogOptions {
 	tui: TUI;
 	theme: Theme;
@@ -370,7 +474,7 @@ export class RealagySettingsComponent implements Component, Focusable {
 			{
 				id: "contextWindow",
 				label: "Pi context window",
-				description: "Global fallback reported to Pi for planning/compaction; per-model rows below take precedence",
+				description: "Global fallback reported to Pi for planning/compaction; the per-model submenu takes precedence",
 				currentValue: formatConfigLimit(this.#state.contextWindow),
 				submenu: (currentValue, done) =>
 					new LimitSubmenu({
@@ -401,26 +505,45 @@ export class RealagySettingsComponent implements Component, Focusable {
 			},
 		];
 
-		const modelIds = [...new Set([...opts.modelIds, ...Object.keys(this.#state.contextWindowOverrides ?? {})])];
-		for (const modelId of modelIds) {
-			const override = this.#state.contextWindowOverrides?.[modelId];
+		const modelIds = [...new Set([
+			...opts.modelIds,
+			...Object.keys(this.#state.contextWindowOverrides ?? {}),
+			...Object.keys(this.#state.maxOutputTokensOverrides ?? {}),
+		])];
+		const addModelLimitMenu = (
+			id: ModelLimitOverridesKey,
+			label: string,
+			presets: readonly SelectItem[],
+		): void => {
 			items.push({
-				id: `${MODEL_CONTEXT_SETTING_PREFIX}${modelId}`,
-				label: `Context · ${modelId}`,
-				description: "Per-model context window; takes precedence over the global Pi context window",
-				currentValue: override !== undefined ? formatConfigLimit(override) : INHERIT_GLOBAL_LABEL,
-				submenu: (currentValue, done) =>
-					new LimitSubmenu({
-						title: `Context · ${modelId}`,
-						currentValue,
-						presets: MODEL_CONTEXT_PRESETS,
-						theme: opts.theme,
-						tui: opts.tui,
-						setActiveInput,
-						done,
-					}),
+				id,
+				label,
+				description: "Choose a model to set or clear its override",
+				currentValue: formatOverrideCount(this.#state[id]),
+				submenu: (_currentValue, done) => new ModelLimitSubmenu({
+					title: label,
+					modelIds,
+					overrides: this.#state[id],
+					presets,
+					theme: opts.theme,
+					tui: opts.tui,
+					setActiveInput,
+					onChange: (modelId, value) => {
+						const next = withUpdatedSetting(
+							this.#state,
+							`${MODEL_LIMIT_SETTING_PREFIXES[id]}${modelId}`,
+							value,
+						);
+						this.#state = next;
+						this.#settingsList.updateValue(id, formatOverrideCount(next[id]));
+						opts.onChange({ ...next });
+					},
+					done,
+				}),
 			});
-		}
+		};
+		addModelLimitMenu("contextWindowOverrides", "Per-model context windows", MODEL_CONTEXT_PRESETS);
+		addModelLimitMenu("maxOutputTokensOverrides", "Per-model output tokens", MODEL_OUTPUT_PRESETS);
 
 		this.#container.addChild(new DynamicBorder());
 		this.#container.addChild({
@@ -490,13 +613,19 @@ export async function editRealagyConfigMenu(
 	modelIds: readonly string[],
 ): Promise<RealagyConfig | undefined> {
 	let draft = { ...initial };
+	const allModelIds = [...new Set([
+		...modelIds,
+		...Object.keys(initial.contextWindowOverrides ?? {}),
+		...Object.keys(initial.maxOutputTokensOverrides ?? {}),
+	])];
 	for (;;) {
 		const choice = await ui.select("Antigravity settings", [
 			`Bypass Agy auto-compaction: ${draft.noAutoCompaction ? "ON" : "OFF"}`,
 			`Pi-only agent profile: ${draft.agentProfile ? "ON" : "OFF"}`,
 			`Pi context window: ${formatConfigLimit(draft.contextWindow)}`,
-			"Per-model context windows…",
 			`Pi max output tokens: ${formatConfigLimit(draft.maxOutputTokens)}`,
+			"Per-model context windows…",
+			"Per-model output tokens…",
 			"Save and close",
 			"Cancel",
 		]);
@@ -514,21 +643,26 @@ export async function editRealagyConfigMenu(
 		let id: string;
 		let current: number | undefined;
 		let title: string;
-		if (choice === "Per-model context windows…") {
-			const modelChoice = await ui.select("Per-model context windows", [
-				...modelIds.map((modelId) => {
-					const limit = draft.contextWindowOverrides?.[modelId];
+		const isModelContext = choice === "Per-model context windows…";
+		const isModelOutput = choice === "Per-model output tokens…";
+		if (isModelContext || isModelOutput) {
+			const key: ModelLimitOverridesKey = isModelContext ? "contextWindowOverrides" : "maxOutputTokensOverrides";
+			const menuTitle = isModelContext ? "Per-model context windows" : "Per-model output tokens";
+			const limitLabel = isModelContext ? "Context" : "Output tokens";
+			const modelChoice = await ui.select(menuTitle, [
+				...allModelIds.map((modelId) => {
+					const limit = draft[key]?.[modelId];
 					return `${modelId}: ${limit !== undefined ? formatConfigLimit(limit) : INHERIT_GLOBAL_LABEL}`;
 				}),
 				"Back",
 			]);
 			if (modelChoice === undefined) return undefined;
 			if (modelChoice === "Back") continue;
-			const modelId = modelIds.find((candidate) => modelChoice.startsWith(`${candidate}: `));
+			const modelId = allModelIds.find((candidate) => modelChoice.startsWith(`${candidate}: `));
 			if (modelId === undefined) continue;
-			id = `${MODEL_CONTEXT_SETTING_PREFIX}${modelId}`;
-			current = draft.contextWindowOverrides?.[modelId];
-			title = `Context · ${modelId} (positive tokens, or empty to inherit global)`;
+			id = `${MODEL_LIMIT_SETTING_PREFIXES[key]}${modelId}`;
+			current = draft[key]?.[modelId];
+			title = `${limitLabel} · ${modelId} (positive tokens, or empty to inherit global)`;
 		} else {
 			const isContext = choice.startsWith("Pi context window:");
 			id = isContext ? "contextWindow" : "maxOutputTokens";
@@ -538,7 +672,7 @@ export async function editRealagyConfigMenu(
 				: "Pi max output tokens (positive tokens, or empty for model default)";
 		}
 
-		const defaultLabel = id.startsWith(MODEL_CONTEXT_SETTING_PREFIX) ? INHERIT_GLOBAL_LABEL : MODEL_DEFAULT_LABEL;
+		const defaultLabel = modelLimitKeyForSettingId(id) !== undefined ? INHERIT_GLOBAL_LABEL : MODEL_DEFAULT_LABEL;
 		const defaultAction = defaultLabel === INHERIT_GLOBAL_LABEL ? "inherit global" : "use the model default";
 		const value = await ui.input(title, current !== undefined ? String(current) : defaultLabel);
 		if (value === undefined) return undefined;

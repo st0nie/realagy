@@ -70,21 +70,25 @@ Out of the box (`noAutoCompaction: true`), realagy starts an embedded loopback C
 
 Run `/realagy settings` (or edit `~/.pi/agent/realagy/config.json`) to toggle the compaction bypass (`noAutoCompaction`), toggle the Pi-only agent profile (`agentProfile`), or override Pi's reported global `contextWindow` and `maxOutputTokens`. Changes save atomically and apply without restarting Pi: model metadata refreshes immediately, and process-level changes (`noAutoCompaction` or `agentProfile`) restart `agy acp` cleanly for the next turn while preserving remembered sessions.
 
-For a model-specific context window, open `/realagy settings`: every available model has its own **Context** row below the global controls. The row shows either its override or `inherit global`; select it to choose a preset, enter a custom positive integer, or restore `inherit global`. RPC hosts expose the same controls under **Per-model context windows…**. Changes are stored in `contextWindowOverrides`, whose keys are exact, case-sensitive Pi model IDs shown after `antigravity/` in `/model` (without the provider prefix); one entry covers every thinking tier grouped into that Pi model. A matching per-model value takes precedence over the global `contextWindow`; models without an entry use the global value, then the upstream catalog or family default. The equivalent JSON configuration is:
+For model-specific limits, open `/realagy settings` and choose **Per-model context windows** or **Per-model output tokens**. Each submenu lists the available models with either its override or `inherit global`; select a model to choose a preset, enter a custom positive integer, or restore inheritance. The main settings list shows only the two submenu entries and their override counts. RPC hosts expose the same two submenus. Changes are stored in `contextWindowOverrides` and `maxOutputTokensOverrides`, whose keys are exact, case-sensitive Pi model IDs shown after `antigravity/` in `/model` (without the provider prefix); one entry covers every thinking tier grouped into that Pi model. A matching per-model value takes precedence over its corresponding global `contextWindow` or `maxOutputTokens`; models without an entry use the global value, then the upstream catalog or family default. The equivalent JSON configuration is:
 
 ```json
 {
   "noAutoCompaction": true,
   "agentProfile": true,
   "contextWindow": 512000,
+  "maxOutputTokens": 32768,
   "contextWindowOverrides": {
     "gemini-3-8-flash": 1048576,
     "claude-sonnet-5-5": 200000
+  },
+  "maxOutputTokensOverrides": {
+    "gemini-3-8-flash": 65536
   }
 }
 ```
 
-Here Gemini 3.8 Flash reports 1,048,576 tokens, Claude Sonnet 5.5 reports 200,000, and every other model reports 512,000. Omitting `contextWindow` would leave those other models at their catalog or family defaults. These overrides affect only metadata reported to Pi, not Agy's real server-side limits or `maxOutputTokens`.
+Here Gemini 3.8 Flash reports a 1,048,576-token context window and 65,536-token output limit, Claude Sonnet 5.5 reports a 200,000-token context window and the global 32,768-token output limit, and every other model uses the global limits. Omitting either global value would leave unlisted models at their catalog or family defaults. These overrides affect only metadata reported to Pi, not Agy's real server-side limits.
 
 The bypass does not increase real server-side model limits; when a conversation exceeds the upstream window without Pi compaction, the request fails rather than triggering Agy's local summary.
 
@@ -95,6 +99,7 @@ The bypass does not increase real server-side model limits; when a conversation 
 | `contextWindow` | *(model default)* | Optional positive integer overriding the context window reported to Pi for all models |
 | `contextWindowOverrides` | *(none)* | Optional map of exact Pi model IDs to positive-integer context windows; each match takes precedence over `contextWindow` |
 | `maxOutputTokens` | *(model default)* | Optional positive integer overriding the output limit reported to Pi for all models |
+| `maxOutputTokensOverrides` | *(none)* | Optional map of exact Pi model IDs to positive-integer output limits; each match takes precedence over `maxOutputTokens` |
 
 | Environment | Effect |
 | --- | --- |

@@ -316,6 +316,24 @@ describe("extension session lifecycle", () => {
 		expect(perModelModels.find((m: { id: string }) => m.id === "claude-sonnet-5-5").contextWindow).toBe(250_000);
 		expect(perModelModels.find((m: { id: string }) => m.id === "gpt-oss-120b").contextWindow).toBe(500_000);
 		expect(mocks.restart).not.toHaveBeenCalled();
+		const outputChoices = [
+			"Per-model output tokens…",
+			"claude-sonnet-5-5: inherit global",
+			"Save and close",
+		];
+		await session.commands.get("realagy").handler("settings", {
+			...session.ctx,
+			mode: "rpc",
+			ui: {
+				...session.ui,
+				select: vi.fn(async () => outputChoices.shift()),
+				input: vi.fn(async () => "24000"),
+			},
+		});
+		const outputModels = mocks.register.mock.lastCall![0].getModels();
+		expect(outputModels.find((m: { id: string }) => m.id === "claude-sonnet-5-5").maxTokens).toBe(24_000);
+		expect(outputModels.find((m: { id: string }) => m.id === "gemini-4-argon").maxTokens).toBe(65_536);
+		expect(mocks.restart).not.toHaveBeenCalled();
 		expect(JSON.parse(fs.readFileSync(path.join(session.agentDir, "realagy", "config.json"), "utf8"))).toEqual({
 			noAutoCompaction: true,
 			agentProfile: true,
@@ -324,6 +342,7 @@ describe("extension session lifecycle", () => {
 				"gemini-4-argon": 700_000,
 				"claude-sonnet-5-5": 250_000,
 			},
+			maxOutputTokensOverrides: { "claude-sonnet-5-5": 24_000 },
 		});
 	});
 

@@ -42,6 +42,7 @@ test("config defaults enable compaction bypass and agent profile with model-defa
 				contextWindow: 256_000,
 				contextWindowOverrides: { "gemini-4-argon": 900_000 },
 				maxOutputTokens: 32_000,
+				maxOutputTokensOverrides: { "gemini-4-argon": 48_000 },
 			},
 			file,
 		);
@@ -51,6 +52,7 @@ test("config defaults enable compaction bypass and agent profile with model-defa
 			contextWindow: 256_000,
 			contextWindowOverrides: { "gemini-4-argon": 900_000 },
 			maxOutputTokens: 32_000,
+			maxOutputTokensOverrides: { "gemini-4-argon": 48_000 },
 		});
 		assert.deepEqual(loadRealagyConfig(file), saved);
 		assert.equal(fs.statSync(file).mode & 0o777, 0o600);
@@ -78,6 +80,7 @@ test("config defaults enable compaction bypass and agent profile with model-defa
 					"": 100_000,
 				},
 				maxOutputTokens: -5,
+				maxOutputTokensOverrides: { "gemini-4-argon": "48,000", "invalid-output": -1 },
 			}),
 			{
 				noAutoCompaction: true,
@@ -87,6 +90,7 @@ test("config defaults enable compaction bypass and agent profile with model-defa
 					"gemini-4-argon": 900_000,
 					"claude-sonnet-5-5": 200_000,
 				},
+				maxOutputTokensOverrides: { "gemini-4-argon": 48_000 },
 			},
 		);
 		assert.equal(parsePositiveInt("1_048_576"), 1_048_576);
@@ -95,8 +99,10 @@ test("config defaults enable compaction bypass and agent profile with model-defa
 		assert.equal(formatConfigLimit(1_048_576), "1,048,576");
 		assert.match(formatConfigSummary(DEFAULT_REALAGY_CONFIG, file), /Pi context window: model default/);
 		assert.match(formatConfigSummary(saved, file), /Pi context window \(gemini-4-argon\): 900,000/);
+		assert.match(formatConfigSummary(saved, file), /Pi max output tokens \(gemini-4-argon\): 48,000/);
 		assert.equal(normalizeRealagyConfig({ contextWindowOverrides: {} }).contextWindowOverrides, undefined);
 		assert.equal(normalizeRealagyConfig({ contextWindowOverrides: [] }).contextWindowOverrides, undefined);
+		assert.equal(normalizeRealagyConfig({ maxOutputTokensOverrides: {} }).maxOutputTokensOverrides, undefined);
 	} finally {
 		fs.rmSync(directory, { recursive: true, force: true });
 	}
@@ -130,8 +136,9 @@ test("RealagySettingsComponent renders TUI list, toggles booleans, edits custom 
 	assert.match(initialLines, /Bypass Agy auto-compaction.*true/);
 	assert.match(initialLines, /Pi-only agent profile.*true/);
 	assert.match(initialLines, /Pi context window.*model default/);
-	assert.match(initialLines, /Context · gemini-4-argon.*900,000/);
-	assert.match(initialLines, /Context · claude-sonnet-5-5.*inherit global/);
+	assert.match(initialLines, /Per-model context windows.*1 override/);
+	assert.match(initialLines, /Per-model output tokens.*none/);
+	assert.doesNotMatch(initialLines, /Context · gemini-4-argon/);
 
 	// Toggle noAutoCompaction (row 0) with Enter.
 	component.handleInput("\r");
@@ -168,14 +175,20 @@ test("RealagySettingsComponent renders TUI list, toggles booleans, edits custom 
 	component.handleInput("\r");
 	assert.equal(changes.at(-1)?.contextWindow, undefined);
 
-	// Clear argon's override (row 4), then add a custom override for Claude (row 5).
+	// The main list contains only grouped entries. Open context models, clear argon, then set Claude.
 	component.handleInput("\x1b[B");
 	component.handleInput("\x1b[B");
+	component.handleInput("\r");
+	const contextModels = component.render(100).join("\n");
+	assert.match(contextModels, /gemini-4-argon.*900,000/);
+	assert.match(contextModels, /claude-sonnet-5-5.*inherit global/);
 	component.handleInput("\r");
 	for (let i = 0; i < 6; i++) component.handleInput("\x1b[A");
 	component.handleInput("\r");
 	assert.equal(changes.at(-1)?.contextWindowOverrides, undefined);
+	assert.match(component.render(100).join("\n"), /Per-model context windows.*none/);
 
+	component.handleInput("\r");
 	component.handleInput("\x1b[B");
 	component.handleInput("\r");
 	for (let i = 0; i < 6; i++) component.handleInput("\x1b[B");
@@ -183,9 +196,22 @@ test("RealagySettingsComponent renders TUI list, toggles booleans, edits custom 
 	for (const ch of "450000") component.handleInput(ch);
 	component.handleInput("\r");
 	assert.deepEqual(changes.at(-1)?.contextWindowOverrides, { "claude-sonnet-5-5": 450_000 });
+	assert.match(component.render(100).join("\n"), /Per-model context windows.*1 override/);
+
+	// Output tokens have an independent grouped submenu and presets.
+	component.handleInput("\x1b[B");
+	component.handleInput("\r");
+	assert.match(component.render(100).join("\n"), /gemini-4-argon.*inherit global/);
+	component.handleInput("\r");
+	for (let i = 0; i < 5; i++) component.handleInput("\x1b[B");
+	component.handleInput("\r");
+	for (const ch of "48000") component.handleInput(ch);
+	component.handleInput("\r");
+	assert.deepEqual(changes.at(-1)?.maxOutputTokensOverrides, { "gemini-4-argon": 48_000 });
 	const perModelLines = component.render(100).join("\n");
-	assert.match(perModelLines, /Context · gemini-4-argon.*inherit global/);
-	assert.match(perModelLines, /Context · claude-sonnet-5-5.*450,000/);
+	assert.match(perModelLines, /Per-model context windows.*1 override/);
+	assert.match(perModelLines, /Per-model output tokens.*1 override/);
+	assert.doesNotMatch(perModelLines, /Context · gemini-4-argon/);
 
 	// Esc closes the main settings list.
 	component.handleInput("\x1b");
@@ -193,40 +219,47 @@ test("RealagySettingsComponent renders TUI list, toggles booleans, edits custom 
 	assert.ok(renders > 0);
 });
 
-test("fallback menu edits global settings and per-model overrides, resets inheritance, and cancels cleanly", async () => {
+test("fallback menu edits global and grouped per-model limits, resets inheritance, and cancels cleanly", async () => {
 	const modelIds = ["gemini-4-argon", "claude-sonnet-5-5"];
-	const ui = menuUi([0, 1, 2, 4, 5], ["300000", "32000"]);
-	const result = await editRealagyConfigMenu(
-		ui,
-		{ ...DEFAULT_REALAGY_CONFIG, contextWindowOverrides: { "gemini-4-argon": 900_000 } },
-		modelIds,
-	);
+	const initial: RealagyConfig = {
+		...DEFAULT_REALAGY_CONFIG,
+		contextWindowOverrides: { "gemini-4-argon": 900_000 },
+		maxOutputTokensOverrides: { "gemini-4-argon": 64_000 },
+	};
+	const ui = menuUi([0, 1, 2, 3, 6], ["300000", "32000"]);
+	const result = await editRealagyConfigMenu(ui, initial, modelIds);
 	assert.deepEqual(result, {
 		noAutoCompaction: false,
 		agentProfile: false,
 		contextWindow: 300_000,
 		contextWindowOverrides: { "gemini-4-argon": 900_000 },
 		maxOutputTokens: 32_000,
+		maxOutputTokensOverrides: { "gemini-4-argon": 64_000 },
 	});
 	assert.equal(ui.messages.length, 0);
 
-	const resetUi = menuUi([2, 2, 5], ["not-a-number", ""]);
+	const resetUi = menuUi([2, 2, 6], ["not-a-number", ""]);
 	const resetResult = await editRealagyConfigMenu(resetUi, result!, modelIds);
 	assert.deepEqual(resetResult, {
 		noAutoCompaction: false,
 		contextWindowOverrides: { "gemini-4-argon": 900_000 },
 		agentProfile: false,
 		maxOutputTokens: 32_000,
+		maxOutputTokensOverrides: { "gemini-4-argon": 64_000 },
 	});
 	assert.equal(resetUi.messages.length, 1);
 
-	const perModelUi = menuUi([3, 1, 3, 1, 3, 0, 3, 2, 5], ["bad", "450000", ""]);
+	const perModelUi = menuUi(
+		[4, 1, 4, 1, 4, 0, 4, 2, 5, 0, 5, 1, 5, 1, 5, 2, 6],
+		["bad", "450000", "", "48000", "32000", ""],
+	);
 	const perModelResult = await editRealagyConfigMenu(perModelUi, result!, modelIds);
 	assert.deepEqual(perModelResult?.contextWindowOverrides, { "claude-sonnet-5-5": 450_000 });
+	assert.deepEqual(perModelResult?.maxOutputTokensOverrides, { "gemini-4-argon": 48_000 });
 	assert.equal(perModelUi.messages.length, 1);
 	assert.match(perModelUi.messages[0], /inherit global/);
 
-	const cancelled = menuUi([6], []);
+	const cancelled = menuUi([7], []);
 	assert.equal(await editRealagyConfigMenu(cancelled, DEFAULT_REALAGY_CONFIG, modelIds), undefined);
 });
 

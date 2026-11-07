@@ -346,17 +346,18 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 					return;
 				}
 				if (stopped) return;
-				const beforeOverrides = before.contextWindowOverrides ?? {};
-				const afterOverrides = config.contextWindowOverrides ?? {};
-				const overridesChanged =
-					Object.keys(beforeOverrides).length !== Object.keys(afterOverrides).length ||
-					Object.entries(afterOverrides).some(([modelId, limit]) => beforeOverrides[modelId] !== limit);
+				const modelLimitsChanged = (["contextWindowOverrides", "maxOutputTokensOverrides"] as const).some((key) => {
+					const beforeOverrides = before[key] ?? {};
+					const afterOverrides = config[key] ?? {};
+					return Object.keys(beforeOverrides).length !== Object.keys(afterOverrides).length ||
+						Object.entries(afterOverrides).some(([modelId, limit]) => beforeOverrides[modelId] !== limit);
+				});
 				const changed =
 					config.noAutoCompaction !== before.noAutoCompaction ||
 					config.agentProfile !== before.agentProfile ||
 					config.contextWindow !== before.contextWindow ||
 					config.maxOutputTokens !== before.maxOutputTokens ||
-					overridesChanged;
+					modelLimitsChanged;
 				if (!changed) return;
 				const restartAgy =
 					config.noAutoCompaction !== before.noAutoCompaction ||

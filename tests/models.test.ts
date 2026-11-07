@@ -83,6 +83,23 @@ test("per-model context windows take precedence over the global fallback with ex
 	assert.equal(toPiModel(argon, { contextWindowOverrides: { "gemini-4-argon": 800_000 } }).contextWindow, 800_000);
 });
 
+test("per-model output tokens take precedence over the global fallback with exact Pi ID matching", () => {
+	const entries = entriesFromAcpModels(LIVE);
+	const argon = entries.find((entry) => entry.id === "gemini-4-argon")!;
+	const claude = entries.find((entry) => entry.id === "claude-sonnet-5-5")!;
+	const overrides = {
+		maxOutputTokens: 64_000,
+		maxOutputTokensOverrides: { "gemini-4-argon": 48_000 },
+	};
+
+	assert.equal(toPiModel(argon, overrides).maxTokens, 48_000);
+	assert.equal(toPiModel(argon, overrides).contextWindow, 1_048_576);
+	assert.equal(toPiModel(claude, overrides).maxTokens, 64_000);
+	assert.equal(toPiModel(claude, overrides).contextWindow, 1_000_000);
+	assert.equal(toPiModel(argon, { maxOutputTokensOverrides: { "Gemini-4-argon": 48_000 } }).maxTokens, 65_536);
+	assert.equal(toPiModel(argon, { maxOutputTokensOverrides: { "gemini-4-argon-high": 48_000 } }).maxTokens, 65_536);
+});
+
 test("unknown families remain exact-slug fixed models and noise is rejected", () => {
 	const entries = entriesFromAcpModels([
 		{ modelId: "Available models:" },
