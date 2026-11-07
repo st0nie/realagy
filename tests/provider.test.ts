@@ -629,7 +629,7 @@ test("bounded transcript keeps system prompt, realctx-history summaries, and new
 	assert.ok(!huge.contextBlock!.text.includes("<pi-transcript-omitted"));
 });
 
-test("warm session survives realctx drops, path-notes, history chunks, tag stripping, and ephemeral pi-lens messages", () => {
+test("warm session survives small realctx drops, path-notes, history chunks, tag stripping, and ephemeral pi-lens messages", () => {
 	const model = toPiModel(FALLBACK_MODELS[0]);
 	const img = { type: "image" as const, data: "dXNlckltZw==", mimeType: "image/png" };
 	const turn1User: Message = { role: "user", content: [{ type: "text", text: "inspect this screenshot" }, img], timestamp: 1 };
@@ -719,7 +719,7 @@ test("warm session survives realctx drops, path-notes, history chunks, tag strip
 	assert.equal(planAfterHistorian.input.prompt, "still warm after historian?");
 });
 
-test("mid-turn realctx history compression during tool reentry preserves warm reuse for the next turn", async () => {
+test("small mid-turn realctx history compression during tool reentry preserves warm reuse for the next turn", async () => {
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
 	const roundTrips = new ToolRoundTrips(driver);
@@ -916,7 +916,7 @@ test("persisted warm checkpoints survive reload and fork the SQLite store on /tr
 	}
 });
 
-test("universal extension invariance: arbitrary prompt decorators, transient messages, custom summaries, and sliding windows preserve warm sessions while manual /compact and edits diverge", async () => {
+test("universal extension invariance: arbitrary prompt decorators, transient messages, custom summaries, and small sliding windows preserve warm sessions while manual /compact and edits diverge", async () => {
 	const model = toPiModel(FALLBACK_MODELS[0]);
 	const makeAsst = (text: string): Message => ({
 		role: "assistant",
@@ -1088,4 +1088,255 @@ test("agy's high-traffic notice fails the turn as a retryable overload instead o
 	assert.equal(error.error.errorMessage, "Antigravity servers are overloaded: Our servers are experiencing high traffic right now, please try again in a minute.");
 	// pi's auto-retry keys on "overloaded" in the error message.
 	assert.match(error.error.errorMessage ?? "", /overloaded/);
+});
+
+function reclaimAssistant(content: Extract<Message, { role: "assistant" }>["content"], timestamp = Date.now()): Extract<Message, { role: "assistant" }> {
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	return {
+		role: "assistant",
+		content,
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		stopReason: content.some((block) => block.type === "toolCall") ? "toolUse" : "stop",
+		timestamp,
+	};
+}
+
+function toolResult(id: string, text: string): Message {
+	return { role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text }], isError: false, timestamp: Date.now() };
+}
+
+const readCall = (id: string) => reclaimAssistant([{ type: "toolCall", id, name: "read", arguments: { path: id } }]);
+
+test("a warm session is replaced by a fresh one once a context manager reclaims enough of what it holds", () => {
+	const big = "x".repeat(200_000);
+	const u1 = user("inspect the logs");
+	const a1 = readCall("c1");
+	const r1 = toolResult("c1", big);
+	const a2 = reclaimAssistant([{ type: "text", text: "The log is noisy." }]);
+	const u2 = user("and the config?");
+	const a3 = reclaimAssistant([{ type: "text", text: "The config is fine." }]);
+	const warm = warmAfterTurn(context([system(), u1, a1, r1, a2, u2]), a3, "acp-big", "/repo");
+	assert.ok((warm.bytes ?? 0) > 200_000);
+
+	// Unchanged history: warm, nothing hidden.
+	const same = planTurn(context([system(), u1, a1, r1, a2, u2, a3, user("next")]), "/repo", warm);
+	assert.equal(same.kind, "warm");
+	if (same.kind === "warm") assert.equal(same.hidden, 0);
+
+	// realctx drops the large output: the session would keep it, so start fresh without it.
+	const r1Dropped = toolResult("c1", "[#1 dropped · read c1 · 50k tok]");
+	const dropped = planTurn(context([system(), u1, a1, r1Dropped, a2, u2, a3, user("next")]), "/repo", warm);
+	assert.equal(dropped.kind, "fresh");
+	if (dropped.kind === "fresh") {
+		assert.equal(dropped.reason, "context-reclaimed");
+		assert.ok(!dropped.input.contextBlock?.text.includes("xxxxxxxxxx"));
+		assert.match(dropped.input.contextBlock?.text ?? "", /\[#1 dropped · read c1/);
+	}
+
+	// realctx's historian folds turn 1 into a summary: also fresh.
+	const summary = user('<realctx-history part="h1" turns="1-1" replaced="50k tok">\nRead the noisy log.\n</realctx-history>');
+	const folded = planTurn(context([system(), summary, u2, a3, user("next")]), "/repo", warm);
+	assert.equal(folded.kind, "fresh");
+	if (folded.kind === "fresh") assert.equal(folded.reason, "context-reclaimed");
+});
+
+test("small reclaims keep the warm session but accumulate across checkpoints until a fresh session pays off", () => {
+	const u1 = user("read both files");
+	const a1 = readCall("c1");
+	const r1 = toolResult("c1", "a".repeat(20_000));
+	const a2 = readCall("c2");
+	const r2 = toolResult("c2", "b".repeat(20_000));
+	const a3 = reclaimAssistant([{ type: "text", text: "Both read." }]);
+	const warm1 = warmAfterTurn(context([system(), u1, a1, r1, a2, r2]), a3, "acp-small", "/repo");
+
+	// 20 KB dropped: below RECLAIM_MIN_BYTES, so the session stays warm and remembers the excess.
+	const r1Dropped = toolResult("c1", "[#1 dropped · read c1 · 5k tok]");
+	const u2 = user("summarize");
+	const ctx2 = context([system(), u1, a1, r1Dropped, a2, r2, a3, u2]);
+	const plan2 = planTurn(ctx2, "/repo", warm1);
+	assert.equal(plan2.kind, "warm");
+	if (plan2.kind !== "warm") return;
+	assert.ok(plan2.hidden > 19_000 && plan2.hidden < 21_000, String(plan2.hidden));
+	const a4 = reclaimAssistant([{ type: "text", text: "Summary." }]);
+	const warm2 = warmAfterTurn(ctx2, a4, "acp-small", "/repo", undefined, plan2.hidden);
+	assert.ok((warm2.bytes ?? 0) > (warm1.bytes ?? 0));
+
+	// Another 20 KB dropped: 40 KB in total now exceeds the threshold.
+	const r2Dropped = toolResult("c2", "[#2 dropped · read c2 · 5k tok]");
+	const plan3 = planTurn(context([system(), u1, a1, r1Dropped, a2, r2Dropped, a3, u2, a4, user("next")]), "/repo", warm2);
+	assert.equal(plan3.kind, "fresh");
+	if (plan3.kind === "fresh") assert.equal(plan3.reason, "context-reclaimed");
+});
+
+test("a reclaim below the share threshold restarts only once the prompt cache is cold", () => {
+	const filler = toolResult("c0", "f".repeat(1_000_000));
+	const big = toolResult("c1", "y".repeat(50_000));
+	const u1 = user("go");
+	const hot = Date.now();
+	const old = hot - 10 * 60_000;
+	for (const [stamp, expected] of [[hot, "warm"], [old, "fresh"]] as const) {
+		const a1 = readCall("c0");
+		const a2 = readCall("c1");
+		const a3 = reclaimAssistant([{ type: "text", text: "done" }], stamp);
+		const warm = warmAfterTurn(context([system(), u1, a1, filler, a2, big]), a3, "acp-cold", "/repo");
+		const plan = planTurn(context([system(), u1, a1, filler, a2, toolResult("c1", "[#2 dropped · read c1 · 12k tok]"), a3, user("next")]), "/repo", warm);
+		assert.equal(plan.kind, expected);
+	}
+});
+
+test("restored warm checkpoints keep their byte size; older ones without it stay usable", () => {
+	const warm = warmAfterTurn(context([system(), user("hi")]), reclaimAssistant([{ type: "text", text: "hello" }]), "acp-r", "/repo");
+	const legacy = { ...warm, bytes: undefined };
+	const { checkpoints } = restoreWarmSessions([
+		{ type: "custom", customType: WARM_SESSION_ENTRY, data: legacy },
+		{ type: "custom", customType: WARM_SESSION_ENTRY, data: { ...warm, count: warm.count } },
+	] as SessionEntryLike[]);
+	assert.equal(checkpoints.at(-1)?.bytes, warm.bytes);
+	assert.equal(checkpoints[0]?.bytes, undefined);
+	assert.equal(planTurn(context([system(), user("hi"), reclaimAssistant([{ type: "text", text: "hello" }]), user("again")]), "/repo", checkpoints[0]).kind, "warm");
+});
+
+test("a running turn restarts on a fresh session when realctx drops a large output it already holds", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const roundTrips = new ToolRoundTrips(driver);
+	driver.onTurnEnd = (outcome) => failParkedCalls(roundTrips, outcome);
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const sessions: AcpSessions = {};
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+	const withSession = (handle: FakeHandle): void => {
+		const push = handle.pushExternal.bind(handle);
+		handle.pushExternal = (activity) => push(activity.type === "bridge_call" ? { ...activity, sessionId: "acp-running" } : activity);
+	};
+	try {
+		const u1 = user("scan the repo");
+		const step1 = collect(stream(model, context([system(), u1])));
+		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+		const handle = driver.activeHandle as FakeHandle;
+		withSession(handle);
+		const call1 = roundTrips.onToolCall("c1", "read", { path: "big.log" }, new AbortController().signal);
+		const done1 = (await step1).find((event) => event.type === "done");
+		if (done1?.type !== "done") throw new Error("no toolUse message");
+		const a1 = done1.message;
+
+		// pi runs the tool: a large output goes back into the same running turn.
+		const r1 = toolResult("c1", "z".repeat(200_000));
+		const step2 = collect(stream(model, context([system(), u1, a1, r1])));
+		assert.match(JSON.stringify(await call1), /zzzz/);
+		const call2 = roundTrips.onToolCall("c2", "read", { path: "small.txt" }, new AbortController().signal);
+		const done2 = (await step2).find((event) => event.type === "done");
+		if (done2?.type !== "done") throw new Error("no second toolUse message");
+		const a2 = done2.message;
+		assert.equal(driver.requests.length, 1);
+		assert.ok((sessions.step?.bytes ?? 0) > 200_000);
+
+		// realctx drops the large output before the next request: the running
+		// session still holds it, so the turn restarts fresh without it.
+		driver.autoFinish = true;
+		driver.script = [{ type: "text", delta: "restarted" }];
+		const r1Dropped = toolResult("c1", "[#1 dropped · read big.log · 50k tok]");
+		const r2 = toolResult("c2", "small");
+		const done3 = (await collect(stream(model, context([system(), u1, a1, r1Dropped, a2, r2])))).find((event) => event.type === "done");
+		assert.equal(done3?.type, "done");
+		await assert.rejects(call2);
+		assert.equal(driver.cancels.length, 1);
+		assert.equal(driver.requests.length, 2);
+		assert.equal(driver.requests[1].conversationId, null);
+		const transcript = driver.requests[1].contextBlock?.text ?? "";
+		assert.match(transcript, /\[#1 dropped · read big\.log/);
+		assert.ok(!transcript.includes("zzzzzzzzzz"));
+		assert.match(transcript, /small/);
+	} finally {
+		roundTrips.failAll("test done");
+	}
+});
+
+test("a running turn keeps its session when realctx only drops a little of it", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const roundTrips = new ToolRoundTrips(driver);
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const sessions: AcpSessions = {};
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+	try {
+		const u1 = user("scan");
+		const step1 = collect(stream(model, context([system(), u1])));
+		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+		const handle = driver.activeHandle as FakeHandle;
+		const push = handle.pushExternal.bind(handle);
+		handle.pushExternal = (activity) => push(activity.type === "bridge_call" ? { ...activity, sessionId: "acp-small-run" } : activity);
+		void roundTrips.onToolCall("c1", "read", {}, new AbortController().signal);
+		const done1 = (await step1).find((event) => event.type === "done");
+		if (done1?.type !== "done") throw new Error("no toolUse message");
+		const r1 = toolResult("c1", "s".repeat(10_000));
+		const step2 = collect(stream(model, context([system(), u1, done1.message, r1])));
+		await vi.waitFor(() => assert.ok(!roundTrips.isPending("c1")));
+		const call2 = roundTrips.onToolCall("c2", "read", {}, new AbortController().signal);
+		const done2 = (await step2).find((event) => event.type === "done");
+		if (done2?.type !== "done") throw new Error("no second toolUse message");
+
+		const step3 = collect(stream(model, context([system(), u1, done1.message, toolResult("c1", "[#1 dropped · read · 2.5k tok]"), done2.message, toolResult("c2", "ok")])));
+		assert.match(JSON.stringify(await call2), /ok/);
+		handle.complete({ status: "OK", response: "", aborted: false, conversationId: "acp-small-run" });
+		await step3;
+		assert.equal(driver.requests.length, 1);
+		assert.equal(driver.cancels.length, 0);
+		// The checkpoint still counts the 10 KB the session holds beyond pi's view.
+		assert.ok((sessions.warm?.bytes ?? 0) > 10_000, String(sessions.warm?.bytes));
+	} finally {
+		roundTrips.failAll("test done");
+	}
+});
+
+test("the reclaim policy is configurable: off keeps sessions warm, tighter values restart sooner", async () => {
+	const u1 = user("read");
+	const a1 = readCall("c1");
+	const r1 = toolResult("c1", "q".repeat(200_000));
+	const a2 = reclaimAssistant([{ type: "text", text: "read" }]);
+	const warm = warmAfterTurn(context([system(), u1, a1, r1]), a2, "acp-policy", "/repo");
+	const dropped = context([system(), u1, a1, toolResult("c1", "[#1 dropped · read c1 · 50k tok]"), a2, user("next")]);
+	assert.equal(planTurn(dropped, "/repo", warm).kind, "fresh");
+	assert.equal(planTurn(dropped, "/repo", warm, null).kind, "warm");
+	assert.equal(planTurn(dropped, "/repo", warm, { minBytes: 1_000_000, minShare: 0, coldMs: 0 }).kind, "warm");
+
+	// A 5 KB drop stays warm by default but restarts under a 1k-byte, 0% policy.
+	const small = warmAfterTurn(context([system(), u1, a1, toolResult("c1", "s".repeat(5_000))]), a2, "acp-policy", "/repo");
+	assert.equal(planTurn(dropped, "/repo", small).kind, "warm");
+	assert.equal(planTurn(dropped, "/repo", small, { minBytes: 1_000, minShare: 0, coldMs: 0 }).kind, "fresh");
+
+	// Mid-turn, a disabled policy resolves the tool result into the running turn.
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const roundTrips = new ToolRoundTrips(driver);
+	const sessions: AcpSessions = {};
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions, reclaim: () => null });
+	try {
+		const step1 = collect(stream(model, context([system(), u1])));
+		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+		const handle = driver.activeHandle as FakeHandle;
+		const push = handle.pushExternal.bind(handle);
+		handle.pushExternal = (activity) => push(activity.type === "bridge_call" ? { ...activity, sessionId: "acp-off" } : activity);
+		void roundTrips.onToolCall("c1", "read", {}, new AbortController().signal);
+		const done1 = (await step1).find((event) => event.type === "done");
+		if (done1?.type !== "done") throw new Error("no toolUse message");
+		const step2 = collect(stream(model, context([system(), u1, done1.message, r1])));
+		await vi.waitFor(() => assert.ok(!roundTrips.isPending("c1")));
+		const call2 = roundTrips.onToolCall("c2", "read", {}, new AbortController().signal);
+		const done2 = (await step2).find((event) => event.type === "done");
+		if (done2?.type !== "done") throw new Error("no second toolUse message");
+		const step3 = collect(stream(model, context([system(), u1, done1.message, toolResult("c1", "[#1 dropped · read · 50k tok]"), done2.message, toolResult("c2", "ok")])));
+		assert.match(JSON.stringify(await call2), /ok/);
+		handle.complete({ status: "OK", response: "", aborted: false, conversationId: "acp-off" });
+		await step3;
+		assert.equal(driver.requests.length, 1);
+		assert.equal(driver.cancels.length, 0);
+		// Bytes are still tracked, so turning the policy back on can reclaim later.
+		assert.ok((sessions.warm?.bytes ?? 0) > 200_000);
+	} finally {
+		roundTrips.failAll("test done");
+	}
 });

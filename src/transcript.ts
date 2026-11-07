@@ -49,6 +49,12 @@ export interface WarmSession {
 	/** Highest `steps.idx` in `~/.gemini/antigravity-cli/conversations/<sessionId>.db`
 	 *  when this turn completed. Used to fork a truncated store on `/tree` rewind. */
 	maxStepIdx?: number;
+	/** Estimated bytes of conversation the ACP session holds (`messageBytes`
+	 *  units). It can exceed pi's current view of the same messages after a
+	 *  context manager (realctx drops, history summaries, sliding windows)
+	 *  shrank them; that excess is what a fresh session would reclaim.
+	 *  Absent on checkpoints recorded before this was tracked. */
+	bytes?: number;
 	systemPrompt: string;
 	tools: string;
 }
@@ -212,6 +218,55 @@ function isHistorySummaryText(text: string): boolean {
 function isHistorySummary(message: Message): boolean {
 	if (message.role !== "user") return false;
 	return isHistorySummaryText(contentText(message.content));
+}
+
+/** When a warm session is abandoned for a fresh one because a context manager
+ *  shrank pi's view of what the session holds (`/realagy settings`). */
+export interface ReclaimPolicy {
+	/** Least reclaimable bytes (`messageBytes` units) worth a fresh session... */
+	minBytes: number;
+	/** ...that are also at least this share (0-1) of what the session holds,
+	 *  so a re-read of the whole (smaller) transcript pays for itself... */
+	minShare: number;
+	/** ...unless the latest reply is at least this old (ms): the provider's
+	 *  prompt cache is cold anyway. 0 turns this rule off. */
+	coldMs: number;
+}
+
+/** Rough UTF-8 bytes per token, for policies configured in tokens. */
+export const BYTES_PER_TOKEN = 4;
+
+/** 8k tokens, 10% of the session, or any such reclaim after 5 idle minutes. */
+export const DEFAULT_RECLAIM_POLICY: Readonly<ReclaimPolicy> = {
+	minBytes: 8_000 * BYTES_PER_TOKEN,
+	minShare: 0.1,
+	coldMs: 5 * 60_000,
+};
+
+/** Byte weight of one attached image (about 1.5k tokens). */
+const IMAGE_BYTES = 6_000;
+
+/** Whether `reclaim` bytes held by a session of `held` bytes, but no longer
+ *  in pi's view, justify replacing the session with a fresh one. A null
+ *  policy never reclaims. */
+export function shouldReclaim(reclaim: number, held: number, cold: boolean, policy: Readonly<ReclaimPolicy> | null = DEFAULT_RECLAIM_POLICY): boolean {
+	if (!policy || reclaim <= 0 || reclaim < policy.minBytes) return false;
+	return cold || reclaim >= held * policy.minShare;
+}
+
+/** Size of one message as the ACP session sees it: serialized text plus a
+ *  fixed weight per image. System messages are not part of the conversation. */
+export function messageBytes(message: Message): number {
+	if (message.role === "system") return 0;
+	const serialized = serializeMessage(message, 0);
+	return utf8Bytes(serialized.text) + serialized.images.length * IMAGE_BYTES;
+}
+
+/** Total `messageBytes` of `messages`. */
+export function transcriptBytes(messages: readonly Message[]): number {
+	let total = 0;
+	for (const message of messages) total += messageBytes(message);
+	return total;
 }
 
 function utf8Bytes(text: string): number {
@@ -592,7 +647,7 @@ function matchKeySuffix(
 function splitWarmTranscript(
 	index: TranscriptIndex,
 	warm: { count: number; hash: string; keys?: readonly string[]; items?: readonly WarmItem[] },
-): { prefix: Message[]; delta: Message[] } | null {
+): { prefix: Message[]; delta: Message[]; end: number } | null {
 	const messages = index.messages;
 	const direct = index.splitAtPersistentCount(warm.count);
 	if (direct && index.prefixHash(warm.count) === warm.hash) {
@@ -610,6 +665,7 @@ function splitWarmTranscript(
 	return {
 		prefix: persistentMessages(messages.slice(0, splitIdx)),
 		delta: messages.slice(splitIdx),
+		end: splitIdx,
 	};
 }
 
@@ -636,6 +692,8 @@ class TranscriptIndex {
 	#fresh: AcpInput | undefined;
 	#tools: string | undefined;
 	#systemPrompt: string | undefined;
+	/** bytesUpTo[i] = `messageBytes` of the persistent messages before persistent entry i. */
+	#bytesUpTo: number[] | undefined;
 
 	constructor(context: TranscriptContext) {
 		this.context = context;
@@ -670,13 +728,14 @@ class TranscriptIndex {
 	}
 
 	/** The first `count` persistent messages, and everything after them. */
-	splitAtPersistentCount(count: number): { prefix: Message[]; delta: Message[] } | null {
+	splitAtPersistentCount(count: number): { prefix: Message[]; delta: Message[]; end: number } | null {
 		const persistent = this.persistent();
 		if (count > persistent.length) return null;
 		const last = count > 0 ? persistent[count - 1] : undefined;
 		return {
 			prefix: persistent.slice(0, count).map((entry) => entry.message),
 			delta: this.messages.slice(last ? last.index + 1 : 0),
+			end: last ? last.index + 1 : 0,
 		};
 	}
 
@@ -692,6 +751,34 @@ class TranscriptIndex {
 			this.#body = body;
 		}
 		return this.#body;
+	}
+
+	/** `messageBytes` of the persistent messages before transcript index `end`. */
+	bytesBefore(end: number): number {
+		const persistent = this.persistent();
+		if (!this.#bytesUpTo) {
+			const sums = [0];
+			let total = 0;
+			for (const entry of persistent) {
+				total += messageBytes(entry.message);
+				sums.push(total);
+			}
+			this.#bytesUpTo = sums;
+		}
+		let count = 0;
+		while (count < persistent.length && (persistent[count]?.index ?? Infinity) < end) count++;
+		return this.#bytesUpTo[count] ?? 0;
+	}
+
+	/** Whether the provider's prompt cache has gone cold since the latest reply. */
+	cold(coldMs: number, now = Date.now()): boolean {
+		for (let i = this.messages.length - 1; i >= 0; i--) {
+			const message = this.messages[i];
+			if (message?.role !== "assistant") continue;
+			const at = message.timestamp;
+			return coldMs > 0 && typeof at === "number" && at > 0 && now - at >= coldMs;
+		}
+		return false;
 	}
 
 	fresh(): AcpInput {
@@ -712,12 +799,28 @@ class TranscriptIndex {
 
 export type TurnPlan =
 	| { kind: "fresh"; input: AcpInput; reason: string }
-	| { kind: "warm"; sessionId: string; maxStepIdx?: number; input: AcpInput; fallback: AcpInput; deltaMessages: number };
+	| {
+		kind: "warm";
+		sessionId: string;
+		maxStepIdx?: number;
+		input: AcpInput;
+		fallback: AcpInput;
+		deltaMessages: number;
+		/** Bytes the session holds beyond pi's current view of its prefix
+		 *  (see `WarmSession.bytes`); carried into the next checkpoint. */
+		hidden: number;
+	};
 
-type WarmMatch = { warm: WarmSession; delta: Message[] } | { reason: string };
+type WarmMatch = { warm: WarmSession; delta: Message[]; hidden: number } | { reason: string };
+
+/** Bytes `warm` holds beyond pi's view of the messages it matched (negative
+ *  when pi's view grew), or undefined for checkpoints without `bytes`. */
+function hiddenBytes(index: TranscriptIndex, warm: WarmSession, end: number): number | undefined {
+	return warm.bytes === undefined ? undefined : warm.bytes - index.bytesBefore(end);
+}
 
 /** Whether `warm` can continue this transcript, and with which delta. */
-function matchWarm(index: TranscriptIndex, cwd: string, warm: WarmSession | undefined): WarmMatch {
+function matchWarm(index: TranscriptIndex, cwd: string, warm: WarmSession | undefined, policy: Readonly<ReclaimPolicy> | null): WarmMatch {
 	if (!warm) return { reason: "no-session" };
 	if (warm.cwd !== cwd) return { reason: "cwd" };
 	// A changed active tool set (pi's `<tools>` system messages after an
@@ -729,12 +832,17 @@ function matchWarm(index: TranscriptIndex, cwd: string, warm: WarmSession | unde
 	}
 	if (split.delta.length === 0) return { reason: "history-shrank" };
 	if (!split.delta.some((message) => message.role === "user" || message.role === "toolResult")) return { reason: "no-user-message" };
-	return { warm, delta: split.delta };
+	// Matching tolerates context managers rewriting what the session already
+	// holds, but the session keeps the original: once enough was dropped or
+	// summarized, only a fresh session actually releases that context.
+	const hidden = hiddenBytes(index, warm, split.end) ?? 0;
+	if (warm.bytes !== undefined && policy && shouldReclaim(hidden, warm.bytes, index.cold(policy.coldMs), policy)) return { reason: "context-reclaimed" };
+	return { warm, delta: split.delta, hidden };
 }
 
 function planFromMatch(index: TranscriptIndex, match: WarmMatch): TurnPlan {
 	if ("reason" in match) return { kind: "fresh", input: index.fresh(), reason: match.reason };
-	const { warm, delta } = match;
+	const { warm, delta, hidden } = match;
 	const systemPrompt = index.systemPrompt();
 	const systemChanged = systemPrompt !== warm.systemPrompt;
 	const tools = index.tools();
@@ -766,6 +874,7 @@ function planFromMatch(index: TranscriptIndex, match: WarmMatch): TurnPlan {
 		input,
 		fallback: index.fresh(),
 		deltaMessages: delta.length,
+		hidden,
 	};
 }
 
@@ -778,26 +887,54 @@ function toolsUpdate(tools: string): string {
 	return `<pi-tools-update>\n${text}\n</pi-tools-update>`;
 }
 
-export function planTurn(context: TranscriptContext, cwd: string, warm: WarmSession | undefined): TurnPlan {
+/** For a running turn about to continue on `warm` (its tool-boundary
+ *  checkpoint): the bytes the session holds beyond pi's current view, and
+ *  whether that is enough to restart on a fresh session instead. Undefined
+ *  when the checkpoint has no `bytes` or no longer matches. */
+export function measureWarm(
+	context: TranscriptContext,
+	warm: WarmSession,
+	policy: Readonly<ReclaimPolicy> | null = DEFAULT_RECLAIM_POLICY,
+): { hidden: number; reclaim: boolean } | undefined {
+	if (warm.bytes === undefined) return undefined;
 	const index = new TranscriptIndex(context);
-	return planFromMatch(index, matchWarm(index, cwd, warm));
+	const split = splitWarmTranscript(index, warm);
+	if (!split) return undefined;
+	const hidden = hiddenBytes(index, warm, split.end) ?? 0;
+	// Mid-turn the prompt cache is hot: only the share rule applies.
+	return { hidden, reclaim: shouldReclaim(hidden, warm.bytes, false, policy) };
+}
+
+export function planTurn(
+	context: TranscriptContext,
+	cwd: string,
+	warm: WarmSession | undefined,
+	policy: Readonly<ReclaimPolicy> | null = DEFAULT_RECLAIM_POLICY,
+): TurnPlan {
+	const index = new TranscriptIndex(context);
+	return planFromMatch(index, matchWarm(index, cwd, warm, policy));
 }
 
 /** Plan against several remembered sessions (most preferred first): the one
  *  with the smallest delta wins; with none usable, the first one's fresh
  *  reason is reported. Inputs are built only for the winner. */
-export function planTurnFrom(context: TranscriptContext, cwd: string, candidates: readonly WarmSession[]): TurnPlan {
+export function planTurnFrom(
+	context: TranscriptContext,
+	cwd: string,
+	candidates: readonly WarmSession[],
+	policy: Readonly<ReclaimPolicy> | null = DEFAULT_RECLAIM_POLICY,
+): TurnPlan {
 	const index = new TranscriptIndex(context);
 	let best: Extract<WarmMatch, { warm: WarmSession }> | undefined;
 	for (const candidate of candidates) {
-		const match = matchWarm(index, cwd, candidate);
+		const match = matchWarm(index, cwd, candidate, policy);
 		if ("reason" in match) continue;
 		if (!best || match.delta.length < best.delta.length) {
 			best = match;
 			if (best.delta.length === 1) break;
 		}
 	}
-	return planFromMatch(index, best ?? matchWarm(index, cwd, candidates[0]));
+	return planFromMatch(index, best ?? matchWarm(index, cwd, candidates[0], policy));
 }
 
 /** State after a completed turn: the session holds pi's persistent messages
@@ -808,12 +945,16 @@ export function warmAfterTurn(
 	sessionId: string,
 	cwd: string,
 	maxStepIdx?: number,
+	/** Bytes the session held beyond pi's view of the turn's prefix
+	 *  (`TurnPlan.hidden`; 0 for a fresh session). */
+	hidden = 0,
 ): WarmSession {
 	const messages = [...persistentMessages(context.messages), final];
 	const warm: WarmSession = {
 		sessionId,
 		cwd,
 		count: messages.length,
+		bytes: Math.max(0, transcriptBytes(messages) + hidden),
 		hash: fingerprint(messages),
 		keys: nonHistoryKeys(messages),
 		items: warmItemsForMessages(messages),
@@ -861,6 +1002,9 @@ function toWarmSession(data: Partial<WarmSession> | null | undefined): WarmSessi
 	}
 	if (data.maxStepIdx !== undefined && Number.isFinite(data.maxStepIdx)) {
 		warm.maxStepIdx = Number(data.maxStepIdx);
+	}
+	if (data.bytes !== undefined && Number.isFinite(data.bytes)) {
+		warm.bytes = Number(data.bytes);
 	}
 	return warm;
 }

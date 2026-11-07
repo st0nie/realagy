@@ -25,6 +25,7 @@ import {
 	type TuiMouseEventResult,
 } from "@earendil-works/pi-tui";
 import type { ModelLimitOverrides } from "./models.js";
+import { BYTES_PER_TOKEN, type ReclaimPolicy } from "./transcript.js";
 
 export interface RealagyConfig extends ModelLimitOverrides {
 	/** Rewrite Agy's model catalog on loopback to disable local automatic
@@ -33,12 +34,126 @@ export interface RealagyConfig extends ModelLimitOverrides {
 	/** Run Agy with realagy's hidden agent profile (Pi's prompt and tools only)
 	 * instead of Agy's default agent. */
 	agentProfile: boolean;
+	/** Restart an agy session on a fresh one once pi's context managers (such
+	 * as realctx) dropped or summarized enough of what it holds. Default on. */
+	reclaimContext?: boolean;
+	/** Least reclaimable context, in tokens, worth a fresh session. */
+	reclaimMinTokens?: number;
+	/** ...that is also at least this percentage of the session's context... */
+	reclaimMinPercent?: number;
+	/** ...unless the latest reply is at least this many minutes old (0 = off). */
+	reclaimColdMinutes?: number;
 }
 
 export const DEFAULT_REALAGY_CONFIG: Readonly<RealagyConfig> = {
 	noAutoCompaction: true,
 	agentProfile: true,
 };
+
+export type ReclaimSettings = Required<Pick<RealagyConfig, "reclaimContext" | "reclaimMinTokens" | "reclaimMinPercent" | "reclaimColdMinutes">>;
+export const RECLAIM_SETTING_KEYS = ["reclaimContext", "reclaimMinTokens", "reclaimMinPercent", "reclaimColdMinutes"] as const;
+type ReclaimSettingKey = (typeof RECLAIM_SETTING_KEYS)[number];
+
+/** Defaults of the reclaim settings; config files omit keys equal to them. */
+export const DEFAULT_RECLAIM_SETTINGS: Readonly<ReclaimSettings> = {
+	reclaimContext: true,
+	reclaimMinTokens: 8_000,
+	reclaimMinPercent: 10,
+	reclaimColdMinutes: 5,
+};
+
+const RECLAIM_TOKEN_VALUES = ["2,000", "4,000", "8,000", "16,000", "32,000", "64,000"];
+const RECLAIM_PERCENT_VALUES = ["0%", "5%", "10%", "20%", "30%", "50%"];
+const RECLAIM_COLD_VALUES = ["off", "1 min", "5 min", "10 min", "15 min", "30 min", "60 min"];
+/** Reclaim entries of the fallback (non-TUI) settings menu. */
+const RECLAIM_MENU: ReadonlyArray<{ key: ReclaimSettingKey; label: string; values: readonly string[]; hint: string }> = [
+	{ key: "reclaimContext", label: "Release dropped context", values: ["true", "false"], hint: "true or false" },
+	{ key: "reclaimMinTokens", label: "Release: minimum tokens", values: RECLAIM_TOKEN_VALUES, hint: "a positive whole number of tokens" },
+	{ key: "reclaimMinPercent", label: "Release: minimum share", values: RECLAIM_PERCENT_VALUES, hint: "a percentage from 0 to 100" },
+	{ key: "reclaimColdMinutes", label: "Release: cold cache after", values: RECLAIM_COLD_VALUES, hint: "minutes, or off" },
+];
+
+/** The reclaim settings in effect, defaults filled in. */
+export function reclaimSettings(config: RealagyConfig): ReclaimSettings {
+	return {
+		reclaimContext: config.reclaimContext ?? DEFAULT_RECLAIM_SETTINGS.reclaimContext,
+		reclaimMinTokens: config.reclaimMinTokens ?? DEFAULT_RECLAIM_SETTINGS.reclaimMinTokens,
+		reclaimMinPercent: config.reclaimMinPercent ?? DEFAULT_RECLAIM_SETTINGS.reclaimMinPercent,
+		reclaimColdMinutes: config.reclaimColdMinutes ?? DEFAULT_RECLAIM_SETTINGS.reclaimColdMinutes,
+	};
+}
+
+/** The provider's reclaim policy for `config`; null when reclaiming is off. */
+export function reclaimPolicy(config: RealagyConfig): ReclaimPolicy | null {
+	const settings = reclaimSettings(config);
+	if (!settings.reclaimContext) return null;
+	return {
+		minBytes: settings.reclaimMinTokens * BYTES_PER_TOKEN,
+		minShare: settings.reclaimMinPercent / 100,
+		coldMs: settings.reclaimColdMinutes * 60_000,
+	};
+}
+
+/** A non-negative number from config or UI text: `10`, `"10%"`, `"5 min"`;
+ *  `"off"` is 0. Percentages above `max` are rejected. */
+function parseNonNegative(value: unknown, max = Number.POSITIVE_INFINITY): number | undefined {
+	let parsed: number | undefined;
+	if (typeof value === "number") parsed = value;
+	else if (typeof value === "string") {
+		const normalized = value.trim().toLowerCase().replace(/[,_]/g, "");
+		if (normalized === "off") parsed = 0;
+		else {
+			const match = /^(\d+(?:\.\d+)?)\s*(?:%|m|min|mins|minutes?)?$/.exec(normalized);
+			if (match) parsed = Number(match[1]);
+		}
+	}
+	return parsed !== undefined && Number.isFinite(parsed) && parsed >= 0 && parsed <= max ? parsed : undefined;
+}
+
+/** Parse one reclaim setting; undefined when the value is invalid. */
+function parseReclaimValue(key: ReclaimSettingKey, value: unknown): boolean | number | undefined {
+	switch (key) {
+		case "reclaimContext":
+			if (typeof value === "boolean") return value;
+			if (value === "true" || value === "false") return value === "true";
+			return undefined;
+		case "reclaimMinTokens":
+			return parsePositiveInt(value);
+		case "reclaimMinPercent":
+			return parseNonNegative(value, 100);
+		case "reclaimColdMinutes":
+			return parseNonNegative(value);
+	}
+}
+
+/** Copy `key` into `target` when valid and not the default. */
+function setReclaimValue(target: RealagyConfig, key: ReclaimSettingKey, value: unknown): void {
+	const parsed = parseReclaimValue(key, value);
+	if (parsed === undefined || parsed === DEFAULT_RECLAIM_SETTINGS[key]) delete target[key];
+	else (target as unknown as Record<string, unknown>)[key] = parsed;
+}
+
+/** Display text of a reclaim setting, as offered by the settings UI. */
+export function formatReclaimValue(key: ReclaimSettingKey, config: RealagyConfig): string {
+	const value = reclaimSettings(config)[key];
+	switch (key) {
+		case "reclaimContext":
+			return value ? "true" : "false";
+		case "reclaimMinTokens":
+			return (value as number).toLocaleString("en-US");
+		case "reclaimMinPercent":
+			return `${value as number}%`;
+		case "reclaimColdMinutes":
+			return value === 0 ? "off" : `${value as number} min`;
+	}
+}
+
+function formatReclaimSummary(config: RealagyConfig): string {
+	const settings = reclaimSettings(config);
+	if (!settings.reclaimContext) return "OFF";
+	const cold = settings.reclaimColdMinutes > 0 ? `, or any such amount after ${formatReclaimValue("reclaimColdMinutes", config)} idle` : "";
+	return `ON (≥ ${formatReclaimValue("reclaimMinTokens", config)} tokens and ≥ ${formatReclaimValue("reclaimMinPercent", config)} of the session${cold})`;
+}
 
 export const MODEL_DEFAULT_LABEL = "model default";
 const CUSTOM_VALUE = "__custom__";
@@ -151,6 +266,7 @@ export function normalizeRealagyConfig(raw: unknown): RealagyConfig {
 	if (contextWindowOverrides !== undefined) result.contextWindowOverrides = contextWindowOverrides;
 	if (maxOutputTokens !== undefined) result.maxOutputTokens = maxOutputTokens;
 	if (maxOutputTokensOverrides !== undefined) result.maxOutputTokensOverrides = maxOutputTokensOverrides;
+	for (const key of RECLAIM_SETTING_KEYS) setReclaimValue(result, key, record[key]);
 	return result;
 }
 
@@ -209,6 +325,7 @@ export function formatConfigSummary(config: RealagyConfig, file: string = realag
 		...Object.entries(config.maxOutputTokensOverrides ?? {}).map(
 			([modelId, limit]) => `  Pi max output tokens (${modelId}): ${formatConfigLimit(limit)}`,
 		),
+		`  Release context dropped by pi extensions: ${formatReclaimSummary(config)}`,
 	].join("\n");
 }
 
@@ -239,6 +356,9 @@ function withUpdatedSetting(current: RealagyConfig, id: string, rawValue: string
 	if (maxOutputTokens !== undefined) next.maxOutputTokens = maxOutputTokens;
 	if (current.contextWindowOverrides !== undefined) next.contextWindowOverrides = current.contextWindowOverrides;
 	if (current.maxOutputTokensOverrides !== undefined) next.maxOutputTokensOverrides = current.maxOutputTokensOverrides;
+	for (const key of RECLAIM_SETTING_KEYS) {
+		setReclaimValue(next, key, id === key ? rawValue : current[key]);
+	}
 	return next;
 }
 
@@ -544,6 +664,36 @@ export class RealagySettingsComponent implements Component, Focusable {
 		};
 		addModelLimitMenu("contextWindowOverrides", "Per-model context windows", MODEL_CONTEXT_PRESETS);
 		addModelLimitMenu("maxOutputTokensOverrides", "Per-model output tokens", MODEL_OUTPUT_PRESETS);
+		items.push(
+			{
+				id: "reclaimContext",
+				label: "Release dropped context",
+				description: "Start a fresh agy session once pi extensions (such as realctx) dropped or summarized enough of what the current one holds; false keeps sessions warm",
+				currentValue: formatReclaimValue("reclaimContext", this.#state),
+				values: ["true", "false"],
+			},
+			{
+				id: "reclaimMinTokens",
+				label: "Release: minimum tokens",
+				description: "Least dropped context, in tokens, worth re-sending the smaller transcript to a fresh session (more values in config.json)",
+				currentValue: formatReclaimValue("reclaimMinTokens", this.#state),
+				values: RECLAIM_TOKEN_VALUES,
+			},
+			{
+				id: "reclaimMinPercent",
+				label: "Release: minimum share",
+				description: "...that is also at least this share of the session's context while the prompt cache is warm (0% = tokens alone decide)",
+				currentValue: formatReclaimValue("reclaimMinPercent", this.#state),
+				values: RECLAIM_PERCENT_VALUES,
+			},
+			{
+				id: "reclaimColdMinutes",
+				label: "Release: cold cache after",
+				description: "After this long without a reply the prompt cache is cold, so the minimum tokens alone decide (off = always require the share)",
+				currentValue: formatReclaimValue("reclaimColdMinutes", this.#state),
+				values: RECLAIM_COLD_VALUES,
+			},
+		);
 
 		this.#container.addChild(new DynamicBorder());
 		this.#container.addChild({
@@ -626,6 +776,7 @@ export async function editRealagyConfigMenu(
 			`Pi max output tokens: ${formatConfigLimit(draft.maxOutputTokens)}`,
 			"Per-model context windows…",
 			"Per-model output tokens…",
+			...RECLAIM_MENU.map((entry) => `${entry.label}: ${formatReclaimValue(entry.key, draft)}`),
 			"Save and close",
 			"Cancel",
 		]);
@@ -637,6 +788,28 @@ export async function editRealagyConfigMenu(
 		}
 		if (choice.startsWith("Pi-only agent profile:")) {
 			draft = withUpdatedSetting(draft, "agentProfile", draft.agentProfile ? "false" : "true");
+			continue;
+		}
+		const reclaimEntry = RECLAIM_MENU.find((entry) => choice.startsWith(`${entry.label}: `));
+		if (reclaimEntry) {
+			if (reclaimEntry.key === "reclaimContext") {
+				draft = withUpdatedSetting(draft, "reclaimContext", reclaimSettings(draft).reclaimContext ? "false" : "true");
+				continue;
+			}
+			const picked = await ui.select(reclaimEntry.label, [...reclaimEntry.values, "Custom…", "Back"]);
+			if (picked === undefined) return undefined;
+			if (picked === "Back") continue;
+			let raw = picked;
+			if (picked === "Custom…") {
+				const typed = await ui.input(`${reclaimEntry.label} (${reclaimEntry.hint})`, formatReclaimValue(reclaimEntry.key, draft));
+				if (typed === undefined) return undefined;
+				raw = typed;
+			}
+			if (parseReclaimValue(reclaimEntry.key, raw) === undefined) {
+				ui.notify(`Enter ${reclaimEntry.hint}.`, "warning");
+				continue;
+			}
+			draft = withUpdatedSetting(draft, reclaimEntry.key, raw);
 			continue;
 		}
 

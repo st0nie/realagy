@@ -21,8 +21,11 @@ import { agyCapacityNotice } from "./acp/events.js";
 import type { BridgeResult } from "./mcp-server.js";
 import {
 	formatToolResult,
+	measureWarm,
 	planTurnFrom,
 	warmAfterTurn,
+	DEFAULT_RECLAIM_POLICY,
+	type ReclaimPolicy,
 	type TurnPlan,
 	type WarmSession,
 } from "./transcript.js";
@@ -589,7 +592,24 @@ export interface AcpSessions {
 	 *  is still running, its outcome records a warm checkpoint at `assistant`. */
 	parked?: { handle: TurnHandle };
 }
-function selectTurnPlan(context: TranscriptContext, cwd: string, sessions: AcpSessions): TurnPlan {
+/** Why a running turn is cancelled and restarted on a fresh session. */
+const RECLAIM_REASON = "pi's context manager dropped or summarized enough of this session's history to restart it on a fresh session";
+
+/** The ACP session a pi request continues, and how many bytes it holds
+ *  beyond pi's view of its prefix (`TurnPlan.hidden`). */
+interface TurnBase {
+	sessionId: string;
+	hidden: number;
+}
+
+/** Bytes a checkpoint of `sessionId` holds beyond pi's view: the turn's
+ *  `hidden` when it ran on that session, 0 when it ran on a new one (a fresh
+ *  plan, or the fallback after a lost session). */
+function heldBeyondView(base: TurnBase | undefined, sessionId: string): number {
+	return base && base.sessionId === sessionId ? base.hidden : 0;
+}
+
+function selectTurnPlan(context: TranscriptContext, cwd: string, sessions: AcpSessions, policy: Readonly<ReclaimPolicy> | null): TurnPlan {
 	const candidates: WarmSession[] = [];
 	if (sessions.warm) candidates.push(sessions.warm);
 	const history = sessions.checkpoints ?? [];
@@ -597,7 +617,7 @@ function selectTurnPlan(context: TranscriptContext, cwd: string, sessions: AcpSe
 		const item = history[i];
 		if (item && item !== sessions.warm) candidates.push(item);
 	}
-	const plan = planTurnFrom(context, cwd, candidates);
+	const plan = planTurnFrom(context, cwd, candidates, policy);
 	if (plan.kind !== "warm") return plan;
 	return { ...plan, sessionId: resolveSessionAtStep(sessions.conversationsDir?.(), plan.sessionId, plan.maxStepIdx) };
 }
@@ -608,6 +628,10 @@ export interface StreamSimpleDeps {
 	roundTrips: ToolRoundTrips;
 	sessions?: AcpSessions;
 	meter?: UsageMeter;
+	/** Live reclaim policy (`/realagy settings`); null keeps warm sessions
+	 *  however much pi's context managers dropped. Defaults to
+	 *  DEFAULT_RECLAIM_POLICY. */
+	reclaim?: () => Readonly<ReclaimPolicy> | null;
 }
 
 export function createStreamSimple(deps: StreamSimpleDeps) {
@@ -624,31 +648,37 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 	};
 	/** A settled turn's checkpoint: after it completed, or after an abort once
 	 *  agy recorded its prompt (the session keeps everything up to the cancel). */
-	const recordWarm = (targetContext: TranscriptContext, outcome: TurnOutcome, final: AssistantMessage): void => {
+	const recordWarm = (targetContext: TranscriptContext, outcome: TurnOutcome, final: AssistantMessage, base?: TurnBase): void => {
 		if (outcome.status !== "OK" || !outcome.conversationId || sessions.turnCwd === undefined) return;
 		if (outcome.aborted && outcome.promptDelivered !== true) return;
-		remember(warmAfterTurn(targetContext, final, outcome.conversationId, sessions.turnCwd, outcome.maxStepIdx), true);
+		const hidden = heldBeyondView(base, outcome.conversationId);
+		remember(warmAfterTurn(targetContext, final, outcome.conversationId, sessions.turnCwd, outcome.maxStepIdx, hidden), true);
 	};
 	/** At a pi tool call the session holds the transcript up to its toolUse
 	 *  message: an Esc during the tool still leaves a matching checkpoint. */
-	const recordStep = (targetContext: TranscriptContext, call: Extract<DriverActivity, { type: "bridge_call" }>, assistant: AssistantMessage): void => {
+	const recordStep = (targetContext: TranscriptContext, call: Extract<DriverActivity, { type: "bridge_call" }>, assistant: AssistantMessage, base?: TurnBase): void => {
 		if (!call.sessionId || sessions.turnCwd === undefined) return;
-		remember(warmAfterTurn(targetContext, assistant, call.sessionId, sessions.turnCwd, call.maxStepIdx), false);
+		const hidden = heldBeyondView(base, call.sessionId);
+		remember(warmAfterTurn(targetContext, assistant, call.sessionId, sessions.turnCwd, call.maxStepIdx, hidden), false);
 	};
 	return (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream => {
 		const stream = createAssistantMessageEventStream();
 		const blocks: BlockState = { partial: newAssistant(model), textIdx: null, thinkingIdx: null, started: false, usage: {} };
+		/** The session this call continues and the bytes it holds beyond pi's
+		 *  view of its prefix; set below, before any checkpoint is recorded. */
+		let base: TurnBase | undefined;
+		const policy = deps.reclaim ? deps.reclaim() : DEFAULT_RECLAIM_POLICY;
 		const onCompleted = (outcome: TurnOutcome, final: AssistantMessage): void => {
-			recordWarm(context, outcome, final);
+			recordWarm(context, outcome, final, base);
 		};
 		const onToolCall = (handle: TurnHandle, assistant: AssistantMessage, call: Extract<DriverActivity, { type: "bridge_call" }>): void => {
-			recordStep(context, call, assistant);
+			recordStep(context, call, assistant, base);
 			const parked = { handle };
 			sessions.parked = parked;
 			void handle.outcome.then((outcome) => {
 				if (sessions.parked !== parked) return;
 				sessions.parked = undefined;
-				recordWarm(context, outcome, assistant);
+				recordWarm(context, outcome, assistant, base);
 			});
 		};
 		void (async () => {
@@ -656,13 +686,29 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 				const results = context.messages.filter((message): message is Extract<Message, { role: "toolResult" }> =>
 					message.role === "toolResult" && deps.roundTrips.isPending(message.toolCallId),
 				);
-				for (let i = 0; i < results.length; i++) {
-					const result = results[i];
-					const trailing = i === results.length - 1 ? context.messages.slice(context.messages.lastIndexOf(result) + 1) : [];
-					const payload = formatToolResult(result, trailing);
-					deps.roundTrips.resolve(result.toolCallId, payload.text, result.isError, payload.images);
+				// The running turn's session still holds everything pi's context
+				// managers have since dropped or summarized. Past the reclaim
+				// threshold, restart on a fresh session instead of continuing it.
+				let reclaim = false;
+				const step = sessions.step;
+				if (results.length > 0 && step && !options?.signal?.aborted && deps.driver.reentry()) {
+					const measured = measureWarm(context, step, policy);
+					if (measured?.reclaim) reclaim = true;
+					else if (measured) base = { sessionId: step.sessionId, hidden: measured.hidden };
 				}
-				const active = results.length > 0 && !deps.roundTrips.hasPendingBatchCalls() ? deps.driver.reentry() : null;
+				if (reclaim) {
+					traceUsage("reclaim", { sessionId: step?.sessionId, held: step?.bytes, results: results.length });
+					deps.roundTrips.failAll(RECLAIM_REASON, { includeEscalated: true });
+					await deps.driver.cancelActive(RECLAIM_REASON);
+				} else {
+					for (let i = 0; i < results.length; i++) {
+						const result = results[i];
+						const trailing = i === results.length - 1 ? context.messages.slice(context.messages.lastIndexOf(result) + 1) : [];
+						const payload = formatToolResult(result, trailing);
+						deps.roundTrips.resolve(result.toolCallId, payload.text, result.isError, payload.images);
+					}
+				}
+				const active = !reclaim && results.length > 0 && !deps.roundTrips.hasPendingBatchCalls() ? deps.driver.reentry() : null;
 				if (active) {
 					sessions.parked = undefined;
 					await consumeTurn(stream, blocks, active, model, options, onCompleted, onToolCall, deps.meter);
@@ -698,9 +744,10 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 
 				const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 				const entry = deps.entries.find((candidate) => candidate.id === model.id);
-				const plan = selectTurnPlan(context, cwd, sessions);
+				const plan = selectTurnPlan(context, cwd, sessions, policy);
+				base = plan.kind === "warm" ? { sessionId: plan.sessionId, hidden: plan.hidden } : undefined;
 				traceUsage("plan", plan.kind === "warm"
-					? { kind: plan.kind, sessionId: plan.sessionId, deltaMessages: plan.deltaMessages, delta: plan.input.contextBlock ? "transcript" : "user", parts: plan.input.parts?.length ?? 0 }
+					? { kind: plan.kind, sessionId: plan.sessionId, deltaMessages: plan.deltaMessages, delta: plan.input.contextBlock ? "transcript" : "user", parts: plan.input.parts?.length ?? 0, hidden: plan.hidden }
 					: { kind: plan.kind, reason: plan.reason, messages: context.messages.length, parts: plan.input.parts?.length ?? 0 });
 				// Unknown until this turn reaches a tool boundary or settles.
 				sessions.warm = undefined;

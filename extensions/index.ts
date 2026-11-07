@@ -23,6 +23,8 @@ import {
 	formatConfigSummary,
 	loadRealagyConfig,
 	realagyConfigPath,
+	RECLAIM_SETTING_KEYS,
+	reclaimPolicy,
 	RealagySettingsComponent,
 	saveRealagyConfig,
 	type RealagyConfig,
@@ -159,7 +161,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	};
 	const meter = new UsageMeter();
 	let ready = false;
-	const streamSimple = createStreamSimple({ entries, driver, roundTrips, sessions, meter });
+	const streamSimple = createStreamSimple({ entries, driver, roundTrips, sessions, meter, reclaim: () => reclaimPolicy(config) });
 	const registerModels = () => {
 		// Sign-in belongs to the agy CLI. Ambient-only auth (no `login`) means pi
 		// never prompts for or stores a key; the provider counts as configured
@@ -324,7 +326,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		description: "Antigravity: /realagy settings, /realagy setup, or /realagy usage",
 		getArgumentCompletions: (prefix) => {
 			const items = [
-				{ value: "settings", label: "settings", description: "Configure compaction bypass, agent profile, and Pi token limits" },
+				{ value: "settings", label: "settings", description: "Configure compaction bypass, agent profile, Pi token limits, and context release" },
 				{ value: "setup", label: "setup", description: "Check agy and show how to install it or sign in" },
 				{ value: "usage", label: "usage", description: "Cache hits and plan quota" },
 			];
@@ -376,6 +378,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 					config.agentProfile !== before.agentProfile ||
 					config.contextWindow !== before.contextWindow ||
 					config.maxOutputTokens !== before.maxOutputTokens ||
+					RECLAIM_SETTING_KEYS.some((key) => config[key] !== before[key]) ||
 					modelLimitsChanged;
 				if (!changed) return;
 				const restartAgy =

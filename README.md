@@ -34,7 +34,7 @@ The catalog comes live from agy and depends on the account.
 | Command | What it does |
 | --- | --- |
 | `/realagy` | Open an interactive Settings / Usage / Setup menu (cancel returns without running a command) |
-| `/realagy settings` | Configure Agy auto-compaction bypass, Pi-only agent profile, and optional Pi token-limit overrides (`~/.pi/agent/realagy/config.json`) |
+| `/realagy settings` | Configure Agy auto-compaction bypass, Pi-only agent profile, optional Pi token-limit overrides, and when dropped context is released (`~/.pi/agent/realagy/config.json`) |
 | `/realagy setup` | Checks agy: shows install steps when it is missing, sign-in steps when it cannot start a session, and reloads the model catalog when it is ready |
 | `/realagy usage` | Cache-hit rate for this session plus every quota group's 5-hour and weekly remaining share and reset times (from the live `agy acp` server, or `agy --print /usage`) |
 
@@ -88,7 +88,7 @@ By default, realagy unlocks Antigravity's full context window so Pi manages comp
 
 Out of the box (`noAutoCompaction: true`), realagy starts an embedded loopback Cloud Code reverse proxy and passes `--cloud_code_endpoint http://127.0.0.1:<port>` to `agy acp`. Only `fetchAvailableModels` is buffered: realagy captures each model's upstream `maxTokens` and `maxOutputTokens` for Pi, disables every `CASCADE_USE_EXPERIMENT_CHECKPOINTER*` configuration, and raises the catalog `maxTokens` clamp so Agy does not run local automatic compaction prematurely. Generation, authentication, quota calls, and streaming RPCs pass through unchanged. Existing `HTTP_PROXY` / `HTTPS_PROXY` and `NO_PROXY` settings are honored; no TLS CA, mitmproxy, or system proxy change is needed.
 
-Run `/realagy settings` (or edit `~/.pi/agent/realagy/config.json`) to toggle the compaction bypass (`noAutoCompaction`), toggle the Pi-only agent profile (`agentProfile`), or override Pi's reported global `contextWindow` and `maxOutputTokens`. Changes save atomically and apply without restarting Pi: model metadata refreshes immediately, and process-level changes (`noAutoCompaction` or `agentProfile`) restart `agy acp` cleanly for the next turn while preserving remembered sessions.
+Run `/realagy settings` (or edit `~/.pi/agent/realagy/config.json`) to toggle the compaction bypass (`noAutoCompaction`), toggle the Pi-only agent profile (`agentProfile`), override Pi's reported global `contextWindow` and `maxOutputTokens`, or tune when context dropped by pi extensions is released (`reclaimContext`, `reclaimMinTokens`, `reclaimMinPercent`, `reclaimColdMinutes`; see the table below). Changes save atomically and apply without restarting Pi: model metadata refreshes immediately, and process-level changes (`noAutoCompaction` or `agentProfile`) restart `agy acp` cleanly for the next turn while preserving remembered sessions.
 
 For model-specific limits, open `/realagy settings` and choose **Per-model context windows** or **Per-model output tokens**. Each submenu lists the available models with either its override or `inherit global`; select a model to choose a preset, enter a custom positive integer, or restore inheritance. The main settings list shows only the two submenu entries and their override counts. RPC hosts expose the same two submenus. Changes are stored in `contextWindowOverrides` and `maxOutputTokensOverrides`, whose keys are exact, case-sensitive Pi model IDs shown after `antigravity/` in `/model` (without the provider prefix); one entry covers every thinking tier grouped into that Pi model. A matching per-model value takes precedence over its corresponding global `contextWindow` or `maxOutputTokens`; models without an entry use the global value, then the upstream catalog or family default. The equivalent JSON configuration is:
 
@@ -120,6 +120,10 @@ The bypass does not increase real server-side model limits; when a conversation 
 | `contextWindowOverrides` | *(none)* | Optional map of exact Pi model IDs to positive-integer context windows; each match takes precedence over `contextWindow` |
 | `maxOutputTokens` | *(model default)* | Optional positive integer overriding the output limit reported to Pi for all models |
 | `maxOutputTokensOverrides` | *(none)* | Optional map of exact Pi model IDs to positive-integer output limits; each match takes precedence over `maxOutputTokens` |
+| `reclaimContext` | `true` | Start a fresh agy session once pi extensions such as realctx dropped or summarized enough of what the current one holds (agy otherwise keeps the full text, so their savings never reach the model); `false` keeps warm sessions |
+| `reclaimMinTokens` | `8000` | Least dropped context, in tokens, worth re-sending the smaller transcript to a fresh session |
+| `reclaimMinPercent` | `10` | ...that is also at least this percentage (0-100) of the session's context while the prompt cache is warm |
+| `reclaimColdMinutes` | `5` | After this many minutes without a reply the prompt cache is cold, so `reclaimMinTokens` alone decides; `0` turns this off |
 
 | Environment | Effect |
 | --- | --- |
