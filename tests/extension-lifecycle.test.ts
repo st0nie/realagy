@@ -158,7 +158,7 @@ describe("extension session lifecycle", () => {
 		const agy = session.commands.get("agy");
 		expect([...session.commands.keys()]).toEqual(["agy"]);
 		expect(agy.getArgumentCompletions("u")).toEqual([{ value: "usage", label: "usage", description: "Cache hits and plan quota" }]);
-		expect(agy.getArgumentCompletions("").map((item: { value: string }) => item.value)).toEqual(["setup", "usage"]);
+		expect(agy.getArgumentCompletions("").map((item: { value: string }) => item.value)).toEqual(["settings", "setup", "usage"]);
 		expect(agy.getArgumentCompletions("x")).toBeNull();
 		await vi.waitFor(() => expect(mocks.listModels).toHaveBeenCalled());
 		const pending = agy.handler("usage", session.ctx);

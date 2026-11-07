@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { entriesFromAcpModels, FALLBACK_MODELS, reportedModelLimits, toAgyEffort, toPiModel } from "../src/models.js";
+import { entriesFromAcpModels, FALLBACK_MODELS, toAgyEffort, toPiModel } from "../src/models.js";
 
 const LIVE = [
 	{ modelId: "gemini-4-argon-medium", name: "Gemini 4 Argon (Medium)" },
@@ -45,15 +45,6 @@ test("Pi window and output metadata are independent editable overrides", () => {
 	assert.equal(gpt.reasoning, true);
 	assert.deepEqual(gpt.thinkingLevelMap, { off: null, minimal: null, low: null, high: null });
 	assert.equal(toAgyEffort("high", entries.find((entry) => entry.id === "gpt-oss-120b")!.efforts!), "medium");
-	assert.deepEqual(reportedModelLimits({}), { contextWindow: 256_000, maxTokens: 64_000 });
-	assert.deepEqual(reportedModelLimits({ REALAGY_CONTEXT_WINDOW: "100000", REALAGY_MAX_OUTPUT_TOKENS: "32000" }), {
-		contextWindow: 100_000,
-		maxTokens: 32_000,
-	});
-	assert.deepEqual(reportedModelLimits({ REALAGY_CONTEXT_WINDOW: "bad", REALAGY_MAX_OUTPUT_TOKENS: "-1" }), {
-		contextWindow: 256_000,
-		maxTokens: 64_000,
-	});
 });
 
 test("unknown families remain exact-slug fixed models and noise is rejected", () => {
