@@ -56,10 +56,31 @@ With `REALAGY_AGY_PROFILE=0` (or when the profile cannot be written) agy keeps i
 - If agy cannot start or exits mid-turn, the turn fails with the binary path, the exit code, and agy's last error line. The next prompt starts it again. A turn with no output for 5 minutes is stopped, unless one of agy's own tools is still running.
 - After `/reload`, `pi -c`, or `/tree`, realagy resumes the matching Antigravity session. If agy's copy of that conversation is gone, the next prompt starts a new session with the full pi transcript.
 
+## Pi limits and agy compaction
+
+Pi's model metadata and agy's compaction bypass are independent settings. Every model
+is reported to pi with a 256,000-token context window and 64,000-token output limit by
+default; both values can be changed without enabling the proxy. Restart pi after
+changing any of these environment settings.
+
+With `REALAGY_NO_COMPACT=1`, realagy starts an embedded loopback reverse proxy and
+starts agy with its `--cloud_code_endpoint` pointing there. Only the model catalog is
+buffered: realagy disables each checkpointer experiment and defeats its token-limit
+clamps. Generation, authentication, quota calls, and streaming RPCs pass through the
+same proxy without content changes. Existing `HTTP_PROXY` / `HTTPS_PROXY` and `NO_PROXY`
+settings are honored; no CA, mitmproxy, or system proxy change is needed.
+
+The bypass does not increase real server-side model limits. When a conversation reaches
+the actual limit, the request fails instead of agy automatically summarizing it. The
+Pi-reported window and output settings do not change those real limits either.
+
 | Environment | Effect |
 | --- | --- |
 | `AGY_BIN` | Path to the `agy` binary |
 | `GEMINI_HOME` | agy's data root (default `~/.gemini`) |
+| `REALAGY_CONTEXT_WINDOW` | Context window reported to pi for every model (default `256000`) |
+| `REALAGY_MAX_OUTPUT_TOKENS` | Output limit reported to pi for every model (default `64000`) |
+| `REALAGY_NO_COMPACT` | `1` enables the embedded proxy and disables agy's local automatic compaction (default off) |
 | `REALAGY_AGY_PROFILE` | `0` keeps agy's default agent (its own prompt and tools) instead of realagy's profile |
 | `REALAGY_TRACE_USAGE` | `1` or an absolute path: log turn plans and token counts (no content) to `~/.pi/agent/realagy/usage-trace.jsonl` |
 
@@ -70,12 +91,13 @@ With `REALAGY_AGY_PROFILE=0` (or when the profile cannot be written) agy keeps i
 | `extensions/index.ts` | Composition root: pi MCP bridge, `antigravity/*` models, agy discovery, `/agy setup`, `/agy usage` |
 | `src/provider.ts` | pi assistant event stream, MCP → `toolUse` → `toolResult` round-trips, usage mapping |
 | `src/transcript.ts` | Transcript serialization, fingerprints, warm-session turn planning across checkpoints |
-| `src/models.ts` | ACP model catalog parsing, effort grouping, family limits, offline fallback catalog |
+| `src/models.ts` | ACP model catalog parsing, effort grouping, independent Pi-reported limits, offline fallback catalog |
 | `src/mcp-server.ts`, `src/bridge-catalog.ts` | Loopback, token-protected MCP server for pi's tools (every tool an extension may activate; only active ones run) |
 | `src/tool-loadout.ts` | Undoes the situational tools pi's `/tree` restore activates |
 | `src/quota.ts`, `src/usage-trace.ts` | Cache/quota meter, quota-exhaustion notice, usage diagnostics |
 | `src/acp/setup.ts` | Finding `agy` and its data dir |
 | `src/acp/connection.ts`, `driver.ts`, `events.ts`, `jsonrpc.ts` | `agy acp` process, ACP protocol, serialized turns, frame mapping |
+| `src/acp/catalog-proxy.ts` | Optional loopback Cloud Code proxy, catalog compaction rewrite, upstream proxy support |
 | `src/acp/step-usage.ts` | Exact per-model-call tokens from agy's conversation store, and `/tree` forks of it |
 | `src/agent-profile.ts`, `src/tool-policy.ts` | agy's custom agent profile (realagy's system prompt, eager pi tools) and the tool policy appended to it |
 | `src/native-tools.ts`, `src/acp/background.ts`, `src/background-card.ts` | Thinking lines and the live panel for agy's own tool calls; finished background work as a conversation card that wakes pi's agent |
@@ -95,4 +117,4 @@ npm run smoke:pi       # load the extension through pi's real loader
 
 ## Protocol note
 
-agy offers third-party models only to clients it recognizes, so realagy declares `clientInfo.name = "zed"` to get the same Claude/GPT catalog Zed sees. Sign-in, quotas, and generation all still go through Google's official agy CLI. realagy does not call private endpoints or bypass quota checks.
+agy offers third-party models only to clients it recognizes, so realagy declares `clientInfo.name = "zed"` to get the same Claude/GPT catalog Zed sees. Sign-in, quotas, and generation all still go through Google's official agy CLI and Cloud Code endpoint. The optional loopback proxy forwards that same traffic and never bypasses quota checks.

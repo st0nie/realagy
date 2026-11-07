@@ -32,6 +32,7 @@ import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { BackgroundMessages, type BackgroundItem, type BackgroundNotice } from "./background.js";
 import { AcpConnection, type AcpExitInfo, type AcpMcpServer } from "./connection.js";
+import { CatalogProxy } from "./catalog-proxy.js";
 import { isAgyRetryNotice, mapStopReason, mapUpdate, TextAccumulator, type AcpEditDiff } from "./events.js";
 import { conversationDbPath, lastStepIdx, readStepState, siblingUsage, summarizeSteps, userInputSince, type StepTokens, type StepUsage } from "./step-usage.js";
 import { nativeToolLabel, nativeToolTarget, PI_BRIDGE_SERVER, type NativeToolEvent } from "../native-tools.js";
@@ -48,8 +49,14 @@ export interface AcpDriverOptions {
 	/** agy binary. A function is resolved per spawn, so `/agy setup` can
 	 *  point the next spawn at a newly found binary. */
 	bin: string | (() => string);
-	/** argv for the binary (tests: the fake-server script). Default `acp`. */
+	/** argv for the binary (tests: the fake-server script). Default `acp`.
+	 * Explicit args also disable the real-Agy catalog proxy. */
 	binArgs?: string[];
+	/** Rewrite Agy's catalog through a loopback proxy to disable its local
+	 * automatic checkpointer. Default false: keep Agy's normal limits. */
+	noAutoCompaction?: boolean;
+	/** Cloud Code origin used by the proxy (tests may use a local HTTP server). */
+	cloudCodeUpstream?: string;
 	extraEnv?: Record<string, string>;
 	/** Bridge registration for every session/new, resume, and load. */
 	mcpServers?: () => AcpMcpServer[];
@@ -157,6 +164,8 @@ export class AcpDriver implements TurnDriver {
 	#liveSessions = new Set<string>();
 	/** Watches agy's brain directory for background work (created lazily). */
 	#background: BackgroundMessages | undefined;
+	/** Shared by real Agy respawns while noAutoCompaction is enabled. */
+	#catalogProxy: CatalogProxy | undefined;
 
 	constructor(opts: AcpDriverOptions) {
 		this.#opts = opts;
@@ -685,42 +694,59 @@ export class AcpDriver implements TurnDriver {
 	#ensureConnection(cwd: string): Promise<AcpConnection> {
 		if (this.#starting) return this.#starting;
 		if (this.#conn?.alive) return Promise.resolve(this.#conn);
+		const starting = this.#startConnection(cwd);
+		this.#starting = starting;
+		const clear = (): void => {
+			if (this.#starting === starting) this.#starting = undefined;
+		};
+		void starting.then(clear, clear);
+		return starting;
+	}
+
+	async #startConnection(cwd: string): Promise<AcpConnection> {
 		const bin = typeof this.#opts.bin === "function" ? this.#opts.bin() : this.#opts.bin;
 		const agent = this.#resolveAgent();
-		const conn: AcpConnection = new AcpConnection({
-			bin,
-			binArgs: this.#opts.binArgs,
-			agent,
-			extraEnv: this.#opts.extraEnv,
-			cwd,
-			mcpServers: this.#opts.mcpServers,
-			log: (msg, data) => this.#log(msg, data),
-			systemPrompt: this.#opts.systemPrompt,
-			// Fail-closed: only skipPermissions turns approve agy's requests.
-			permissions: () => (this.#active?.request.skipPermissions ? "auto" : "deny"),
-			onUpdate: (sessionId, update) => this.#onConnectionUpdate(conn, sessionId, update),
-			onExit: (info) => this.#onConnectionExit(conn, info),
-		});
-		this.#conn = conn;
-		this.#liveSessions.clear();
-		this.#log("spawn", { bin, agent: agent ?? null });
-		const starting = conn.start().then(
-			() => {
-				if (this.#starting === starting) this.#starting = undefined;
-				return conn;
-			},
-			(err: unknown) => {
-				if (this.#starting === starting) this.#starting = undefined;
-				// A server that spawned but failed the handshake must not leak:
-				// it runs in its own process group and would outlive pi.
+		let conn: AcpConnection | undefined;
+		try {
+			let binArgs = this.#opts.binArgs;
+			if (!binArgs && this.#opts.noAutoCompaction) {
+				this.#catalogProxy ??= new CatalogProxy({
+					upstream: this.#opts.cloudCodeUpstream,
+					env: { ...process.env, ...this.#opts.extraEnv },
+					log: (msg, data) => this.#log(msg, data),
+				});
+				const endpoint = await this.#catalogProxy.start();
+				binArgs = ["acp", "--cloud_code_endpoint", endpoint];
+			}
+			conn = new AcpConnection({
+				bin,
+				binArgs,
+				agent,
+				extraEnv: this.#opts.extraEnv,
+				cwd,
+				mcpServers: this.#opts.mcpServers,
+				log: (msg, data) => this.#log(msg, data),
+				systemPrompt: this.#opts.systemPrompt,
+				// Fail-closed: only skipPermissions turns approve agy's requests.
+				permissions: () => (this.#active?.request.skipPermissions ? "auto" : "deny"),
+				onUpdate: (sessionId, update) => this.#onConnectionUpdate(conn!, sessionId, update),
+				onExit: (info) => this.#onConnectionExit(conn!, info),
+			});
+			this.#conn = conn;
+			this.#liveSessions.clear();
+			this.#log("spawn", { bin, agent: agent ?? null, noAutoCompaction: this.#opts.noAutoCompaction === true });
+			await conn.start();
+			return conn;
+		} catch (err) {
+			// A server that spawned but failed the handshake must not leak:
+			// it runs in its own process group and would outlive pi.
+			if (conn) {
 				if (this.#conn === conn) this.#conn = undefined;
 				conn.kill();
-				this.#log("start-failed", { message: describe(err) });
-				throw new Error(`Cannot start the Antigravity CLI (${bin}): ${describe(err)}. Run /agy setup.`);
-			},
-		);
-		this.#starting = starting;
-		return starting;
+			}
+			this.#log("start-failed", { message: describe(err) });
+			throw new Error(`Cannot start the Antigravity CLI (${bin}): ${describe(err)}. Run /agy setup.`);
+		}
 	}
 
 	/** Abort: ACP cancel once the prompt runs (process and session survive);
@@ -904,6 +930,9 @@ export class AcpDriver implements TurnDriver {
 		conn?.kill();
 		this.#background?.close();
 		this.#background = undefined;
+		const catalogProxy = this.#catalogProxy;
+		this.#catalogProxy = undefined;
+		await catalogProxy?.close();
 	}
 }
 
