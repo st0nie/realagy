@@ -67,7 +67,23 @@ By default, realagy unlocks Antigravity's full context window so Pi manages comp
 
 Out of the box (`noAutoCompaction: true`), realagy starts an embedded loopback Cloud Code reverse proxy and passes `--cloud_code_endpoint http://127.0.0.1:<port>` to `agy acp`. Only `fetchAvailableModels` is buffered: realagy captures each model's upstream `maxTokens` and `maxOutputTokens` for Pi, disables every `CASCADE_USE_EXPERIMENT_CHECKPOINTER*` configuration, and raises the catalog `maxTokens` clamp so Agy does not run local automatic compaction prematurely. Generation, authentication, quota calls, and streaming RPCs pass through unchanged. Existing `HTTP_PROXY` / `HTTPS_PROXY` and `NO_PROXY` settings are honored; no TLS CA, mitmproxy, or system proxy change is needed.
 
-Run `/realagy settings` (or edit `~/.pi/agent/realagy/config.json`) to toggle the compaction bypass (`noAutoCompaction`), toggle the Pi-only agent profile (`agentProfile`), or override Pi's reported `contextWindow` and `maxOutputTokens`. Changes save atomically and apply without restarting Pi: model metadata refreshes immediately, and process-level changes (`noAutoCompaction` or `agentProfile`) restart `agy acp` cleanly for the next turn while preserving remembered sessions.
+Run `/realagy settings` (or edit `~/.pi/agent/realagy/config.json`) to toggle the compaction bypass (`noAutoCompaction`), toggle the Pi-only agent profile (`agentProfile`), or override Pi's reported global `contextWindow` and `maxOutputTokens`. Changes save atomically and apply without restarting Pi: model metadata refreshes immediately, and process-level changes (`noAutoCompaction` or `agentProfile`) restart `agy acp` cleanly for the next turn while preserving remembered sessions.
+
+For a model-specific context window, add `contextWindowOverrides` to `config.json`. Its keys are exact, case-sensitive Pi model IDs shown after `antigravity/` in `/model` (without the provider prefix); one entry covers every thinking tier grouped into that Pi model. A matching per-model value takes precedence over the global `contextWindow`; models without an entry use the global value, then the upstream catalog or family default. The settings menu continues to edit the global values and preserves this map. For example:
+
+```json
+{
+  "noAutoCompaction": true,
+  "agentProfile": true,
+  "contextWindow": 512000,
+  "contextWindowOverrides": {
+    "gemini-3-8-flash": 1048576,
+    "claude-sonnet-5-5": 200000
+  }
+}
+```
+
+Here Gemini 3.8 Flash reports 1,048,576 tokens, Claude Sonnet 5.5 reports 200,000, and every other model reports 512,000. Omitting `contextWindow` would leave those other models at their catalog or family defaults. These overrides affect only metadata reported to Pi, not Agy's real server-side limits or `maxOutputTokens`.
 
 The bypass does not increase real server-side model limits; when a conversation exceeds the upstream window without Pi compaction, the request fails rather than triggering Agy's local summary.
 
@@ -76,6 +92,7 @@ The bypass does not increase real server-side model limits; when a conversation 
 | `noAutoCompaction` | `true` | Enable the loopback catalog proxy and disable Agy's local automatic compaction |
 | `agentProfile` | `true` | Run Agy with realagy's hidden Pi-only agent profile (`false` keeps Agy's default agent) |
 | `contextWindow` | *(model default)* | Optional positive integer overriding the context window reported to Pi for all models |
+| `contextWindowOverrides` | *(none)* | Optional map of exact Pi model IDs to positive-integer context windows; each match takes precedence over `contextWindow` |
 | `maxOutputTokens` | *(model default)* | Optional positive integer overriding the output limit reported to Pi for all models |
 
 | Environment | Effect |

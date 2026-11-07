@@ -87,6 +87,15 @@ export function parsePositiveInt(value: unknown): number | undefined {
 	return undefined;
 }
 
+function normalizeContextWindowOverrides(value: unknown): Record<string, number> | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const entries = Object.entries(value).flatMap(([modelId, rawLimit]) => {
+		const limit = parsePositiveInt(rawLimit);
+		return modelId.length > 0 && limit !== undefined ? [[modelId, limit] as const] : [];
+	});
+	return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
 function parseLimitChoice(value: string): number | undefined {
 	const trimmed = value.trim().toLowerCase();
 	if (trimmed === "" || trimmed === "model" || trimmed === "default" || trimmed === MODEL_DEFAULT_LABEL) {
@@ -106,9 +115,11 @@ export function normalizeRealagyConfig(raw: unknown): RealagyConfig {
 		? record.agentProfile
 		: DEFAULT_REALAGY_CONFIG.agentProfile;
 	const contextWindow = parsePositiveInt(record.contextWindow);
+	const contextWindowOverrides = normalizeContextWindowOverrides(record.contextWindowOverrides);
 	const maxOutputTokens = parsePositiveInt(record.maxOutputTokens);
 	const result: RealagyConfig = { noAutoCompaction, agentProfile };
 	if (contextWindow !== undefined) result.contextWindow = contextWindow;
+	if (contextWindowOverrides !== undefined) result.contextWindowOverrides = contextWindowOverrides;
 	if (maxOutputTokens !== undefined) result.maxOutputTokens = maxOutputTokens;
 	return result;
 }
@@ -150,6 +161,9 @@ export function formatConfigSummary(config: RealagyConfig, file: string = realag
 		`  Bypass Agy auto-compaction: ${config.noAutoCompaction ? "ON" : "OFF"}`,
 		`  Pi-only agent profile: ${config.agentProfile ? "ON" : "OFF"}`,
 		`  Pi context window: ${formatConfigLimit(config.contextWindow)}`,
+		...Object.entries(config.contextWindowOverrides ?? {}).map(
+			([modelId, limit]) => `  Pi context window (${modelId}): ${formatConfigLimit(limit)}`,
+		),
 		`  Pi max output tokens: ${formatConfigLimit(config.maxOutputTokens)}`,
 	].join("\n");
 }
@@ -166,6 +180,7 @@ function withUpdatedSetting(current: RealagyConfig, id: string, rawValue: string
 	const next: RealagyConfig = { noAutoCompaction, agentProfile };
 	if (contextWindow !== undefined) next.contextWindow = contextWindow;
 	if (maxOutputTokens !== undefined) next.maxOutputTokens = maxOutputTokens;
+	if (current.contextWindowOverrides !== undefined) next.contextWindowOverrides = current.contextWindowOverrides;
 	return next;
 }
 
@@ -329,7 +344,7 @@ export class RealagySettingsComponent implements Component, Focusable {
 			{
 				id: "contextWindow",
 				label: "Pi context window",
-				description: "Reported to Pi for planning/compaction; model default follows each model's real window (1M Gemini/Claude, 128k GPT-OSS)",
+				description: "Global fallback reported to Pi for planning/compaction; exact per-model overrides in config.json take precedence",
 				currentValue: formatConfigLimit(this.#state.contextWindow),
 				submenu: (currentValue, done) =>
 					new LimitSubmenu({

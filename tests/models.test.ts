@@ -63,6 +63,26 @@ test("Pi models follow each model's real window by default and honor optional co
 	assert.deepEqual(familyLimits("gemini-4-argon"), { contextWindow: 1_048_576, maxTokens: 65_536 });
 });
 
+test("per-model context windows take precedence over the global fallback with exact Pi ID matching", () => {
+	const entries = entriesFromAcpModels(LIVE);
+	const argon = entries.find((entry) => entry.id === "gemini-4-argon")!;
+	const claude = entries.find((entry) => entry.id === "claude-sonnet-5-5")!;
+	const overrides = {
+		contextWindow: 512_000,
+		contextWindowOverrides: { "gemini-4-argon": 900_000 },
+	};
+
+	assert.equal(toPiModel(argon, overrides).contextWindow, 900_000);
+	assert.equal(toPiModel(argon, overrides).maxTokens, 65_536);
+	assert.equal(toPiModel(claude, overrides).contextWindow, 512_000);
+	assert.equal(toPiModel(claude, overrides).maxTokens, 128_000);
+
+	// Matching is case-sensitive and uses the grouped Pi ID, not an ACP tier ID.
+	assert.equal(toPiModel(argon, { contextWindowOverrides: { "Gemini-4-argon": 800_000 } }).contextWindow, 1_048_576);
+	assert.equal(toPiModel(argon, { contextWindowOverrides: { "gemini-4-argon-high": 800_000 } }).contextWindow, 1_048_576);
+	assert.equal(toPiModel(argon, { contextWindowOverrides: { "gemini-4-argon": 800_000 } }).contextWindow, 800_000);
+});
+
 test("unknown families remain exact-slug fixed models and noise is rejected", () => {
 	const entries = entriesFromAcpModels([
 		{ modelId: "Available models:" },

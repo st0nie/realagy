@@ -128,7 +128,10 @@ export function familyLimits(full: string): { contextWindow: number; maxTokens: 
 /** Optional Pi-side metadata overrides from ~/.pi/agent/realagy/config.json.
  * Omitted fields follow each model's real context window and output limit. */
 export interface ModelLimitOverrides {
+	/** Global fallback for models without a per-model override. */
 	contextWindow?: number;
+	/** Exact Pi model ID to context window; takes precedence over the global value. */
+	contextWindowOverrides?: Record<string, number>;
 	maxOutputTokens?: number;
 }
 
@@ -141,6 +144,8 @@ function familyInput(full: string): Array<"text" | "image"> {
 export function toPiModel(entry: AgyModelEntry, overrides?: ModelLimitOverrides): Model<Api> {
 	const effortDriven = !!entry.efforts?.length;
 	const defaults = familyLimits(entry.full);
+	const perModel = overrides?.contextWindowOverrides;
+	const contextWindow = perModel && Object.hasOwn(perModel, entry.id) ? perModel[entry.id] : undefined;
 	return {
 		id: entry.id,
 		name: entry.name ?? entry.full,
@@ -151,7 +156,7 @@ export function toPiModel(entry: AgyModelEntry, overrides?: ModelLimitOverrides)
 		...(effortDriven ? { thinkingLevelMap: thinkingLevelMapFor(entry.efforts!) } : {}),
 		input: familyInput(entry.full),
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: overrides?.contextWindow ?? entry.contextWindow ?? defaults.contextWindow,
+		contextWindow: contextWindow ?? overrides?.contextWindow ?? entry.contextWindow ?? defaults.contextWindow,
 		maxTokens: overrides?.maxOutputTokens ?? entry.maxTokens ?? defaults.maxTokens,
 	};
 }

@@ -40,6 +40,7 @@ test("config defaults enable compaction bypass and agent profile with model-defa
 				noAutoCompaction: false,
 				agentProfile: false,
 				contextWindow: 256_000,
+				contextWindowOverrides: { "gemini-4-argon": 900_000 },
 				maxOutputTokens: 32_000,
 			},
 			file,
@@ -48,6 +49,7 @@ test("config defaults enable compaction bypass and agent profile with model-defa
 			noAutoCompaction: false,
 			agentProfile: false,
 			contextWindow: 256_000,
+			contextWindowOverrides: { "gemini-4-argon": 900_000 },
 			maxOutputTokens: 32_000,
 		});
 		assert.deepEqual(loadRealagyConfig(file), saved);
@@ -68,12 +70,23 @@ test("config defaults enable compaction bypass and agent profile with model-defa
 				noAutoCompaction: "bad",
 				agentProfile: false,
 				contextWindow: "500,000",
+				contextWindowOverrides: {
+					"gemini-4-argon": "900,000",
+					"claude-sonnet-5-5": 200_000,
+					"invalid-zero": 0,
+					"invalid-type": false,
+					"": 100_000,
+				},
 				maxOutputTokens: -5,
 			}),
 			{
 				noAutoCompaction: true,
 				agentProfile: false,
 				contextWindow: 500_000,
+				contextWindowOverrides: {
+					"gemini-4-argon": 900_000,
+					"claude-sonnet-5-5": 200_000,
+				},
 			},
 		);
 		assert.equal(parsePositiveInt("1_048_576"), 1_048_576);
@@ -81,6 +94,9 @@ test("config defaults enable compaction bypass and agent profile with model-defa
 		assert.equal(formatConfigLimit(undefined), MODEL_DEFAULT_LABEL);
 		assert.equal(formatConfigLimit(1_048_576), "1,048,576");
 		assert.match(formatConfigSummary(DEFAULT_REALAGY_CONFIG, file), /Pi context window: model default/);
+		assert.match(formatConfigSummary(saved, file), /Pi context window \(gemini-4-argon\): 900,000/);
+		assert.equal(normalizeRealagyConfig({ contextWindowOverrides: {} }).contextWindowOverrides, undefined);
+		assert.equal(normalizeRealagyConfig({ contextWindowOverrides: [] }).contextWindowOverrides, undefined);
 	} finally {
 		fs.rmSync(directory, { recursive: true, force: true });
 	}
@@ -100,7 +116,7 @@ test("RealagySettingsComponent renders TUI list, toggles booleans, edits custom 
 	const component = new RealagySettingsComponent({
 		tui,
 		theme,
-		config: { ...DEFAULT_REALAGY_CONFIG },
+		config: { ...DEFAULT_REALAGY_CONFIG, contextWindowOverrides: { "gemini-4-argon": 900_000 } },
 		configPath: "/tmp/realagy/config.json",
 		onChange: (next) => changes.push(next),
 		onClose: () => { closed = true; },
@@ -141,6 +157,7 @@ test("RealagySettingsComponent renders TUI list, toggles booleans, edits custom 
 	for (const ch of "300000") component.handleInput(ch);
 	component.handleInput("\r");
 	assert.equal(changes.at(-1)?.contextWindow, 300_000);
+	assert.deepEqual(changes.at(-1)?.contextWindowOverrides, { "gemini-4-argon": 900_000 });
 
 	// Reopen contextWindow submenu and pick "model default" (index 0) after moving up to row 0.
 	component.handleInput("\r");
@@ -156,11 +173,12 @@ test("RealagySettingsComponent renders TUI list, toggles booleans, edits custom 
 
 test("fallback menu edits all four settings, resets limits to model default, and cancels cleanly", async () => {
 	const ui = menuUi([0, 1, 2, 3, 4], ["300000", "32000"]);
-	const result = await editRealagyConfigMenu(ui, DEFAULT_REALAGY_CONFIG);
+	const result = await editRealagyConfigMenu(ui, { ...DEFAULT_REALAGY_CONFIG, contextWindowOverrides: { "gemini-4-argon": 900_000 } });
 	assert.deepEqual(result, {
 		noAutoCompaction: false,
 		agentProfile: false,
 		contextWindow: 300_000,
+		contextWindowOverrides: { "gemini-4-argon": 900_000 },
 		maxOutputTokens: 32_000,
 	});
 	assert.equal(ui.messages.length, 0);
@@ -169,6 +187,7 @@ test("fallback menu edits all four settings, resets limits to model default, and
 	const resetResult = await editRealagyConfigMenu(resetUi, result!);
 	assert.deepEqual(resetResult, {
 		noAutoCompaction: false,
+		contextWindowOverrides: { "gemini-4-argon": 900_000 },
 		agentProfile: false,
 		maxOutputTokens: 32_000,
 	});

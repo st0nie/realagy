@@ -53,8 +53,16 @@ type FakeTool = { name: string; description?: string; exposure?: string; paramet
 
 let tempAgentDirs: string[] = [];
 
-async function start(tools: { all: FakeTool[]; active: string[] } = { all: [], active: [] }) {
+async function start(
+	tools: { all: FakeTool[]; active: string[] } = { all: [], active: [] },
+	config?: Record<string, unknown>,
+) {
 	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-ext-agent-"));
+	if (config) {
+		const configFile = path.join(agentDir, "realagy", "config.json");
+		fs.mkdirSync(path.dirname(configFile), { recursive: true });
+		fs.writeFileSync(configFile, JSON.stringify(config));
+	}
 	tempAgentDirs.push(agentDir);
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	const handlers = new Map<string, (...args: any[]) => void>();
@@ -227,6 +235,42 @@ describe("extension session lifecycle", () => {
 		mocks.listModels.mockResolvedValue([{ modelId: "gemini-3.8-flash-low" }, { modelId: "gemini-3.8-flash-high" }]);
 		await realagy.handler("setup", session.ctx);
 		expect(session.ui.notify.mock.lastCall?.[0]).toMatch(/ready: \/bin\/agy is signed in and offers 1 models/);
+	});
+
+	it("registers per-model context overrides and preserves them when editing the global fallback", async () => {
+		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
+		const session = await start(
+			{ all: [], active: [] },
+			{
+				contextWindow: 400_000,
+				contextWindowOverrides: { "gemini-4-argon": 700_000 },
+			},
+		);
+		const initialModels = mocks.register.mock.calls[0][0].getModels();
+		expect(initialModels.find((m: { id: string }) => m.id === "gemini-4-argon").contextWindow).toBe(700_000);
+		expect(initialModels.find((m: { id: string }) => m.id === "claude-sonnet-5-5").contextWindow).toBe(400_000);
+
+		const choices = ["Pi context window: 400,000", "Save and close"];
+		await session.commands.get("realagy").handler("settings", {
+			...session.ctx,
+			mode: "rpc",
+			ui: {
+				...session.ui,
+				select: vi.fn(async () => choices.shift()),
+				input: vi.fn(async () => "500000"),
+			},
+		});
+
+		const updatedModels = mocks.register.mock.lastCall![0].getModels();
+		expect(updatedModels.find((m: { id: string }) => m.id === "gemini-4-argon").contextWindow).toBe(700_000);
+		expect(updatedModels.find((m: { id: string }) => m.id === "claude-sonnet-5-5").contextWindow).toBe(500_000);
+		expect(mocks.restart).not.toHaveBeenCalled();
+		expect(JSON.parse(fs.readFileSync(path.join(session.agentDir, "realagy", "config.json"), "utf8"))).toEqual({
+			noAutoCompaction: true,
+			agentProfile: true,
+			contextWindow: 500_000,
+			contextWindowOverrides: { "gemini-4-argon": 700_000 },
+		});
 	});
 
 	it("enables compaction bypass and 1M Argon window by default, and persists /realagy settings to config.json", async () => {
