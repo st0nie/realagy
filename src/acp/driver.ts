@@ -54,7 +54,7 @@ export interface AcpDriverOptions {
 	binArgs?: string[];
 	/** Rewrite Agy's catalog through a loopback proxy to disable its local
 	 * automatic checkpointer. Default false: keep Agy's normal limits. */
-	noAutoCompaction?: boolean;
+	noAutoCompaction?: boolean | (() => boolean);
 	/** Cloud Code origin used by the proxy (tests may use a local HTTP server). */
 	cloudCodeUpstream?: string;
 	extraEnv?: Record<string, string>;
@@ -703,13 +703,18 @@ export class AcpDriver implements TurnDriver {
 		return starting;
 	}
 
+	#noAutoCompaction(): boolean {
+		const value = this.#opts.noAutoCompaction;
+		return typeof value === "function" ? value() : value === true;
+	}
+
 	async #startConnection(cwd: string): Promise<AcpConnection> {
 		const bin = typeof this.#opts.bin === "function" ? this.#opts.bin() : this.#opts.bin;
 		const agent = this.#resolveAgent();
 		let conn: AcpConnection | undefined;
 		try {
 			let binArgs = this.#opts.binArgs;
-			if (!binArgs && this.#opts.noAutoCompaction) {
+			if (!binArgs && this.#noAutoCompaction()) {
 				this.#catalogProxy ??= new CatalogProxy({
 					upstream: this.#opts.cloudCodeUpstream,
 					env: { ...process.env, ...this.#opts.extraEnv },
@@ -734,7 +739,7 @@ export class AcpDriver implements TurnDriver {
 			});
 			this.#conn = conn;
 			this.#liveSessions.clear();
-			this.#log("spawn", { bin, agent: agent ?? null, noAutoCompaction: this.#opts.noAutoCompaction === true });
+			this.#log("spawn", { bin, agent: agent ?? null, noAutoCompaction: this.#noAutoCompaction() });
 			await conn.start();
 			return conn;
 		} catch (err) {
@@ -915,6 +920,20 @@ export class AcpDriver implements TurnDriver {
 
 	#log(msg: string, data?: unknown): void {
 		this.#opts.log?.(msg, data);
+	}
+
+	/** Restart only the ACP transport after a settings change. Background
+	 * watchers survive; remembered sessions resume in the next process. */
+	async restart(): Promise<void> {
+		const starting = this.#starting;
+		if (starting) await starting.catch(() => undefined);
+		const conn = this.#conn;
+		this.#conn = undefined;
+		this.#liveSessions.clear();
+		conn?.kill();
+		const catalogProxy = this.#catalogProxy;
+		this.#catalogProxy = undefined;
+		await catalogProxy?.close();
 	}
 
 	/** Settle the active turn as an error and stop the process. The next

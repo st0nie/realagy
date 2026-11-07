@@ -1,6 +1,6 @@
 // Minimal realagy provider: official ACP transport, pi-native tools.
-// There is intentionally no config panel, stream-json engine, delegation tool,
-// or global MCP registration. agy runs realagy's hidden agent profile, which
+// There is intentionally no stream-json engine, delegation tool, or global
+// MCP registration. agy runs realagy's hidden agent profile, which
 // replaces agy's own prompt and tools with pi's (src/agent-profile.ts); without
 // it, a system-prompt policy steers the model to pi's tools, and agy's own
 // tool use stays visible.
@@ -17,7 +17,8 @@ import { defaultConversationsDir } from "../src/acp/step-usage.js";
 import { ensureAgyReady, MANUAL_SETUP, resolveAgyBinary } from "../src/acp/setup.js";
 import { bridgedPiTools, bridgeInputSchema, dispatchablePiTool } from "../src/bridge-catalog.js";
 import { startMcpServer, TOKEN_HEADER, type McpServerHandle } from "../src/mcp-server.js";
-import { entriesFromAcpModels, FALLBACK_MODELS, reportedModelLimits, toPiModel, type AgyModelEntry } from "../src/models.js";
+import { entriesFromAcpModels, FALLBACK_MODELS, toPiModel, type AgyModelEntry } from "../src/models.js";
+import { editRealagySettings, loadRealagySettings, realagySettingsPath, saveRealagySettings } from "../src/settings.js";
 import { AgyWorkPanel } from "../src/native-tools.js";
 import { createStreamSimple, failParkedCalls, POLL_TOOL_NAME, ToolRoundTrips } from "../src/provider.js";
 import { toolPolicyPrompt } from "../src/tool-policy.js";
@@ -35,10 +36,9 @@ const SIGN_IN = [
 
 export default async function (pi: ExtensionAPI): Promise<void> {
 	const entries: AgyModelEntry[] = [...FALLBACK_MODELS];
-	// These settings independently control ACP startup and Pi-side metadata.
-	// Restart pi after changing any of them.
-	const noAutoCompaction = process.env.REALAGY_NO_COMPACT === "1";
-	const reportedLimits = reportedModelLimits();
+	// Environment supplies defaults; /agy settings persists per-field overrides.
+	let settings = loadRealagySettings();
+	const settingsPath = realagySettingsPath();
 	pi.registerMessageRenderer(AGY_BACKGROUND_MESSAGE, renderBackgroundCard);
 	// Re-resolved by /agy setup; a missing binary fails the spawn with a
 	// pointer to /agy setup.
@@ -65,7 +65,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	const driver = new AcpDriver({
 		bin: () => bin,
-		noAutoCompaction,
+		noAutoCompaction: () => settings.noAutoCompaction,
 		mcpServers: () => bridge ? [{
 			name: "pi-bridge",
 			type: "http",
@@ -148,7 +148,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 					resolve: async () => (resolveAgyBinary() ? { auth: {}, source: "agy CLI" } : undefined),
 				},
 			},
-			models: entries.map((entry) => toPiModel(entry, reportedLimits)),
+			models: entries.map((entry) => toPiModel(entry, settings)),
 			api: { stream: (model, context, options) => streamSimple(model, context, options), streamSimple },
 		}));
 	};
@@ -284,9 +284,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	};
 
 	pi.registerCommand("agy", {
-		description: "Antigravity: /agy setup (install and sign-in help) or /agy usage (cache hits and plan quota)",
+		description: "Antigravity: /agy settings, /agy setup, or /agy usage",
 		getArgumentCompletions: (prefix) => {
 			const items = [
+				{ value: "settings", label: "settings", description: "Pi token limits and the Agy auto-compaction bypass" },
 				{ value: "setup", label: "setup", description: "Check agy and show how to install it or sign in" },
 				{ value: "usage", label: "usage", description: "Cache hits and plan quota" },
 			];
@@ -295,6 +296,29 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		},
 		handler: async (args, ctx) => {
 			const sub = args.trim();
+			if (sub === "settings") {
+				const draft = await editRealagySettings(ctx.ui, settings);
+				if (stopped || !draft) return;
+				const restartAgy = draft.noAutoCompaction !== settings.noAutoCompaction;
+				try {
+					saveRealagySettings(draft, settingsPath);
+				} catch (error) {
+					ctx.ui.notify(`Could not save ${settingsPath}: ${error instanceof Error ? error.message : String(error)}`, "error");
+					return;
+				}
+				settings = draft;
+				registerModels();
+				if (restartAgy) await driver.restart();
+				if (stopped) return;
+				ctx.ui.notify([
+					`Saved to ${settingsPath}`,
+					`Disable Agy auto-compaction: ${settings.noAutoCompaction ? "ON" : "OFF"}`,
+					`Pi context window: ${settings.contextWindow} tokens`,
+					`Pi max output tokens: ${settings.maxTokens} tokens`,
+					...(restartAgy ? ["Agy will use the new setting on its next turn."] : []),
+				].join("\n"), "info");
+				return;
+			}
 			if (sub === "setup") {
 				const loaded = await runWithLoader(ctx, "Checking Antigravity CLI…", () => discover());
 				if (stopped || loaded.aborted) return;
@@ -309,7 +333,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				return;
 			}
 			if (sub !== "usage") {
-				ctx.ui.notify("Usage: /agy setup | /agy usage", "info");
+				ctx.ui.notify("Usage: /agy settings | /agy setup | /agy usage", "info");
 				return;
 			}
 			if (!ready) {

@@ -107,20 +107,8 @@ export interface ReportedModelLimits {
 	maxTokens: number;
 }
 
-/** Independent Pi-side metadata overrides. These do not change Agy's real
+/** Independent Pi-side metadata. These values do not change Agy's real
  * model limits or whether the catalog proxy is enabled. */
-export function reportedModelLimits(env: NodeJS.ProcessEnv = process.env): ReportedModelLimits {
-	return {
-		contextWindow: positiveInteger(env.REALAGY_CONTEXT_WINDOW, DEFAULT_CONTEXT_WINDOW),
-		maxTokens: positiveInteger(env.REALAGY_MAX_OUTPUT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS),
-	};
-}
-
-function positiveInteger(value: string | undefined, fallback: number): number {
-	if (value === undefined || value.trim() === "") return fallback;
-	const parsed = Number(value);
-	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
-}
 
 /** GPT-OSS is text-only: it cannot see images, not even through agy's native
  *  read_file (verified live with agy 1.5.1). */
@@ -128,7 +116,10 @@ function familyInput(full: string): Array<"text" | "image"> {
 	return /^gpt-oss-/.test(full) ? ["text"] : ["text", "image"];
 }
 
-export function toPiModel(entry: AgyModelEntry, limits: ReportedModelLimits = reportedModelLimits()): Model<Api> {
+export function toPiModel(
+	entry: AgyModelEntry,
+	limits: ReportedModelLimits = { contextWindow: DEFAULT_CONTEXT_WINDOW, maxTokens: DEFAULT_MAX_OUTPUT_TOKENS },
+): Model<Api> {
 	const effortDriven = !!entry.efforts?.length;
 	return {
 		id: entry.id,

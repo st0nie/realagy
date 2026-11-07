@@ -45,7 +45,7 @@ REALAGY_TRACE_USAGE=/tmp/trace.jsonl pi      # turn plans, usage_update, step to
 
 ## Conventions
 
-- Keep the extension minimal: one command (`/agy setup`, `/agy usage`), no installers, sign-in flows, config panel, fallback engine, delegation framework, or global agy/MCP mutation. The one exception is realagy's hidden agent profile in `~/.gemini/config/agents/realagy-<hash>.md` (`src/agent-profile.ts`): it affects only processes started with `--agent`, and stale copies are pruned.
+- Keep the extension minimal: one command (`/agy settings`, `/agy setup`, `/agy usage`), one small settings menu, no installers, sign-in flows, fallback engine, delegation framework, or global agy/MCP mutation. The exceptions are realagy's settings file in `~/.pi/agent/realagy/settings.json` and hidden agent profile in `~/.gemini/config/agents/realagy-<hash>.md` (`src/agent-profile.ts`): the profile affects only processes started with `--agent`, and stale copies are pruned.
 - Under the profile the model has only pi's tools; without it (`REALAGY_AGY_PROFILE=0`) agy decides which tools to use, its own or pi's. Pi owns the transcript and rendering.
 - Small functional modules, explicit types, early returns.
 - `agy acp` ignores `enabledTools`/`disabledTools`, so realagy sends neither. `eagerMcpServers: ["pi-bridge"]` avoids agy's lazy `call_mcp_tool` loop under the default agent; a custom agent ignores it, so the profile lists every bridged tool as `eager`.

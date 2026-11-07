@@ -33,10 +33,11 @@ The catalog comes live from agy and depends on the account.
 
 | Command | What it does |
 | --- | --- |
+| `/agy settings` | Edit the Pi token limits and Agy auto-compaction bypass |
 | `/agy setup` | Checks agy: shows install steps when it is missing, sign-in steps when it cannot start a session, and reloads the model catalog when it is ready |
 | `/agy usage` | Cache-hit rate for this session plus every quota group's 5-hour and weekly remaining share and reset times (from the live `agy acp` server, or `agy --print /usage`) |
 
-Quota is fetched only when you run `/agy usage`. There is no settings panel, engine switch, delegation tool, global MCP registration, or config file.
+Quota is fetched only when you run `/agy usage`. There is no engine switch, delegation tool, or global MCP registration.
 
 ## Pi tools and agy's own tools
 
@@ -58,10 +59,15 @@ With `REALAGY_AGY_PROFILE=0` (or when the profile cannot be written) agy keeps i
 
 ## Pi limits and agy compaction
 
-Pi's model metadata and agy's compaction bypass are independent settings. Every model
-is reported to pi with a 256,000-token context window and 64,000-token output limit by
-default; both values can be changed without enabling the proxy. Restart pi after
-changing any of these environment settings.
+Run `/agy settings` to edit all three options in a menu. **Save and close** persists the
+values in `~/.pi/agent/realagy/settings.json` and applies them immediately: Pi's model
+metadata refreshes, and a changed bypass setting restarts Agy before its next turn.
+Pi does not need to be restarted. Environment variables supply defaults, with saved
+menu values taking precedence per field; restart Pi after changing environment variables.
+
+Pi's model metadata and agy's compaction bypass are independent. Every model is reported
+to pi with a 256,000-token context window and 64,000-token output limit by default;
+both values can be changed without enabling the proxy.
 
 With `REALAGY_NO_COMPACT=1`, realagy starts an embedded loopback reverse proxy and
 starts agy with its `--cloud_code_endpoint` pointing there. Only the model catalog is
@@ -88,10 +94,11 @@ Pi-reported window and output settings do not change those real limits either.
 
 | Path | What it holds |
 | --- | --- |
-| `extensions/index.ts` | Composition root: pi MCP bridge, `antigravity/*` models, agy discovery, `/agy setup`, `/agy usage` |
+| `extensions/index.ts` | Composition root: pi MCP bridge, `antigravity/*` models, agy discovery, `/agy settings`, `/agy setup`, `/agy usage` |
 | `src/provider.ts` | pi assistant event stream, MCP → `toolUse` → `toolResult` round-trips, usage mapping |
 | `src/transcript.ts` | Transcript serialization, fingerprints, warm-session turn planning across checkpoints |
 | `src/models.ts` | ACP model catalog parsing, effort grouping, independent Pi-reported limits, offline fallback catalog |
+| `src/settings.ts` | `/agy settings` menu, validation, and persistent per-field settings |
 | `src/mcp-server.ts`, `src/bridge-catalog.ts` | Loopback, token-protected MCP server for pi's tools (every tool an extension may activate; only active ones run) |
 | `src/tool-loadout.ts` | Undoes the situational tools pi's `/tree` restore activates |
 | `src/quota.ts`, `src/usage-trace.ts` | Cache/quota meter, quota-exhaustion notice, usage diagnostics |
