@@ -50,6 +50,26 @@ When `agentProfile` is set to `false` in `/realagy settings` (or when the profil
 - while agy works on its own, a live panel above the editor lists each running call, background command, and subagent with a spinner and its elapsed time (the 5-minute inactivity limit waits for a running call);
 - a command agy moved to the background, or a subagent, is marked `(runs in background)`. When it finishes, a tool card with the exit code and the last 5 lines of its output (expand it with ctrl+o or a left click for the whole output and the log path) is added to the conversation and pi's agent reacts to it: right away when idle, otherwise after its current work. agy's own leftover output never leaks into your next reply.
 
+## Parallel Pi tools
+
+The bridge exposes a virtual `parallel` tool for independent Pi tool calls. It accepts 1–16 calls, each with a Pi tool `name` and its `arguments`:
+
+```json
+{
+  "calls": [
+    { "name": "read", "arguments": { "path": "src/a.ts" } },
+    { "name": "read", "arguments": { "path": "src/b.ts" } },
+    { "name": "bash", "arguments": { "command": "bun test" } }
+  ]
+}
+```
+
+realagy expands this one MCP request into multiple genuine Pi `toolCall` blocks in the same assistant message. Pi applies its normal permissions, hooks, cancellation, and native scheduler: eligible calls run concurrently, while Pi's global sequential mode or a tool's `executionMode: "sequential"` is still respected. Use `parallel` only for independent work; do not use it for dependent steps or writes that can conflict. Nested `parallel` calls and inner `bridge_poll_result` calls are rejected. Invalid batches, inactive tools, and empty or oversized batches are rejected before any tool starts.
+
+The MCP response contains a JSON `results` array in input order. Every entry has `callId`, `name`, `isError`, and `content`; text is embedded, while images are referenced by their 1-based `index` in the MCP response's appended image blocks. One failed tool does not hide the other results, and the aggregate MCP `isError` is true if any entry failed. Cancellation aborts the whole batch without leaving a pending MCP request.
+
+A batch still running after 150 seconds returns `STILL RUNNING` with its outer `parallel` call ID. Poll that outer ID with `bridge_poll_result`; inner call IDs are not separate poll handles. Ordinary single-tool ACP calls retain their existing behavior.
+
 ## Interrupts and failures
 
 - Esc cancels the running Antigravity turn through ACP. agy keeps running, and the next prompt continues in the same session. agy is restarted only if it ignores the cancel for 10 seconds.
@@ -113,6 +133,7 @@ The bypass does not increase real server-side model limits; when a conversation 
 | --- | --- |
 | `extensions/index.ts` | Composition root: pi MCP bridge, `antigravity/*` models, agy discovery, `/realagy settings`, `/realagy setup`, `/realagy usage` |
 | `src/provider.ts` | pi assistant event stream, MCP → `toolUse` → `toolResult` round-trips, usage mapping |
+| `src/parallel.ts` | Explicit `parallel` schema and validation, ordered result/image aggregation |
 | `src/transcript.ts` | Transcript serialization, fingerprints, warm-session turn planning across checkpoints |
 | `src/models.ts` | ACP model catalog parsing, effort grouping, per-model limits and overrides, offline fallback catalog |
 | `src/settings.ts` | `/realagy settings` TUI component, validation, and `~/.pi/agent/realagy/config.json` persistence |

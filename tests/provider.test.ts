@@ -6,10 +6,12 @@ import path from "node:path";
 import { createAssistantMessageEventStream, type AssistantMessageEvent, type Message, type TranscriptContext } from "@earendil-works/pi-ai";
 import { calculateContextTokens, AgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { test, vi } from "vitest";
+import { runAgentLoop, type AgentTool } from "@earendil-works/pi-agent-core";
 import { conversationDbPath, lastStepIdx } from "../src/acp/step-usage.js";
-import { createStreamSimple, ESCALATE_AFTER_MS, POLL_TOOL_NAME, ToolRoundTrips, type AcpSessions } from "../src/provider.js";
+import { createStreamSimple, ESCALATE_AFTER_MS, failParkedCalls, POLL_TOOL_NAME, ToolRoundTrips, type AcpSessions } from "../src/provider.js";
 import type { DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../src/driver-types.js";
 import { FALLBACK_MODELS, toPiModel } from "../src/models.js";
+import { PARALLEL_TOOL_NAME } from "../src/parallel.js";
 import {
 	freshInput,
 	MAX_TRANSCRIPT_BYTES,
@@ -78,7 +80,9 @@ class FakeDriver implements TurnDriver {
 		const active = this.activeHandle;
 		if (!(active instanceof FakeHandle) || active.closed) return;
 		this.cancels.push(reason);
-		active.complete({ status: "OK", response: "", aborted: true });
+		const outcome = { status: "OK", response: "", aborted: true } as const;
+		active.complete(outcome);
+		this.onTurnEnd?.(outcome);
 	}
 	async close(): Promise<void> { this.activeHandle = null; }
 }
@@ -214,6 +218,188 @@ test("MCP call becomes a genuine pi toolUse and its toolResult resumes ACP", asy
 	const finalDone = secondEvents.find((event) => event.type === "done");
 	assert.equal(finalDone?.type === "done" && finalDone.message.usage.totalTokens, 54357);
 	assert.equal(finalDone?.type === "done" && (finalDone.message.usage as typeof finalDone.message.usage & { agyCumulativeTotalTokens?: number }).agyCumulativeTotalTokens, 697244);
+});
+
+test("parallel emits genuine Pi calls that the native agent loop executes concurrently", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const roundTrips = new ToolRoundTrips(driver);
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips });
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	let releaseFirst!: () => void;
+	let releaseSecond!: () => void;
+	const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+	const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+	const started: string[] = [];
+	const completed: string[] = [];
+	const hooks: string[] = [];
+	const tools: AgentTool[] = ["first", "second"].map((name) => ({
+		name,
+		label: name,
+		description: name,
+		parameters: { type: "object", properties: {} },
+		execute: async () => {
+			started.push(name);
+			await (name === "first" ? firstGate : secondGate);
+			completed.push(name);
+			if (name === "second") throw new Error("second failed");
+			return { content: [{ type: "text" as const, text: "first ok" }], details: undefined };
+		},
+	}));
+	// The fake ACP server finishes when Pi re-enters after all tool results.
+	driver.reentry = () => {
+		const handle = driver.activeHandle as FakeHandle;
+		handle.complete();
+		return handle;
+	};
+	const running = runAgentLoop(
+		[user("run both")],
+		{ messages: [], tools },
+		{
+			model,
+			toolExecution: "parallel",
+			convertToLlm: (messages) => messages as Message[],
+			beforeToolCall: async ({ toolCall }) => { hooks.push(toolCall.name); return undefined; },
+		},
+		() => {},
+		undefined,
+		stream,
+	);
+	await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+	const parked = roundTrips.onToolCall("batch", PARALLEL_TOOL_NAME, {
+		calls: [{ name: "first", arguments: {} }, { name: "second", arguments: {} }],
+	}, new AbortController().signal);
+
+	// Both tools must enter execute before either is released: this fails if
+	// realagy emits the calls in separate, serial Pi turns.
+	await vi.waitFor(() => assert.deepEqual([...started].sort(), ["first", "second"]));
+	releaseSecond();
+	await vi.waitFor(() => assert.deepEqual(completed, ["second"]));
+	releaseFirst();
+	const [aggregate, messages] = await Promise.all([parked, running]);
+	assert.deepEqual(hooks, ["first", "second"], "Pi's normal permission/hook path ran for each call");
+	assert.equal(aggregate.isError, true);
+	const text = aggregate.content[0];
+	assert.equal(text.type, "text");
+	const payload = JSON.parse(text.type === "text" ? text.text : "");
+	assert.deepEqual(payload.results.map((result: { name: string }) => result.name), ["first", "second"]);
+	assert.deepEqual(payload.results.map((result: { isError: boolean }) => result.isError), [false, true]);
+	assert.equal(payload.results[0].content[0].text, "first ok");
+	assert.match(payload.results[1].content[0].text, /second failed/);
+	const toolMessage = messages.find((message) => message.role === "assistant" && message.content.filter((block) => block.type === "toolCall").length === 2);
+	assert.equal(toolMessage?.role, "assistant");
+	if (toolMessage?.role === "assistant") {
+		assert.deepEqual(toolMessage.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" && block.id), ["batch:1", "batch:2"]);
+	}
+	const final = messages.at(-1);
+	assert.equal(final?.role, "assistant", "the native follow-up turn completed after the batch");
+	if (final?.role === "assistant") assert.equal(final.stopReason, "stop");
+});
+
+test("parallel keeps one outer poll handle and survives the initial HTTP disconnect", async () => {
+	vi.useFakeTimers();
+	try {
+		const driver = new FakeDriver();
+		driver.autoFinish = false;
+		await driver.run({ cwd: process.cwd(), model: "gpt-oss-120b", mode: "default", skipPermissions: true, prompt: "test" });
+		const roundTrips = new ToolRoundTrips(driver, { escalateAfterMs: 60 });
+		const signal = new AbortController();
+		const parked = roundTrips.onToolCall("batch", PARALLEL_TOOL_NAME, {
+			calls: [{ name: "read", arguments: { path: "a" } }, { name: "read", arguments: { path: "b" } }],
+		}, signal.signal);
+		await vi.advanceTimersByTimeAsync(60);
+		const early = await parked;
+		assert.match(early.content[0].type === "text" ? early.content[0].text : "", /STILL RUNNING[\s\S]*callId "batch"/);
+		signal.abort();
+		assert.equal(roundTrips.isPending("batch:1"), true);
+		assert.equal(roundTrips.isPending("batch:2"), true);
+
+		roundTrips.resolve("batch:2", "second", true);
+		roundTrips.resolve("batch:1", "first", false);
+		const result = await roundTrips.onToolCall("poll", POLL_TOOL_NAME, { callId: "batch" }, new AbortController().signal);
+		assert.equal(result.isError, true);
+		const text = result.content[0];
+		assert.equal(text.type, "text");
+		const payload = JSON.parse(text.type === "text" ? text.text : "");
+		assert.deepEqual(payload.results.map((entry: { callId: string }) => entry.callId), ["batch:1", "batch:2"]);
+		assert.equal(roundTrips.hasPendingBatchCalls(), false);
+		const innerPoll = await roundTrips.onToolCall("poll-inner", POLL_TOOL_NAME, { callId: "batch:1" }, new AbortController().signal);
+		assert.match(innerPoll.content[0].type === "text" ? innerPoll.content[0].text ?? "" : "", /Unknown or non-escalated callId: batch:1/);
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+test("aborting a parallel Pi turn settles the outer request and every inner call", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const roundTrips = new ToolRoundTrips(driver);
+	driver.onTurnEnd = (outcome) => failParkedCalls(roundTrips, outcome);
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips });
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const abort = new AbortController();
+	const first = collect(stream(model, context([system(), user("parallel")]), { signal: abort.signal }));
+	await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+	const parked = roundTrips.onToolCall("batch", PARALLEL_TOOL_NAME, {
+		calls: [{ name: "read", arguments: {} }, { name: "bash", arguments: {} }],
+	}, new AbortController().signal);
+	const firstEvents = await first;
+	const done = firstEvents.find((event) => event.type === "done");
+	assert.equal(done?.type === "done" && done.reason, "toolUse");
+	if (done?.type !== "done") throw new Error("missing parallel toolUse");
+	assert.equal(done.message.content.filter((block) => block.type === "toolCall").length, 2);
+	abort.abort();
+	const aborted = await collect(stream(model, context([system(), user("parallel"), done.message]), { signal: abort.signal }));
+	await assert.rejects(parked, /aborted|ended/);
+	assert.equal(aborted.at(-1)?.type, "error");
+	assert.equal(roundTrips.isPending("batch"), false);
+	assert.equal(roundTrips.isPending("batch:1"), false);
+	assert.equal(roundTrips.isPending("batch:2"), false);
+	assert.equal(roundTrips.hasPendingBatchCalls(), false);
+	assert.equal((driver.activeHandle as FakeHandle).closed, true);
+});
+
+test("incomplete parallel results fail the batch without re-entering or starting ACP", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const roundTrips = new ToolRoundTrips(driver);
+	driver.onTurnEnd = (outcome) => failParkedCalls(roundTrips, outcome);
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips });
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	let reentries = 0;
+	driver.reentry = () => {
+		reentries++;
+		const handle = driver.activeHandle as FakeHandle;
+		handle.complete();
+		return handle;
+	};
+	const first = collect(stream(model, context([system(), user("parallel")])));
+	await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+	const parked = roundTrips.onToolCall("batch", PARALLEL_TOOL_NAME, {
+		calls: [{ name: "read", arguments: {} }, { name: "read", arguments: {} }],
+	}, new AbortController().signal);
+	const rejection = assert.rejects(parked, /parallel tool results are incomplete/);
+	const firstEvents = await first;
+	const done = firstEvents.find((event) => event.type === "done");
+	if (done?.type !== "done") throw new Error("missing parallel toolUse");
+	const partial: Message = {
+		role: "toolResult",
+		toolCallId: "batch:1",
+		toolName: "read",
+		content: [{ type: "text", text: "partial" }],
+		isError: false,
+		timestamp: Date.now(),
+	};
+	const second = await collect(stream(model, context([system(), user("parallel"), done.message, partial])));
+	await rejection;
+	const last = second.at(-1);
+	assert.equal(last?.type, "error");
+	if (last?.type === "error") assert.match(last.error.errorMessage ?? "", /parallel tool results are incomplete/);
+	assert.equal(reentries, 0);
+	assert.equal(driver.requests.length, 1, "no new ACP turn receives a partial batch");
+	assert.deepEqual(driver.cancels, ["parallel tool results are incomplete; the batch was aborted"]);
+	assert.equal(roundTrips.hasPendingBatchCalls(), false);
+	assert.equal(roundTrips.isPending("batch"), false);
 });
 
 test("slow tools early-ack after ESCALATE_AFTER_MS, long-poll on bridge_poll_result, and never hard-kill running tools at 30m", async () => {

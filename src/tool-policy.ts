@@ -7,6 +7,8 @@
 // so the model is asked to prefer pi's tools (agy's own tools stay usable)
 // and to ignore the default prompt's file:// link rules.
 
+import { PARALLEL_TOOL_NAME } from "./parallel.js";
+
 /** agy 1.5's own file and shell tools, which pi's tools replace. */
 const AGY_FILE_AND_SHELL_TOOLS = ["run_command", "read_file", "write_file", "edit_file"];
 /** agy 1.5's delegation and scheduling tools (the browser agent, when
@@ -27,11 +29,15 @@ export interface ToolPolicyOptions {
  *  (and no profile-free formatting override is needed). */
 export function toolPolicyPrompt(toolNames: readonly string[], opts: ToolPolicyOptions = {}): string | undefined {
 	const names = [...new Set(toolNames.filter((name) => name.length > 0))];
+	const parallelRule = names.includes(PARALLEL_TOOL_NAME)
+		? [`For two or more independent, non-conflicting pi tool calls, use ${PARALLEL_TOOL_NAME} once with {calls: [{name, arguments}, ...]} instead of issuing them sequentially. Pi still applies permissions and sequential execution modes. Never nest ${PARALLEL_TOOL_NAME} or put bridge_poll_result inside it.`]
+		: [];
 	if (opts.profile) {
 		if (names.length === 0) return undefined;
 		return [
 			"pi's tools in this session, served by the pi-bridge MCP server (you call them as mcp_pi-bridge_<name>; pi's transcript names them without the prefix):",
 			names.join(", "),
+			...parallelRule,
 		].join("\n");
 	}
 	if (names.length === 0) return PLAIN_PATHS_RULE;
@@ -43,6 +49,7 @@ export function toolPolicyPrompt(toolNames: readonly string[], opts: ToolPolicyO
 		`Do not use your built-in ${AGY_FILE_AND_SHELL_TOOLS.join(", ")} tools for anything a pi tool can do.`,
 		`Do the work yourself, in the foreground: do not start subagents, the browser agent, background tasks, or scheduled tasks (${AGY_DELEGATION_TOOLS.join(", ")}).`,
 		"Use a built-in tool only for a job no pi tool can do.",
+		...parallelRule,
 		PLAIN_PATHS_RULE,
 	].join("\n");
 }

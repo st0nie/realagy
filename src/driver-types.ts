@@ -96,6 +96,9 @@ export type DriverActivity =
 			callId: string;
 			name: string;
 			args: Record<string, unknown>;
+			/** Explicit parallel request: emit these genuine Pi calls in one message.
+			 * The outer callId remains the single MCP/poll handle. */
+			calls?: Array<{ callId: string; name: string; args: Record<string, unknown> }>;
 			/** Set by the driver: the session the call came from, and the
 			 *  store's highest step index when it arrived. The session then holds
 			 *  the transcript up to this call's toolUse message. */

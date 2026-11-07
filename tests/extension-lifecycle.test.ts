@@ -407,22 +407,34 @@ describe("extension session lifecycle", () => {
 			active: ["bash", "read", "pi_lens_activate_tools"],
 		});
 		const listed = () => mocks.bridge!.listTools().map((tool: { name: string }) => tool.name);
-		expect(listed()).toEqual(["bash", "read", "pi_lens_activate_tools", "lens_symbols", "poll"]);
+		expect(listed()).toEqual(["bash", "read", "pi_lens_activate_tools", "lens_symbols", "parallel", "poll"]);
 		const policy = session.driver.systemPrompt();
 		expect(policy).toMatch(/bash, read, pi_lens_activate_tools, lens_symbols/);
+		expect(policy).toMatch(/use parallel once with \{calls:/);
 
 		const inactive = await mocks.bridge!.onToolCall("c1", "lens_symbols", {}, new AbortController().signal);
 		expect(inactive).toEqual({ content: [{ type: "text", text: "Pi tool lens_symbols is not active in pi right now. Active pi tools: bash, read, pi_lens_activate_tools." }], isError: true });
 		expect(mocks.onToolCall).not.toHaveBeenCalled();
+		const invalidBatch = await mocks.bridge!.onToolCall("batch-0", "parallel", { calls: [] }, new AbortController().signal);
+		expect(invalidBatch.isError).toBe(true);
+		const inactiveBatch = await mocks.bridge!.onToolCall("batch-1", "parallel", {
+			calls: [{ name: "bash", arguments: {} }, { name: "lens_symbols", arguments: {} }],
+		}, new AbortController().signal);
+		expect(inactiveBatch).toEqual({ content: [{ type: "text", text: "Pi tool lens_symbols is not active in pi right now. Active pi tools: bash, read, pi_lens_activate_tools." }], isError: true });
+		expect(mocks.onToolCall).not.toHaveBeenCalled();
 
 		// pi_lens_activate_tools mid-session: same list and policy, now callable.
 		session.tools.active.push("lens_symbols");
-		expect(listed()).toEqual(["bash", "read", "pi_lens_activate_tools", "lens_symbols", "poll"]);
+		expect(listed()).toEqual(["bash", "read", "pi_lens_activate_tools", "lens_symbols", "parallel", "poll"]);
 		expect(session.driver.systemPrompt()).toBe(policy);
 		mocks.onToolCall.mockResolvedValueOnce({ content: [{ type: "text", text: "ok" }] });
 		const signal = new AbortController().signal;
 		await mocks.bridge!.onToolCall("c2", "lens_symbols", { name: "x" }, signal);
 		expect(mocks.onToolCall).toHaveBeenCalledWith("c2", "lens_symbols", { name: "x" }, signal);
+		mocks.onToolCall.mockResolvedValueOnce({ content: [{ type: "text", text: "batch ok" }] });
+		const batchArgs = { calls: [{ name: "lens_symbols", arguments: { name: "x" } }, { name: "read" }] };
+		await mocks.bridge!.onToolCall("batch-2", "parallel", batchArgs, signal);
+		expect(mocks.onToolCall).toHaveBeenCalledWith("batch-2", "parallel", batchArgs, signal);
 	});
 
 	it("runs agy with a hidden profile that marks every bridged tool eager, unless opted out", async () => {
@@ -434,7 +446,7 @@ describe("extension session lifecycle", () => {
 			const agent = session.driver.agent();
 			expect(agent).toMatch(/^realagy-[0-9a-f]{12}$/);
 			const profile = fs.readFileSync(path.join(home, "config", "agents", `${agent}.md`), "utf8");
-			for (const tool of ["bash", "read", "poll"]) expect(profile).toContain(`"${tool}":\n        eager: true`);
+			for (const tool of ["bash", "read", "parallel", "poll"]) expect(profile).toContain(`"${tool}":\n        eager: true`);
 			expect(session.driver.systemPrompt(agent)).toMatch(/mcp_pi-bridge_<name>/);
 			expect(session.driver.systemPrompt(undefined)).toMatch(/Do not use your built-in run_command/);
 			const selectChoices = ["Pi-only agent profile: ON", "Save and close"];

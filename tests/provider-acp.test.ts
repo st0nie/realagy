@@ -146,6 +146,49 @@ test("01a1ab97: Esc while pi runs bash, then `continue`, delivers the aborted re
 	}
 });
 
+test("parallel tool results aggregate and continue on the same ACP session", async () => {
+	const h = harness();
+	try {
+		const u1 = user("Read both files [native-slow:50]");
+		const first = h.turn([system(), u1]);
+		await h.waitForPrompts(1);
+		const parked = h.roundTrips.onToolCall("batch", "parallel", {
+			calls: [
+				{ name: "read", arguments: { path: "src/a.ts" } },
+				{ name: "read", arguments: { path: "src/b.ts" } },
+			],
+		}, new AbortController().signal);
+		const toolUse = await first;
+		assert.equal(toolUse.reason, "toolUse");
+		assert.deepEqual(
+			toolUse.message.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" && block.id),
+			["batch:1", "batch:2"],
+		);
+		assert.equal(h.sessions.step?.sessionId, "session-1");
+
+		const r1 = toolResult("batch:1", "read", "alpha");
+		const r2 = toolResult("batch:2", "read", "beta");
+		const second = await h.turn([system(), u1, toolUse.message, r1, r2]);
+		assert.equal(second.reason, "stop");
+		const aggregate = await parked;
+		assert.equal(aggregate.isError, false);
+		const text = aggregate.content[0];
+		assert.equal(text.type, "text");
+		const payload = JSON.parse(text.type === "text" ? text.text : "");
+		assert.deepEqual(payload.results.map((result: { content: Array<{ text: string }> }) => result.content[0].text), ["alpha", "beta"]);
+		assert.equal(h.prompts().length, 1, "both results resume the existing prompt without a new session/prompt");
+		assert.equal(h.sessionNews(), 1);
+		assert.equal(h.persisted.at(-1)?.count, 6);
+
+		const next = await h.turn([system(), u1, toolUse.message, r1, r2, second.message, user("next")]);
+		assert.equal(next.reason, "stop");
+		assert.deepEqual(h.prompts().at(-1), { sessionId: "session-1", text: "next", resource: undefined });
+		assert.equal(h.sessionNews(), 1);
+	} finally {
+		await h.driver.close();
+	}
+});
+
 test("Esc during the reply after a tool result (multi-step loop) checkpoints the whole loop", async () => {
 	const h = harness();
 	try {

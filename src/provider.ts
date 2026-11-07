@@ -28,6 +28,12 @@ import {
 } from "./transcript.js";
 import { traceUsage } from "./usage-trace.js";
 import { quotaExhaustion, type UsageMeter } from "./quota.js";
+import {
+	formatParallelResults,
+	PARALLEL_TOOL_NAME,
+	parallelErrorResult,
+	parseParallelCalls,
+} from "./parallel.js";
 
 export const POLL_TOOL_NAME = "bridge_poll_result";
 const PARK_TIMEOUT_MS = 8 * 60_000;
@@ -51,6 +57,17 @@ interface PendingCall {
 	escalated: boolean;
 	signal: AbortSignal;
 	onAbort: () => void;
+	kickOnSettle: boolean;
+	batchId?: string;
+	onEscalated?: () => void;
+}
+
+interface ParkOptions {
+	escalate?: boolean;
+	timeout?: boolean;
+	kickOnSettle?: boolean;
+	batchId?: string;
+	onEscalated?: () => void;
 }
 
 interface PollResult {
@@ -113,6 +130,14 @@ export class ToolRoundTrips {
 		const handle = this.driver.activeHandle;
 		if (!handle) return Promise.reject(new Error("no active Antigravity turn for this pi tool call"));
 		this.#prunePolls();
+		if (name === PARALLEL_TOOL_NAME) return this.#parallel(callId, args, signal, handle);
+		const result = this.#park(callId, name, signal, {});
+		handle.pushExternal({ type: "bridge_call", callId, name, args });
+		return result;
+	};
+
+	#park(callId: string, name: string, signal: AbortSignal, options: ParkOptions): Promise<BridgeResult> {
+		if (signal.aborted) return Promise.reject(new Error("ACP disconnected before the pi tool result arrived"));
 		return new Promise<BridgeResult>((resolve, reject) => {
 			const pending: PendingCall = {
 				name,
@@ -120,10 +145,13 @@ export class ToolRoundTrips {
 				reject,
 				escalated: false,
 				signal,
+				kickOnSettle: options.kickOnSettle ?? true,
+				batchId: options.batchId,
+				onEscalated: options.onEscalated,
 				onAbort: () => this.#fail(callId, "ACP disconnected before the pi tool result arrived"),
-				timer: setTimeout(() => this.#fail(callId, "pi tool round-trip timed out"), PARK_TIMEOUT_MS),
+				timer: options.timeout === false ? undefined : setTimeout(() => this.#fail(callId, "pi tool round-trip timed out"), PARK_TIMEOUT_MS),
 			};
-			if (this.#escalateAfterMs > 0) {
+			if (options.escalate !== false && this.#escalateAfterMs > 0) {
 				pending.escalateTimer = setTimeout(() => {
 					const current = this.#pending.get(callId);
 					if (!current) return;
@@ -133,6 +161,7 @@ export class ToolRoundTrips {
 					// The initial HTTP request is about to finish with STILL RUNNING;
 					// its socket closing afterwards must not abort the running pi tool.
 					current.signal.removeEventListener("abort", current.onAbort);
+					current.onEscalated?.();
 					this.#polls.set(callId, {
 						name,
 						state: "running",
@@ -145,9 +174,54 @@ export class ToolRoundTrips {
 			}
 			this.#pending.set(callId, pending);
 			signal.addEventListener("abort", pending.onAbort, { once: true });
-			handle.pushExternal({ type: "bridge_call", callId, name, args });
 		});
-	};
+	}
+
+	#parallel(callId: string, args: Record<string, unknown>, signal: AbortSignal, handle: TurnHandle): Promise<BridgeResult> {
+		const parsed = parseParallelCalls(args, [POLL_TOOL_NAME]);
+		if (!parsed.ok) return Promise.resolve(parallelErrorResult(parsed.error));
+		if (signal.aborted) return Promise.reject(new Error("ACP disconnected before the pi tool result arrived"));
+
+		const innerAbort = new AbortController();
+		const forwardAbort = () => innerAbort.abort();
+		const cleanup = () => signal.removeEventListener("abort", forwardAbort);
+		signal.addEventListener("abort", forwardAbort, { once: true });
+		const calls = parsed.calls.map((call, index) => ({ ...call, callId: `${callId}:${index + 1}` }));
+		const innerPromises = calls.map((call) => this.#park(call.callId, call.name, innerAbort.signal, {
+			escalate: false,
+			timeout: false,
+			kickOnSettle: false,
+			batchId: callId,
+		}));
+		const outer = this.#park(callId, PARALLEL_TOOL_NAME, signal, { onEscalated: cleanup });
+		void outer.catch(() => {
+			cleanup();
+			innerAbort.abort();
+		});
+		void Promise.all(innerPromises).then((results) => {
+			const aggregated = formatParallelResults(calls, results);
+			this.resolve(callId, aggregated.text, aggregated.isError, aggregated.images);
+			cleanup();
+		}).catch((error: unknown) => {
+			cleanup();
+			innerAbort.abort();
+			this.#fail(callId, error instanceof Error ? error.message : String(error));
+		});
+		handle.pushExternal({
+			type: "bridge_call",
+			callId,
+			name: PARALLEL_TOOL_NAME,
+			args,
+			calls: calls.map((call) => ({ callId: call.callId, name: call.name, args: call.arguments })),
+		});
+		return outer;
+	}
+
+	/** A native Pi parallel batch must not re-enter ACP with partial results. */
+	hasPendingBatchCalls(): boolean {
+		for (const pending of this.#pending.values()) if (pending.batchId !== undefined) return true;
+		return false;
+	}
 
 	resolve(callId: string, text: string, isError: boolean, images: Array<{ data: string; mimeType: string }> = []): boolean {
 		const pending = this.#pending.get(callId);
@@ -174,7 +248,7 @@ export class ToolRoundTrips {
 		} else {
 			pending.resolve(finalResult);
 		}
-		this.driver.kickIdle();
+		if (pending.kickOnSettle) this.driver.kickIdle();
 		return true;
 	}
 
@@ -210,7 +284,7 @@ export class ToolRoundTrips {
 		} else {
 			pending.reject(new Error(reason));
 		}
-		this.driver.kickIdle();
+		if (pending.kickOnSettle) this.driver.kickIdle();
 	}
 
 	#poll(callId: string, signal: AbortSignal): Promise<BridgeResult> {
@@ -415,11 +489,14 @@ function emitToolUse(stream: AssistantMessageEventStream, blocks: BlockState, ac
 	closeText(stream, blocks);
 	closeThinking(stream, blocks);
 	ensureStarted(stream, blocks);
-	const toolCall = { type: "toolCall" as const, id: activity.callId, name: activity.name, arguments: activity.args as Record<string, JsonValue> };
-	blocks.partial.content.push(toolCall);
-	const contentIndex = blocks.partial.content.length - 1;
-	stream.push({ type: "toolcall_start", contentIndex, partial: blocks.partial });
-	stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: blocks.partial });
+	const calls = activity.calls ?? [{ callId: activity.callId, name: activity.name, args: activity.args }];
+	for (const call of calls) {
+		const toolCall = { type: "toolCall" as const, id: call.callId, name: call.name, arguments: call.args as Record<string, JsonValue> };
+		blocks.partial.content.push(toolCall);
+		const contentIndex = blocks.partial.content.length - 1;
+		stream.push({ type: "toolcall_start", contentIndex, partial: blocks.partial });
+		stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: blocks.partial });
+	}
 	blocks.partial.stopReason = "toolUse";
 	stream.push({ type: "done", reason: "toolUse", message: blocks.partial });
 	stream.end();
@@ -585,7 +662,7 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					const payload = formatToolResult(result, trailing);
 					deps.roundTrips.resolve(result.toolCallId, payload.text, result.isError, payload.images);
 				}
-				const active = results.length > 0 ? deps.driver.reentry() : null;
+				const active = results.length > 0 && !deps.roundTrips.hasPendingBatchCalls() ? deps.driver.reentry() : null;
 				if (active) {
 					sessions.parked = undefined;
 					await consumeTurn(stream, blocks, active, model, options, onCompleted, onToolCall, deps.meter);
@@ -598,6 +675,13 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					// records its checkpoint as it settles; nothing new starts.
 					void deps.driver.cancelActive("aborted in pi");
 					finish(stream, blocks, "aborted", "Operation aborted");
+					return;
+				}
+				if (results.length > 0 && deps.roundTrips.hasPendingBatchCalls()) {
+					const reason = "parallel tool results are incomplete; the batch was aborted";
+					deps.roundTrips.failAll(reason, { includeEscalated: true });
+					await deps.driver.cancelActive(reason);
+					finish(stream, blocks, "error", reason);
 					return;
 				}
 				if (results.length > 0 && sessions.parked) {

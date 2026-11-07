@@ -30,6 +30,12 @@ import {
 import { AgyWorkPanel } from "../src/native-tools.js";
 import { createStreamSimple, failParkedCalls, POLL_TOOL_NAME, ToolRoundTrips } from "../src/provider.js";
 import { toolPolicyPrompt } from "../src/tool-policy.js";
+import {
+	PARALLEL_TOOL_INFO,
+	PARALLEL_TOOL_NAME,
+	parallelErrorResult,
+	parseParallelCalls,
+} from "../src/parallel.js";
 import { restoreWarmSessions, WARM_SESSION_ENTRY, type SessionEntryLike, type WarmSession } from "../src/transcript.js";
 import { treeRestoreExtras, type LoadoutEntry } from "../src/tool-loadout.js";
 /** Widget key of the live panel of running agy work. */
@@ -56,7 +62,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	// Every tool an extension may activate is listed, so a mid-session
 	// activation never needs a new ACP session; only active ones run.
-	const bridgedTools = () => bridgedPiTools(pi.getAllTools(), pi.getActiveTools());
+	const bridgedTools = () => [...bridgedPiTools(pi.getAllTools(), pi.getActiveTools()), PARALLEL_TOOL_INFO];
 	// UI of this runtime, for the live agy panel. pi replaces the runtime on
 	// /new, /resume, /fork, and /reload after session_shutdown, so `stopped`
 	// guards every use.
@@ -118,6 +124,19 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		],
 		onToolCall: (callId, name, args, signal) => {
 			const active = pi.getActiveTools();
+			if (name === PARALLEL_TOOL_NAME) {
+				const parsed = parseParallelCalls(args, [POLL_TOOL_NAME]);
+				if (!parsed.ok) return Promise.resolve(parallelErrorResult(parsed.error));
+				const inactive = parsed.calls.find((call) => !dispatchablePiTool(pi.getAllTools(), active, call.name));
+				if (inactive) {
+					const usable = bridgedTools().filter((tool) => active.includes(tool.name)).map((tool) => tool.name);
+					return Promise.resolve({
+						content: [{ type: "text" as const, text: `Pi tool ${inactive.name} is not active in pi right now. Active pi tools: ${usable.join(", ") || "none"}.` }],
+						isError: true,
+					});
+				}
+				return roundTrips.onToolCall(callId, name, args, signal);
+			}
 			if (name !== POLL_TOOL_NAME && !dispatchablePiTool(pi.getAllTools(), active, name)) {
 				const usable = bridgedTools().filter((tool) => active.includes(tool.name)).map((tool) => tool.name);
 				return Promise.resolve({

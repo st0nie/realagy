@@ -6,7 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { test } from "vitest";
+import { test, vi } from "vitest";
 import { AcpDriver } from "../src/acp/driver.js";
 import { conversationDbPath, lastStepIdx, resolveSessionAtStep, userInputSince } from "../src/acp/step-usage.js";
 import type { DriverActivity, DriverTurnRequest, TurnHandle } from "../src/driver-types.js";
@@ -123,6 +123,7 @@ test("bridge calls carry their session and store step, and siblings of one model
 		const controller = new AbortController();
 		const handle = await driver.run({ ...base, prompt: "Run two tools [hang]", signal: controller.signal });
 		await waitFor(wire, "session/prompt");
+		await vi.waitFor(() => assert.equal(lastStepIdx(conversationDbPath(dbDir, "session-1")!), 0));
 		// The model call that requested both tools finished: agy stored it.
 		store(conversationDbPath(dbDir, "session-1")!, [[1, 15, metadata(2000, 40, 8000)]]);
 		handle.pushExternal({ type: "bridge_call", callId: "c1", name: "bash", args: {} });
