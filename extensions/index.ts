@@ -17,7 +17,7 @@ import { defaultConversationsDir } from "../src/acp/step-usage.js";
 import { ensureAgyReady, MANUAL_SETUP, resolveAgyBinary } from "../src/acp/setup.js";
 import { bridgedPiTools, bridgeInputSchema, dispatchablePiTool } from "../src/bridge-catalog.js";
 import { startMcpServer, TOKEN_HEADER, type McpServerHandle } from "../src/mcp-server.js";
-import { entriesFromAcpModels, FALLBACK_MODELS, toPiModel, type AgyModelEntry } from "../src/models.js";
+import { entriesFromAcpModels, FALLBACK_MODELS, reportedModelLimits, toPiModel, type AgyModelEntry } from "../src/models.js";
 import { AgyWorkPanel } from "../src/native-tools.js";
 import { createStreamSimple, failParkedCalls, POLL_TOOL_NAME, ToolRoundTrips } from "../src/provider.js";
 import { toolPolicyPrompt } from "../src/tool-policy.js";
@@ -35,6 +35,10 @@ const SIGN_IN = [
 
 export default async function (pi: ExtensionAPI): Promise<void> {
 	const entries: AgyModelEntry[] = [...FALLBACK_MODELS];
+	// These settings independently control ACP startup and Pi-side metadata.
+	// Restart pi after changing any of them.
+	const noAutoCompaction = process.env.REALAGY_NO_COMPACT === "1";
+	const reportedLimits = reportedModelLimits();
 	pi.registerMessageRenderer(AGY_BACKGROUND_MESSAGE, renderBackgroundCard);
 	// Re-resolved by /agy setup; a missing binary fails the spawn with a
 	// pointer to /agy setup.
@@ -61,6 +65,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	const driver = new AcpDriver({
 		bin: () => bin,
+		noAutoCompaction,
 		mcpServers: () => bridge ? [{
 			name: "pi-bridge",
 			type: "http",
@@ -143,7 +148,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 					resolve: async () => (resolveAgyBinary() ? { auth: {}, source: "agy CLI" } : undefined),
 				},
 			},
-			models: entries.map((entry) => toPiModel(entry)),
+			models: entries.map((entry) => toPiModel(entry, reportedLimits)),
 			api: { stream: (model, context, options) => streamSimple(model, context, options), streamSimple },
 		}));
 	};

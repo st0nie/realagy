@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { entriesFromAcpModels, FALLBACK_MODELS, toAgyEffort, toPiModel } from "../src/models.js";
+import { entriesFromAcpModels, FALLBACK_MODELS, reportedModelLimits, toAgyEffort, toPiModel } from "../src/models.js";
 
 const LIVE = [
 	{ modelId: "gemini-4-argon-medium", name: "Gemini 4 Argon (Medium)" },
@@ -25,22 +25,35 @@ test("ACP catalog exposes Gemini, Claude, and GPT with correct tiers and labels"
 	]);
 });
 
-test("pi model metadata matches live family limits and image/reasoning support", () => {
+test("Pi window and output metadata are independent editable overrides", () => {
 	const entries = entriesFromAcpModels(LIVE);
-	const claude = toPiModel(entries.find((entry) => entry.id === "claude-sonnet-5-5")!);
-	assert.equal(claude.contextWindow, 1_000_000);
-	assert.equal(claude.maxTokens, 128_000);
+	const claudeEntry = entries.find((entry) => entry.id === "claude-sonnet-5-5")!;
+	const claude = toPiModel(claudeEntry);
+	assert.equal(claude.contextWindow, 256_000);
+	assert.equal(toPiModel(claudeEntry, { contextWindow: 100_000, maxTokens: 64_000 }).contextWindow, 100_000);
+	assert.equal(toPiModel(claudeEntry, { contextWindow: 256_000, maxTokens: 32_000 }).maxTokens, 32_000);
+	assert.equal(claude.maxTokens, 64_000);
 	assert.deepEqual(claude.input, ["text", "image"]);
 	assert.deepEqual(claude.thinkingLevelMap, { off: null, minimal: null });
 
-	const gpt = toPiModel(entries.find((entry) => entry.id === "gpt-oss-120b")!);
-	assert.equal(gpt.contextWindow, 131_072);
-	assert.equal(gpt.maxTokens, 32_768);
+	const gptEntry = entries.find((entry) => entry.id === "gpt-oss-120b")!;
+	const gpt = toPiModel(gptEntry);
+	assert.equal(gpt.contextWindow, 256_000);
+	assert.equal(gpt.maxTokens, 64_000);
 	// GPT-OSS cannot see images, not even through agy's native read_file.
 	assert.deepEqual(gpt.input, ["text"]);
 	assert.equal(gpt.reasoning, true);
 	assert.deepEqual(gpt.thinkingLevelMap, { off: null, minimal: null, low: null, high: null });
 	assert.equal(toAgyEffort("high", entries.find((entry) => entry.id === "gpt-oss-120b")!.efforts!), "medium");
+	assert.deepEqual(reportedModelLimits({}), { contextWindow: 256_000, maxTokens: 64_000 });
+	assert.deepEqual(reportedModelLimits({ REALAGY_CONTEXT_WINDOW: "100000", REALAGY_MAX_OUTPUT_TOKENS: "32000" }), {
+		contextWindow: 100_000,
+		maxTokens: 32_000,
+	});
+	assert.deepEqual(reportedModelLimits({ REALAGY_CONTEXT_WINDOW: "bad", REALAGY_MAX_OUTPUT_TOKENS: "-1" }), {
+		contextWindow: 256_000,
+		maxTokens: 64_000,
+	});
 });
 
 test("unknown families remain exact-slug fixed models and noise is rejected", () => {

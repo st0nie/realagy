@@ -99,11 +99,27 @@ function thinkingLevelMapFor(efforts: readonly AgyEffort[]): ThinkingLevelMap {
 	return map as ThinkingLevelMap;
 }
 
-/** Limits from the live ACP/CCPA model metadata (verified 2026-11-04). */
-function familyLimits(full: string): { contextWindow: number; maxTokens: number } {
-	if (/^gpt-oss-/.test(full)) return { contextWindow: 131_072, maxTokens: 32_768 };
-	if (/^claude-/.test(full)) return { contextWindow: 1_000_000, maxTokens: 128_000 };
-	return { contextWindow: 1_048_576, maxTokens: 65_536 };
+export const DEFAULT_CONTEXT_WINDOW = 256_000;
+export const DEFAULT_MAX_OUTPUT_TOKENS = 64_000;
+
+export interface ReportedModelLimits {
+	contextWindow: number;
+	maxTokens: number;
+}
+
+/** Independent Pi-side metadata overrides. These do not change Agy's real
+ * model limits or whether the catalog proxy is enabled. */
+export function reportedModelLimits(env: NodeJS.ProcessEnv = process.env): ReportedModelLimits {
+	return {
+		contextWindow: positiveInteger(env.REALAGY_CONTEXT_WINDOW, DEFAULT_CONTEXT_WINDOW),
+		maxTokens: positiveInteger(env.REALAGY_MAX_OUTPUT_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS),
+	};
+}
+
+function positiveInteger(value: string | undefined, fallback: number): number {
+	if (value === undefined || value.trim() === "") return fallback;
+	const parsed = Number(value);
+	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 /** GPT-OSS is text-only: it cannot see images, not even through agy's native
@@ -112,9 +128,8 @@ function familyInput(full: string): Array<"text" | "image"> {
 	return /^gpt-oss-/.test(full) ? ["text"] : ["text", "image"];
 }
 
-export function toPiModel(entry: AgyModelEntry): Model<Api> {
+export function toPiModel(entry: AgyModelEntry, limits: ReportedModelLimits = reportedModelLimits()): Model<Api> {
 	const effortDriven = !!entry.efforts?.length;
-	const limits = familyLimits(entry.full);
 	return {
 		id: entry.id,
 		name: entry.name ?? entry.full,
