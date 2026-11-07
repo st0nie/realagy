@@ -3,11 +3,11 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { createAssistantMessageEventStream, type AssistantMessageEvent, type Message, type TranscriptContext } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEvent, type Message, type TranscriptContext } from "@earendil-works/pi-ai";
 import { calculateContextTokens, AgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { test, vi } from "vitest";
 import { conversationDbPath, lastStepIdx } from "../src/acp/step-usage.js";
-import { createStreamSimple, ESCALATE_AFTER_MS, POLL_TOOL_NAME, ToolRoundTrips, type AcpSessions } from "../src/provider.js";
+import { createStreamSimple, DEFAULT_SESSION_OVERHEAD, ESCALATE_AFTER_MS, POLL_TOOL_NAME, rotationReason, ToolRoundTrips, type AcpSessions } from "../src/provider.js";
 import type { DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../src/driver-types.js";
 import { FALLBACK_MODELS, toPiModel } from "../src/models.js";
 import {
@@ -902,4 +902,170 @@ test("agy's high-traffic notice fails the turn as a retryable overload instead o
 	assert.equal(error.error.errorMessage, "Antigravity servers are overloaded: Our servers are experiencing high traffic right now, please try again in a minute.");
 	// pi's auto-retry keys on "overloaded" in the error message.
 	assert.match(error.error.errorMessage ?? "", /overloaded/);
+});
+
+// --- agy's own context compaction ----------------------------------------------
+
+const stepUsage = (contextTokens: number): DriverActivity => ({
+	type: "step_usage",
+	usage: { input: contextTokens, output: 0, cacheRead: 0, cacheWrite: 0, contextTokens, steps: 1 },
+});
+
+/** A bridge call as the real driver reports it: with the session and store step. */
+function withSession(handle: FakeHandle, sessionId: string, maxStepIdx: number): void {
+	const push = handle.pushExternal.bind(handle);
+	handle.pushExternal = (activity) => push(activity.type === "bridge_call" ? { ...activity, sessionId, maxStepIdx } : activity);
+}
+
+test("rotationReason moves near-limit or inflated sessions to a smaller fresh one, and never below the floor", () => {
+	const limit = 256_000;
+	const fresh = (tokens: number) => () => tokens;
+	// Below half the limit nothing rotates, however small pi's transcript is.
+	assert.equal(rotationReason({ contextTokens: 120_000, overhead: 5_000 }, fresh(1_000), limit), undefined);
+	// Inflated: realctx dropped much more than a quarter of what agy holds.
+	assert.equal(rotationReason({ contextTokens: 150_000, overhead: 5_000 }, fresh(60_000), limit), "pi-context-smaller");
+	assert.equal(rotationReason({ contextTokens: 150_000, overhead: 5_000 }, fresh(120_000), limit), undefined);
+	// Near agy's limit a 10% gain is enough; without one, keep the session.
+	assert.equal(rotationReason({ contextTokens: 220_000, overhead: 5_000 }, fresh(180_000), limit), "agy-context-limit");
+	assert.equal(rotationReason({ contextTokens: 220_000, overhead: 5_000 }, fresh(210_000), limit), undefined);
+	// Unmeasured sessions are never rotated.
+	assert.equal(rotationReason({}, fresh(1), limit), undefined);
+	// The default overhead stands in for an uncalibrated session.
+	assert.equal(rotationReason({ contextTokens: 220_000 }, fresh(190_000 - DEFAULT_SESSION_OVERHEAD), limit), "agy-context-limit");
+});
+
+async function warmTurn(
+	stream: ReturnType<typeof createStreamSimple>,
+	driver: FakeDriver,
+	model: ReturnType<typeof toPiModel>,
+	messages: Message[],
+	sessionId: string,
+	contextTokens: number,
+	maxStepIdx = 3,
+): Promise<Message> {
+	driver.autoFinish = false;
+	driver.script = [stepUsage(contextTokens), { type: "text", delta: "done" }];
+	const pending = collect(stream(model, context(messages)));
+	await vi.waitFor(() => assert.ok(driver.activeHandle && !(driver.activeHandle as FakeHandle).closed));
+	(driver.activeHandle as FakeHandle).complete({ status: "OK", response: "done", aborted: false, conversationId: sessionId, maxStepIdx });
+	const done = (await pending).find((event) => event.type === "done");
+	if (done?.type !== "done") throw new Error("turn did not finish");
+	return done.message;
+}
+
+test("a session agy compacted on its own is never continued: the next turn starts fresh from pi's transcript", async () => {
+	const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-compacted-"));
+	const driver = new FakeDriver();
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const rotations: string[] = [];
+	const sessions: AcpSessions = { conversationsDir: () => dir, onRotate: (event) => rotations.push(event.reason) };
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver), sessions });
+	const first = [system(), user("remember PERIWINKLE")];
+	const reply = await warmTurn(stream, driver, model, first, "agy-1", 40_000, 3);
+
+	// Without a compaction step the session stays warm.
+	const db = new DatabaseSync(conversationDbPath(dir, "agy-1")!);
+	db.exec("CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB)");
+	db.exec("INSERT INTO steps VALUES (0, 14, NULL), (1, 15, NULL), (2, 14, NULL), (3, 15, NULL)");
+	const second = [...first, reply, user("still there?")];
+	const reply2 = await warmTurn(stream, driver, model, second, "agy-1", 41_000, 3);
+	assert.equal(driver.requests[1].conversationId, "agy-1");
+
+	// agy compacted the session (CORTEX_STEP_TYPE_CHECKPOINT = 23) during that turn.
+	db.exec("INSERT INTO steps VALUES (4, 23, NULL), (5, 15, NULL)");
+	db.close();
+	sessions.warm = { ...sessions.warm!, maxStepIdx: 5 };
+	await warmTurn(stream, driver, model, [...second, reply2, user("what was the word?")], "agy-2", 20_000);
+	assert.equal(driver.requests[2].conversationId, null);
+	assert.match(driver.requests[2].contextBlock!.text, /remember PERIWINKLE/);
+	assert.deepEqual(rotations, ["agy-compacted"]);
+});
+
+test("a warm session near agy's compaction limit moves to a fresh one when pi's transcript is smaller", async () => {
+	const driver = new FakeDriver();
+	assert.equal(toPiModel(FALLBACK_MODELS[0]).contextWindow, 256_000);
+	// A user's models.json may raise pi's window; agy still compacts at 256k.
+	const model = { ...toPiModel(FALLBACK_MODELS[0]), contextWindow: 1_048_576 };
+	const sessions: AcpSessions = {};
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver), sessions });
+	const first = [system(), user("go")];
+	// Calibrates the session: ~8k measured for a tiny seed is agy's overhead.
+	const reply = await warmTurn(stream, driver, model, first, "agy-1", 8_000);
+	assert.equal(sessions.warm?.overhead, 8_000 - Math.ceil((driver.requests[0].prompt.length + driver.requests[0].contextBlock!.text.length) / 4));
+	// agy's session grew to 215k (e.g. tool outputs realctx later dropped from pi's view).
+	const reply2 = await warmTurn(stream, driver, model, [...first, reply, user("more")], "agy-1", 215_000);
+	assert.equal(driver.requests[1].conversationId, "agy-1");
+	assert.equal(sessions.warm?.contextTokens, 215_000);
+	await warmTurn(stream, driver, model, [...first, reply, user("more"), reply2, user("next")], "agy-2", 9_000);
+	assert.equal(driver.requests[2].conversationId, null);
+	assert.equal(sessions.retired?.get("agy-1"), -1);
+});
+
+test("a parked turn whose session nears agy's limit continues in a fresh session that carries the tool result", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const roundTrips = new ToolRoundTrips(driver);
+	const rotations: Array<{ reason: string; midTurn: boolean }> = [];
+	const sessions: AcpSessions = { onRotate: (event) => rotations.push({ reason: event.reason, midTurn: event.midTurn }) };
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+	const start = [system(), user("read the big file")];
+	driver.script = [stepUsage(230_000)];
+	const first = collect(stream(model, context(start)));
+	await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+	withSession(driver.activeHandle as FakeHandle, "agy-big", 7);
+	const parked = roundTrips.onToolCall("call-1", "read", { path: "big.txt" }, new AbortController().signal);
+	const done = (await first).find((event) => event.type === "done");
+	if (done?.type !== "done") throw new Error("no toolUse");
+	assert.equal(done.message.usage.totalTokens, 230_000);
+	assert.equal(sessions.step?.sessionId, "agy-big");
+
+	const result: Message = { role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "file contents" }], isError: false, timestamp: 3 };
+	driver.autoFinish = true;
+	driver.script = [{ type: "text", delta: "summary" }];
+	const events = await collect(stream(model, context([...start, done.message, result])));
+	await assert.rejects(parked);
+	assert.deepEqual(driver.cancels, ["moving to a fresh session (agy-context-limit)"]);
+	assert.equal(driver.requests.length, 2);
+	assert.equal(driver.requests[1].conversationId, null);
+	assert.match(driver.requests[1].contextBlock!.text, /file contents/);
+	assert.deepEqual(rotations, [{ reason: "agy-context-limit", midTurn: true }]);
+	assert.ok(events.some((event) => event.type === "done"));
+});
+
+test("pi compacting mid-turn moves the parked turn to a fresh session seeded with the compacted transcript", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const roundTrips = new ToolRoundTrips(driver);
+	const sessions: AcpSessions = {};
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+	const start = [system(), user("long task")];
+	driver.script = [stepUsage(50_000)];
+	const first = collect(stream(model, context(start)));
+	await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+	withSession(driver.activeHandle as FakeHandle, "agy-long", 9);
+	const parked = roundTrips.onToolCall("call-1", "bash", { command: "ls" }, new AbortController().signal);
+	const done = (await first).find((event) => event.type === "done");
+	if (done?.type !== "done") throw new Error("no toolUse");
+
+	// What extensions/index.ts does on session_compact.
+	sessions.rotateActive = "pi-compacted";
+	const summary = user("The conversation history before this point was compacted into the following summary:\n<summary>did things</summary>");
+	const result: Message = { role: "toolResult", toolCallId: "call-1", toolName: "bash", content: [{ type: "text", text: "a.txt" }], isError: false, timestamp: 3 };
+	driver.autoFinish = true;
+	await collect(stream(model, context([system(), summary, done.message, result])));
+	await assert.rejects(parked);
+	assert.deepEqual(driver.cancels, ["moving to a fresh session (pi-compacted)"]);
+	assert.equal(driver.requests[1].conversationId, null);
+	assert.match(driver.requests[1].contextBlock!.text, /did things/);
+	assert.equal(sessions.rotateActive, undefined);
+});
+
+test("checkpoint context size and overhead survive persistence", () => {
+	const warm = warmAfterTurn(context([system(), user("hi")]), { role: "assistant", content: [], api: "x", provider: "x", model: "x", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 1 } as unknown as AssistantMessage, "s", "/w", 4, { contextTokens: 123_456, overhead: 7_000 });
+	const restored = restoreWarmSessions([{ type: "custom", customType: WARM_SESSION_ENTRY, data: warm }]);
+	assert.equal(restored.warm?.contextTokens, 123_456);
+	assert.equal(restored.warm?.overhead, 7_000);
 });

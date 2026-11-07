@@ -55,6 +55,7 @@ With `REALAGY_AGY_PROFILE=0` (or when the profile cannot be written) agy keeps i
 - When agy answers that its servers are busy ("high traffic"), the turn fails as an overload error, so pi retries it instead of keeping the notice as the answer.
 - If agy cannot start or exits mid-turn, the turn fails with the binary path, the exit code, and agy's last error line. The next prompt starts it again. A turn with no output for 5 minutes is stopped, unless one of agy's own tools is still running.
 - After `/reload`, `pi -c`, or `/tree`, realagy resumes the matching Antigravity session. If agy's copy of that conversation is gone, the next prompt starts a new session with the full pi transcript.
+- agy compacts a long session on its own (into its own summary) once it passes the model's compaction limit: 256k tokens for Gemini 3.8/4 and Claude, 80k for GPT-OSS. pi's context window for each model is that limit, so pi's compaction and context extensions such as realctx act first. When pi's transcript is clearly smaller than agy's session (for example after realctx dropped old tool outputs), or when agy did compact a session, realagy continues in a fresh session seeded with pi's transcript, also in the middle of a tool loop. pi shows a notice when agy had compacted a session. See [Context compaction](docs/architecture.md#context-compaction).
 
 | Environment | Effect |
 | --- | --- |
@@ -70,13 +71,13 @@ With `REALAGY_AGY_PROFILE=0` (or when the profile cannot be written) agy keeps i
 | `extensions/index.ts` | Composition root: pi MCP bridge, `antigravity/*` models, agy discovery, `/agy setup`, `/agy usage` |
 | `src/provider.ts` | pi assistant event stream, MCP → `toolUse` → `toolResult` round-trips, usage mapping |
 | `src/transcript.ts` | Transcript serialization, fingerprints, warm-session turn planning across checkpoints |
-| `src/models.ts` | ACP model catalog parsing, effort grouping, family limits, offline fallback catalog |
+| `src/models.ts` | ACP model catalog parsing, effort grouping, agy compaction limits as context windows (live and offline), offline fallback catalog |
 | `src/mcp-server.ts`, `src/bridge-catalog.ts` | Loopback, token-protected MCP server for pi's tools (every tool an extension may activate; only active ones run) |
 | `src/tool-loadout.ts` | Undoes the situational tools pi's `/tree` restore activates |
 | `src/quota.ts`, `src/usage-trace.ts` | Cache/quota meter, quota-exhaustion notice, usage diagnostics |
 | `src/acp/setup.ts` | Finding `agy` and its data dir |
 | `src/acp/connection.ts`, `driver.ts`, `events.ts`, `jsonrpc.ts` | `agy acp` process, ACP protocol, serialized turns, frame mapping |
-| `src/acp/step-usage.ts` | Exact per-model-call tokens from agy's conversation store, and `/tree` forks of it |
+| `src/acp/step-usage.ts` | Exact per-model-call tokens and compaction steps from agy's conversation store, and `/tree` forks of it |
 | `src/agent-profile.ts`, `src/tool-policy.ts` | agy's custom agent profile (realagy's system prompt, eager pi tools) and the tool policy appended to it |
 | `src/native-tools.ts`, `src/acp/background.ts`, `src/background-card.ts` | Thinking lines and the live panel for agy's own tool calls; finished background work as a conversation card that wakes pi's agent |
 | `src/stream-sanitizer.ts`, `src/file-links.ts`, `src/frame-guard.ts`, `src/redact.ts` | Hiding injected `<SYSTEM_MESSAGE>` blocks, rewriting `file://` links to plain paths, dropping stdout noise, redacting secrets from logs and errors |

@@ -20,6 +20,12 @@ const STEP_TYPE_AGENT = 15;
  *  prompt arrives, before any model output, and keeps it when the prompt is
  *  cancelled (verified live with agy 1.5.1). */
 const STEP_TYPE_USER_INPUT = 14;
+/** steps.step_type of agy's own context compaction (CORTEX_STEP_TYPE_CHECKPOINT).
+ *  Once the session's context passes the model's `max_token_limit`, agy
+ *  summarizes everything before this step: later model calls see only the
+ *  summary, the user messages, and a one-line action log, not the tool
+ *  outputs or replies (verified live with agy 1.5.2). */
+const STEP_TYPE_CHECKPOINT = 23;
 /** node:sqlite is synchronous: a locked store must not stall pi's event loop. */
 const BUSY_TIMEOUT_MS = 100;
 
@@ -177,6 +183,27 @@ export function readStepState(dbPath: string, afterIdx = -1): { steps: StepToken
 export function userInputSince(dbPath: string, afterIdx: number): boolean | undefined {
 	return withDb(dbPath, true, (db) =>
 		db.prepare("SELECT 1 AS found FROM steps WHERE step_type = ? AND idx > ? LIMIT 1").get(STEP_TYPE_USER_INPUT, afterIdx) !== undefined);
+}
+
+/** Index of the session's first compaction step: null when agy never
+ *  compacted it, undefined when the store is unreadable. */
+export function firstCompactionIdx(dbPath: string): number | null | undefined {
+	return withDb(dbPath, true, (db) => {
+		const row = db.prepare("SELECT MIN(idx) AS idx FROM steps WHERE step_type = ?").get(STEP_TYPE_CHECKPOINT) as { idx: number | bigint | null } | undefined;
+		return row?.idx === null || row?.idx === undefined ? null : Number(row.idx);
+	});
+}
+
+/** Whether agy had compacted `sessionId` by step `maxStepIdx` (any step when
+ *  unknown), so continuing it would continue from agy's summary instead of
+ *  the conversation pi recorded. An unreadable store counts as intact. */
+export function compactedBy(dir: string | undefined, sessionId: string, maxStepIdx: number | undefined): boolean {
+	if (!dir) return false;
+	const dbPath = conversationDbPath(dir, sessionId);
+	if (!dbPath) return false;
+	const first = firstCompactionIdx(dbPath);
+	if (first === null || first === undefined) return false;
+	return maxStepIdx === undefined || maxStepIdx < 0 || first <= maxStepIdx;
 }
 
 /** Highest step index currently stored (−1 for an empty or missing store). */

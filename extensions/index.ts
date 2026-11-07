@@ -11,13 +11,13 @@ import { AcpDriver } from "../src/acp/driver.js";
 import { agentProfileEnabled, installAgentProfile } from "../src/agent-profile.js";
 import { backgroundMessageText, defaultBrainDir } from "../src/acp/background.js";
 import { AGY_BACKGROUND_MESSAGE, renderBackgroundCard, type BackgroundCardDetails } from "../src/background-card.js";
-import { fetchCliUsage, UsageMeter } from "../src/quota.js";
+import { fetchAcpModels, fetchCliUsage, UsageMeter } from "../src/quota.js";
 import type { AcpSessions } from "../src/provider.js";
 import { defaultConversationsDir } from "../src/acp/step-usage.js";
 import { ensureAgyReady, MANUAL_SETUP, resolveAgyBinary } from "../src/acp/setup.js";
 import { bridgedPiTools, bridgeInputSchema, dispatchablePiTool } from "../src/bridge-catalog.js";
 import { startMcpServer, TOKEN_HEADER, type McpServerHandle } from "../src/mcp-server.js";
-import { entriesFromAcpModels, FALLBACK_MODELS, toPiModel, type AgyModelEntry } from "../src/models.js";
+import { entriesFromAcpModels, FALLBACK_MODELS, modelLimitsFromAgy, toPiModel, withModelLimits, type AgyModelEntry } from "../src/models.js";
 import { AgyWorkPanel } from "../src/native-tools.js";
 import { createStreamSimple, failParkedCalls, POLL_TOOL_NAME, ToolRoundTrips } from "../src/provider.js";
 import { toolPolicyPrompt } from "../src/tool-policy.js";
@@ -61,6 +61,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	const driver = new AcpDriver({
 		bin: () => bin,
+		// Ask agy to compact as late as it allows: pi owns the transcript and
+		// realagy moves to a fresh session before agy's limit. agy 1.5.2 reads
+		// this only in its interactive CLI, so it is a no-op for `agy acp` today;
+		// a value the user set is kept.
+		extraEnv: { AGY_CLI_AUTO_COMPACT_OVERRIDE: process.env.AGY_CLI_AUTO_COMPACT_OVERRIDE ?? "100%" },
 		mcpServers: () => bridge ? [{
 			name: "pi-bridge",
 			type: "http",
@@ -125,6 +130,13 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		onWarm: (warm) => {
 			pendingWarmEntry = warm;
 		},
+		// Moving to a fresh session before agy's limit is routine and silent.
+		// agy compacting a session means the model worked from agy's summary
+		// for a while, which is worth knowing.
+		onRotate: (event) => {
+			if (stopped || event.reason !== "agy-compacted") return;
+			ui?.notify("Antigravity compacted its session context on its own; realagy continued in a fresh session from pi's transcript.", "info");
+		},
 	};
 	const meter = new UsageMeter();
 	let ready = false;
@@ -157,7 +169,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		bin = status.bin;
 		ready = true;
 		try {
-			const discovered = entriesFromAcpModels(await driver.listModels(process.cwd()));
+			let discovered = entriesFromAcpModels(await driver.listModels(process.cwd()));
+			// agy's compaction limits become pi's context windows, so pi and
+			// context extensions manage the transcript below them. Offline
+			// family limits apply when the metadata is unavailable.
+			const pid = driver.pid;
+			if (pid !== undefined && discovered.length > 0) {
+				try {
+					discovered = withModelLimits(discovered, modelLimitsFromAgy(await fetchAcpModels(pid, { signal: shutdownController.signal })));
+				} catch { /* family limits */ }
+			}
 			if (!stopped && discovered.length > 0) {
 				entries.splice(0, entries.length, ...discovered);
 				registerModels();
@@ -211,8 +232,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	});
 	pi.on("session_compact", () => {
 		pendingWarmEntry = null;
+		// A turn still parked on pi tools holds agy's uncompacted session:
+		// its continuation moves to a fresh session with the compacted
+		// transcript (the provider needs `step` to retire it).
+		if (sessions.step) sessions.rotateActive = "pi-compacted";
 		sessions.parked = undefined;
-		sessions.step = undefined;
 		sessions.warm = undefined;
 		sessions.checkpoints = undefined;
 	});

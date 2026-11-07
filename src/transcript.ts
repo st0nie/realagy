@@ -49,6 +49,13 @@ export interface WarmSession {
 	/** Highest `steps.idx` in `~/.gemini/antigravity-cli/conversations/<sessionId>.db`
 	 *  when this turn completed. Used to fork a truncated store on `/tree` rewind. */
 	maxStepIdx?: number;
+	/** Context agy's latest model call in this session held at this point
+	 *  (measured tokens), for rotating the session before agy compacts it. */
+	contextTokens?: number;
+	/** Measured context minus pi's estimate of the transcript the session was
+	 *  seeded with: agy's own prompt, tools, and tokenizer bias. Inherited by
+	 *  every later checkpoint of the session. */
+	overhead?: number;
 	systemPrompt: string;
 	tools: string;
 }
@@ -333,6 +340,17 @@ export function freshInput(context: TranscriptContext): AcpInput {
 	const system = getCurrentSystemPrompt(context.messages);
 	const header = system ? `<pi-system>\n${system}\n</pi-system>` : "";
 	return transcriptInput("pi://transcript", FRESH_PROMPT, header, context.messages);
+}
+
+/** Rough token count of one image, as pi and realctx estimate it. */
+const IMAGE_TOKENS = 1_200;
+
+/** pi's estimate of an input's size: 4 characters per token plus a flat
+ *  cost per image, the same scale pi and context extensions use. */
+export function estimateInputTokens(input: AcpInput): number {
+	let chars = input.prompt.length + (input.contextBlock?.text.length ?? 0);
+	for (const part of input.parts ?? []) chars += part.prompt.length + (part.contextBlock?.text.length ?? 0);
+	return Math.ceil(chars / 4) + input.images.length * IMAGE_TOKENS;
 }
 
 /** Content fingerprint: role, visible text, tool identities, and image bytes.
@@ -634,6 +652,7 @@ class TranscriptIndex {
 	#prefixHashes: string[] | undefined;
 	#body: BodyEntry[] | undefined;
 	#fresh: AcpInput | undefined;
+	#freshTokens: number | undefined;
 	#tools: string | undefined;
 	#systemPrompt: string | undefined;
 
@@ -699,6 +718,11 @@ class TranscriptIndex {
 		return this.#fresh;
 	}
 
+	freshTokens(): number {
+		this.#freshTokens ??= estimateInputTokens(this.fresh());
+		return this.#freshTokens;
+	}
+
 	tools(): string {
 		this.#tools ??= toolsKey(this.context);
 		return this.#tools;
@@ -711,13 +735,19 @@ class TranscriptIndex {
 }
 
 export type TurnPlan =
-	| { kind: "fresh"; input: AcpInput; reason: string }
-	| { kind: "warm"; sessionId: string; maxStepIdx?: number; input: AcpInput; fallback: AcpInput; deltaMessages: number };
+	| { kind: "fresh"; input: AcpInput; reason: string; freshTokens: number }
+	| { kind: "warm"; sessionId: string; maxStepIdx?: number; input: AcpInput; fallback: AcpInput; deltaMessages: number; warm: WarmSession };
 
-type WarmMatch = { warm: WarmSession; delta: Message[] } | { reason: string };
+type WarmMatch = { warm: WarmSession; delta: Message[] } | { reason: string; vetoed?: true };
+
+/** Veto on continuing a candidate session: a reason to start fresh instead
+ *  (agy compacted it, or a fresh session from pi's transcript would be much
+ *  smaller), or undefined to allow it. `freshTokens` estimates that fresh
+ *  input and is computed only when asked for. */
+export type WarmVeto = (warm: WarmSession, freshTokens: () => number) => string | undefined;
 
 /** Whether `warm` can continue this transcript, and with which delta. */
-function matchWarm(index: TranscriptIndex, cwd: string, warm: WarmSession | undefined): WarmMatch {
+function matchWarm(index: TranscriptIndex, cwd: string, warm: WarmSession | undefined, veto?: WarmVeto): WarmMatch {
 	if (!warm) return { reason: "no-session" };
 	if (warm.cwd !== cwd) return { reason: "cwd" };
 	// A changed active tool set (pi's `<tools>` system messages after an
@@ -729,11 +759,13 @@ function matchWarm(index: TranscriptIndex, cwd: string, warm: WarmSession | unde
 	}
 	if (split.delta.length === 0) return { reason: "history-shrank" };
 	if (!split.delta.some((message) => message.role === "user" || message.role === "toolResult")) return { reason: "no-user-message" };
+	const vetoed = veto?.(warm, () => index.freshTokens());
+	if (vetoed) return { reason: vetoed, vetoed: true };
 	return { warm, delta: split.delta };
 }
 
 function planFromMatch(index: TranscriptIndex, match: WarmMatch): TurnPlan {
-	if ("reason" in match) return { kind: "fresh", input: index.fresh(), reason: match.reason };
+	if ("reason" in match) return { kind: "fresh", input: index.fresh(), reason: match.reason, freshTokens: index.freshTokens() };
 	const { warm, delta } = match;
 	const systemPrompt = index.systemPrompt();
 	const systemChanged = systemPrompt !== warm.systemPrompt;
@@ -766,6 +798,7 @@ function planFromMatch(index: TranscriptIndex, match: WarmMatch): TurnPlan {
 		input,
 		fallback: index.fresh(),
 		deltaMessages: delta.length,
+		warm,
 	};
 }
 
@@ -778,26 +811,42 @@ function toolsUpdate(tools: string): string {
 	return `<pi-tools-update>\n${text}\n</pi-tools-update>`;
 }
 
-export function planTurn(context: TranscriptContext, cwd: string, warm: WarmSession | undefined): TurnPlan {
+export function planTurn(context: TranscriptContext, cwd: string, warm: WarmSession | undefined, veto?: WarmVeto): TurnPlan {
 	const index = new TranscriptIndex(context);
-	return planFromMatch(index, matchWarm(index, cwd, warm));
+	return planFromMatch(index, matchWarm(index, cwd, warm, veto));
+}
+
+/** pi's estimate of the fresh input for this transcript, in tokens. */
+export function freshTokens(context: TranscriptContext): number {
+	return new TranscriptIndex(context).freshTokens();
 }
 
 /** Plan against several remembered sessions (most preferred first): the one
  *  with the smallest delta wins; with none usable, the first one's fresh
  *  reason is reported. Inputs are built only for the winner. */
-export function planTurnFrom(context: TranscriptContext, cwd: string, candidates: readonly WarmSession[]): TurnPlan {
+export function planTurnFrom(context: TranscriptContext, cwd: string, candidates: readonly WarmSession[], veto?: WarmVeto): TurnPlan {
 	const index = new TranscriptIndex(context);
-	let best: Extract<WarmMatch, { warm: WarmSession }> | undefined;
+	const matches: Array<Extract<WarmMatch, { warm: WarmSession }>> = [];
+	// A vetoed session is out entirely: an older checkpoint of it would only
+	// continue the same session with a larger delta. Candidates come newest
+	// first, so its latest matching checkpoint is the one vetoed.
+	const vetoed = new Set<string>();
+	let firstReason: WarmMatch | undefined;
 	for (const candidate of candidates) {
-		const match = matchWarm(index, cwd, candidate);
+		if (vetoed.has(candidate.sessionId)) continue;
+		const match = matchWarm(index, cwd, candidate, veto);
+		firstReason ??= match;
+		if ("vetoed" in match) vetoed.add(candidate.sessionId);
 		if ("reason" in match) continue;
-		if (!best || match.delta.length < best.delta.length) {
-			best = match;
-			if (best.delta.length === 1) break;
-		}
+		matches.push(match);
+		if (match.delta.length === 1) break;
 	}
-	return planFromMatch(index, best ?? matchWarm(index, cwd, candidates[0]));
+	let best: Extract<WarmMatch, { warm: WarmSession }> | undefined;
+	for (const match of matches) {
+		if (vetoed.has(match.warm.sessionId)) continue;
+		if (!best || match.delta.length < best.delta.length) best = match;
+	}
+	return planFromMatch(index, best ?? firstReason ?? matchWarm(index, cwd, undefined));
 }
 
 /** State after a completed turn: the session holds pi's persistent messages
@@ -808,6 +857,7 @@ export function warmAfterTurn(
 	sessionId: string,
 	cwd: string,
 	maxStepIdx?: number,
+	usage: { contextTokens?: number; overhead?: number } = {},
 ): WarmSession {
 	const messages = [...persistentMessages(context.messages), final];
 	const warm: WarmSession = {
@@ -821,6 +871,8 @@ export function warmAfterTurn(
 		tools: toolsKey(context),
 	};
 	if (maxStepIdx !== undefined && maxStepIdx >= 0) warm.maxStepIdx = maxStepIdx;
+	if (usage.contextTokens !== undefined && usage.contextTokens > 0) warm.contextTokens = usage.contextTokens;
+	if (usage.overhead !== undefined && Number.isFinite(usage.overhead)) warm.overhead = usage.overhead;
 	return warm;
 }
 
@@ -862,6 +914,8 @@ function toWarmSession(data: Partial<WarmSession> | null | undefined): WarmSessi
 	if (data.maxStepIdx !== undefined && Number.isFinite(data.maxStepIdx)) {
 		warm.maxStepIdx = Number(data.maxStepIdx);
 	}
+	if (typeof data.contextTokens === "number" && Number.isFinite(data.contextTokens) && data.contextTokens > 0) warm.contextTokens = data.contextTokens;
+	if (typeof data.overhead === "number" && Number.isFinite(data.overhead)) warm.overhead = data.overhead;
 	return warm;
 }
 

@@ -13,18 +13,20 @@ import {
 	type TranscriptContext,
 	type Usage,
 } from "@earendil-works/pi-ai";
-import { resolveSessionAtStep } from "./acp/step-usage.js";
+import { conversationDbPath, firstCompactionIdx, resolveSessionAtStep } from "./acp/step-usage.js";
 import type { AgyStepUsage, AgyUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "./driver-types.js";
-import { toAgyEffort, type AgyModelEntry } from "./models.js";
+import { familyLimits, toAgyEffort, type AgyModelEntry } from "./models.js";
 import { nativeToolLine } from "./native-tools.js";
 import { agyCapacityNotice } from "./acp/events.js";
 import type { BridgeResult } from "./mcp-server.js";
 import {
 	formatToolResult,
+	freshTokens,
 	planTurnFrom,
 	warmAfterTurn,
 	type TurnPlan,
 	type WarmSession,
+	type WarmVeto,
 } from "./transcript.js";
 import { traceUsage } from "./usage-trace.js";
 import { quotaExhaustion, type UsageMeter } from "./quota.js";
@@ -511,8 +513,95 @@ export interface AcpSessions {
 	/** In-flight toolUse turn: if agy ends its prompt while an escalated pi tool
 	 *  is still running, its outcome records a warm checkpoint at `assistant`. */
 	parked?: { handle: TurnHandle };
+	/** agy sessions that must not be continued past a step: agy compacted them,
+	 *  or realagy moved the conversation to a fresh session (sessionId → first
+	 *  retired step; −1 = every step). */
+	retired?: Map<string, number>;
+	/** Set when pi compacted its transcript while an agy turn is still parked
+	 *  on pi tools: the next continuation moves to a fresh session seeded with
+	 *  the compacted transcript instead of feeding agy's full session. */
+	rotateActive?: string;
+	/** The in-flight turn's session overhead (see WarmSession.overhead), or
+	 *  the estimate of its fresh seed until the first measurement. */
+	turnOverhead?: number;
+	turnSeedTokens?: number;
+	/** Called when realagy leaves an agy session for a fresh one. */
+	onRotate?: (event: { reason: string; sessionId: string; contextTokens?: number; midTurn: boolean }) => void;
 }
-function selectTurnPlan(context: TranscriptContext, cwd: string, sessions: AcpSessions): TurnPlan {
+
+/** Fresh-plan reasons that leave a usable-looking session behind on purpose. */
+const ROTATION_REASONS = new Set(["agy-compacted", "agy-context-limit", "pi-context-smaller"]);
+
+/** Share of the model's compaction limit (pi's contextWindow) from which a
+ *  session is moved to a fresh one when pi's transcript is smaller. */
+export const ROTATE_FLOOR = 0.5;
+/** Share of the limit from which agy is about to compact: a smaller gain
+ *  already justifies a fresh session. */
+export const ROTATE_PRESSURE = 0.8;
+/** agy's prompt, tool declarations, and tokenizer bias over pi's estimate,
+ *  when no session measured them yet (~15k measured for agy 1.5.2's default
+ *  agent on a fresh session). */
+export const DEFAULT_SESSION_OVERHEAD = 15_000;
+/** Cap on a calibrated overhead: a fresh turn's first measurement can include
+ *  outputs of agy's own tools that ran before it. */
+export const MAX_SESSION_OVERHEAD = 40_000;
+
+/** Why a session holding `warm.contextTokens` should give way to a fresh one
+ *  seeded with pi's transcript (`freshTokens` estimated), given the model's
+ *  compaction limit; undefined to keep it.
+ *  - agy-context-limit: agy would soon compact the session, and pi's
+ *    transcript is at least 10% smaller.
+ *  - pi-context-smaller: pi's transcript is much smaller than agy's session
+ *    (a context extension such as realctx dropped old tool outputs, or pi
+ *    compacted), so agy's context and usage reports would stay inflated. */
+export function rotationReason(
+	warm: Pick<WarmSession, "contextTokens" | "overhead">,
+	fresh: () => number,
+	limit: number,
+): string | undefined {
+	const used = warm.contextTokens;
+	if (!used || !(limit > 0) || used < limit * ROTATE_FLOOR) return undefined;
+	const projected = fresh() + Math.max(0, warm.overhead ?? DEFAULT_SESSION_OVERHEAD);
+	const saved = used - projected;
+	if (used >= limit * ROTATE_PRESSURE) return saved >= used * 0.1 ? "agy-context-limit" : undefined;
+	return saved >= Math.max(used * 0.25, 16_000) ? "pi-context-smaller" : undefined;
+}
+
+/** Vetoes candidate sessions agy compacted or realagy retired, and those
+ *  worth rotating. A checkpoint before the retired step survives only while
+ *  it is well below the limit (a `/tree` rewind far back). */
+function warmVeto(sessions: AcpSessions, limit: number): WarmVeto {
+	const dir = sessions.conversationsDir?.();
+	const compactions = new Map<string, number | null>();
+	const compactedAt = (sessionId: string): number | null => {
+		if (!compactions.has(sessionId)) {
+			const dbPath = dir ? conversationDbPath(dir, sessionId) : undefined;
+			compactions.set(sessionId, dbPath ? (firstCompactionIdx(dbPath) ?? null) : null);
+		}
+		return compactions.get(sessionId) ?? null;
+	};
+	const survives = (warm: WarmSession, from: number): boolean =>
+		from >= 0 &&
+		warm.maxStepIdx !== undefined &&
+		warm.maxStepIdx < from &&
+		warm.contextTokens !== undefined &&
+		warm.contextTokens < limit * ROTATE_FLOOR;
+	return (warm, fresh) => {
+		const compacted = compactedAt(warm.sessionId);
+		if (compacted !== null && !survives(warm, compacted)) return "agy-compacted";
+		const retired = sessions.retired?.get(warm.sessionId);
+		if (retired !== undefined && !survives(warm, retired)) return "retired";
+		return rotationReason(warm, fresh, limit);
+	};
+}
+
+function retire(sessions: AcpSessions, sessionId: string, from = -1): void {
+	sessions.retired ??= new Map();
+	const previous = sessions.retired.get(sessionId);
+	sessions.retired.set(sessionId, previous === undefined ? from : Math.min(previous, from));
+}
+
+function selectTurnPlan(context: TranscriptContext, cwd: string, sessions: AcpSessions, limit: number): TurnPlan {
 	const candidates: WarmSession[] = [];
 	if (sessions.warm) candidates.push(sessions.warm);
 	const history = sessions.checkpoints ?? [];
@@ -520,9 +609,26 @@ function selectTurnPlan(context: TranscriptContext, cwd: string, sessions: AcpSe
 		const item = history[i];
 		if (item && item !== sessions.warm) candidates.push(item);
 	}
-	const plan = planTurnFrom(context, cwd, candidates);
+	const plan = planTurnFrom(context, cwd, candidates, warmVeto(sessions, limit));
 	if (plan.kind !== "warm") return plan;
 	return { ...plan, sessionId: resolveSessionAtStep(sessions.conversationsDir?.(), plan.sessionId, plan.maxStepIdx) };
+}
+
+/** Why the parked in-flight turn should not continue in its session, given
+ *  pi's current transcript: agy compacted the session during the turn, pi
+ *  compacted its transcript, or the session should rotate. */
+function midTurnRotation(context: TranscriptContext, sessions: AcpSessions, limit: number): { reason: string; step: WarmSession } | undefined {
+	const step = sessions.step;
+	if (!step) return undefined;
+	if (sessions.rotateActive) return { reason: sessions.rotateActive, step };
+	const dir = sessions.conversationsDir?.();
+	const dbPath = dir ? conversationDbPath(dir, step.sessionId) : undefined;
+	const compacted = dbPath ? firstCompactionIdx(dbPath) : undefined;
+	if (compacted !== null && compacted !== undefined && (step.maxStepIdx === undefined || compacted <= step.maxStepIdx)) {
+		return { reason: "agy-compacted", step };
+	}
+	const reason = rotationReason(step, () => freshTokens(context), limit);
+	return reason ? { reason, step } : undefined;
 }
 
 export interface StreamSimpleDeps {
@@ -531,6 +637,14 @@ export interface StreamSimpleDeps {
 	roundTrips: ToolRoundTrips;
 	sessions?: AcpSessions;
 	meter?: UsageMeter;
+}
+
+/** The context at which agy compacts this model's sessions: the entry's
+ *  live or offline limit, and never more than pi's window for the model (a
+ *  user's models.json may raise that window, but agy still compacts). */
+function compactionLimit(model: Model<Api>, entry: AgyModelEntry | undefined): number {
+	const agy = (entry?.limits ?? familyLimits(entry?.full ?? model.id)).contextWindow;
+	return model.contextWindow > 0 ? Math.min(agy, model.contextWindow) : agy;
 }
 
 export function createStreamSimple(deps: StreamSimpleDeps) {
@@ -550,13 +664,24 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 	const recordWarm = (targetContext: TranscriptContext, outcome: TurnOutcome, final: AssistantMessage): void => {
 		if (outcome.status !== "OK" || !outcome.conversationId || sessions.turnCwd === undefined) return;
 		if (outcome.aborted && outcome.promptDelivered !== true) return;
-		remember(warmAfterTurn(targetContext, final, outcome.conversationId, sessions.turnCwd, outcome.maxStepIdx), true);
+		remember(warmAfterTurn(targetContext, final, outcome.conversationId, sessions.turnCwd, outcome.maxStepIdx, measure(final)), true);
+	};
+	/** The context a checkpoint's session holds (the message's measured
+	 *  usage) and the session's overhead, calibrated on its first measurement
+	 *  against the estimate of the fresh transcript it was seeded with. */
+	const measure = (message: AssistantMessage): { contextTokens?: number; overhead?: number } => {
+		const contextTokens = message.usage.totalTokens > 0 ? message.usage.totalTokens : undefined;
+		if (sessions.turnOverhead === undefined && contextTokens !== undefined && sessions.turnSeedTokens !== undefined) {
+			sessions.turnOverhead = Math.min(MAX_SESSION_OVERHEAD, Math.max(0, contextTokens - sessions.turnSeedTokens));
+			sessions.turnSeedTokens = undefined;
+		}
+		return { contextTokens, overhead: sessions.turnOverhead };
 	};
 	/** At a pi tool call the session holds the transcript up to its toolUse
 	 *  message: an Esc during the tool still leaves a matching checkpoint. */
 	const recordStep = (targetContext: TranscriptContext, call: Extract<DriverActivity, { type: "bridge_call" }>, assistant: AssistantMessage): void => {
 		if (!call.sessionId || sessions.turnCwd === undefined) return;
-		remember(warmAfterTurn(targetContext, assistant, call.sessionId, sessions.turnCwd, call.maxStepIdx), false);
+		remember(warmAfterTurn(targetContext, assistant, call.sessionId, sessions.turnCwd, call.maxStepIdx, measure(assistant)), false);
 	};
 	return (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream => {
 		const stream = createAssistantMessageEventStream();
@@ -579,13 +704,32 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 				const results = context.messages.filter((message): message is Extract<Message, { role: "toolResult" }> =>
 					message.role === "toolResult" && deps.roundTrips.isPending(message.toolCallId),
 				);
-				for (let i = 0; i < results.length; i++) {
+				// The parked turn's session no longer matches what pi wants the
+				// model to see: end it, and continue below in a fresh session that
+				// gets pi's transcript, these tool results included.
+				const entry = deps.entries.find((candidate) => candidate.id === model.id);
+				const limit = compactionLimit(model, entry);
+				const rotation = results.length > 0 && !options?.signal?.aborted && deps.driver.reentry()
+					? midTurnRotation(context, sessions, limit)
+					: undefined;
+				sessions.rotateActive = undefined;
+				if (rotation) {
+					retire(sessions, rotation.step.sessionId);
+					traceUsage("rotate", { reason: rotation.reason, sessionId: rotation.step.sessionId, contextTokens: rotation.step.contextTokens, midTurn: true });
+					sessions.onRotate?.({ reason: rotation.reason, sessionId: rotation.step.sessionId, contextTokens: rotation.step.contextTokens, midTurn: true });
+					// agy's pending MCP calls get an error, not pi's results: the
+					// results reach the model through the fresh transcript instead.
+					deps.roundTrips.failAll(`realagy moved to a fresh agy session (${rotation.reason})`, { includeEscalated: true });
+					await deps.driver.cancelActive(`moving to a fresh session (${rotation.reason})`);
+					sessions.parked = undefined;
+				}
+				for (let i = 0; !rotation && i < results.length; i++) {
 					const result = results[i];
 					const trailing = i === results.length - 1 ? context.messages.slice(context.messages.lastIndexOf(result) + 1) : [];
 					const payload = formatToolResult(result, trailing);
 					deps.roundTrips.resolve(result.toolCallId, payload.text, result.isError, payload.images);
 				}
-				const active = results.length > 0 ? deps.driver.reentry() : null;
+				const active = results.length > 0 && !rotation ? deps.driver.reentry() : null;
 				if (active) {
 					sessions.parked = undefined;
 					await consumeTurn(stream, blocks, active, model, options, onCompleted, onToolCall, deps.meter);
@@ -613,15 +757,21 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 				sessions.parked = undefined;
 
 				const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-				const entry = deps.entries.find((candidate) => candidate.id === model.id);
-				const plan = selectTurnPlan(context, cwd, sessions);
+				const plan = selectTurnPlan(context, cwd, sessions, limit);
 				traceUsage("plan", plan.kind === "warm"
 					? { kind: plan.kind, sessionId: plan.sessionId, deltaMessages: plan.deltaMessages, delta: plan.input.contextBlock ? "transcript" : "user", parts: plan.input.parts?.length ?? 0 }
-					: { kind: plan.kind, reason: plan.reason, messages: context.messages.length, parts: plan.input.parts?.length ?? 0 });
+					: { kind: plan.kind, reason: plan.reason, messages: context.messages.length, parts: plan.input.parts?.length ?? 0, freshTokens: plan.freshTokens });
+				const previous = sessions.warm;
+				if (plan.kind === "fresh" && previous && ROTATION_REASONS.has(plan.reason)) {
+					retire(sessions, previous.sessionId);
+					sessions.onRotate?.({ reason: plan.reason, sessionId: previous.sessionId, contextTokens: previous.contextTokens, midTurn: false });
+				}
 				// Unknown until this turn reaches a tool boundary or settles.
 				sessions.warm = undefined;
 				sessions.step = undefined;
 				sessions.turnCwd = cwd;
+				sessions.turnOverhead = plan.kind === "warm" ? plan.warm.overhead : undefined;
+				sessions.turnSeedTokens = plan.kind === "fresh" ? plan.freshTokens : undefined;
 				const request: DriverTurnRequest = {
 					cwd,
 					model: entry?.full ?? model.id,

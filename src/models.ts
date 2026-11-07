@@ -18,6 +18,17 @@ export interface AgyModelEntry {
 	id: string;
 	name?: string;
 	efforts?: AgyEffort[];
+	/** Live limits from agy's model metadata (see modelLimitsFromAgy). */
+	limits?: AgyModelLimits;
+}
+
+/** What pi should treat as a model's window and output cap. */
+export interface AgyModelLimits {
+	/** Usable context: agy's automatic compaction limit, not the model's raw
+	 *  window. Past it agy replaces the session's history with its own summary,
+	 *  so pi (and context extensions) must manage the transcript below it. */
+	contextWindow: number;
+	maxTokens: number;
 }
 
 export interface AcpModelInfo {
@@ -99,11 +110,74 @@ function thinkingLevelMapFor(efforts: readonly AgyEffort[]): ThinkingLevelMap {
 	return map as ThinkingLevelMap;
 }
 
-/** Limits from the live ACP/CCPA model metadata (verified 2026-11-04). */
-function familyLimits(full: string): { contextWindow: number; maxTokens: number } {
-	if (/^gpt-oss-/.test(full)) return { contextWindow: 131_072, maxTokens: 32_768 };
-	if (/^claude-/.test(full)) return { contextWindow: 1_000_000, maxTokens: 128_000 };
-	return { contextWindow: 1_048_576, maxTokens: 65_536 };
+/** Offline limits: agy's compaction limit (`max_token_limit` of the model's
+ *  CASCADE_USE_EXPERIMENT_CHECKPOINTER config) and output cap, read from
+ *  agy 1.5.2's GetAvailableModels on 2026-11-07. The raw windows are larger
+ *  (1M for Gemini and Claude, 131k for GPT-OSS), but agy compacts a session
+ *  once its context passes the limit. Unknown families get the smallest
+ *  Gemini limit. */
+export function familyLimits(full: string): AgyModelLimits {
+	if (/^gpt-oss-/.test(full)) return { contextWindow: 80_000, maxTokens: 32_768 };
+	if (/^claude-/.test(full)) return { contextWindow: 256_000, maxTokens: 128_000 };
+	if (/^gemini-(?:3\.8|4)-/.test(full)) return { contextWindow: 256_000, maxTokens: 65_536 };
+	return { contextWindow: 128_000, maxTokens: 65_536 };
+}
+
+/** Per-ACP-model limits from the body of agy's language-server RPC
+ *  `GetAvailableModels`: the compaction limit when agy compacts the model's
+ *  sessions (capped by the raw window), else the raw window. */
+export function modelLimitsFromAgy(body: string): Map<string, AgyModelLimits> {
+	const out = new Map<string, AgyModelLimits>();
+	let models: unknown;
+	try {
+		models = (JSON.parse(body) as { response?: { models?: unknown } })?.response?.models;
+	} catch {
+		return out;
+	}
+	if (!models || typeof models !== "object") return out;
+	for (const [id, raw] of Object.entries(models as Record<string, unknown>)) {
+		if (!raw || typeof raw !== "object") continue;
+		const model = raw as { maxTokens?: unknown; maxOutputTokens?: unknown; modelExperiments?: { experiments?: Record<string, { stringValue?: unknown }> } };
+		const window = positive(model.maxTokens);
+		const maxTokens = positive(model.maxOutputTokens);
+		if (!window || !maxTokens) continue;
+		let contextWindow = window;
+		const checkpointer = model.modelExperiments?.experiments?.CASCADE_USE_EXPERIMENT_CHECKPOINTER?.stringValue;
+		if (typeof checkpointer === "string") {
+			try {
+				const config = JSON.parse(checkpointer) as { enabled?: unknown; max_token_limit?: unknown };
+				const limit = positive(config.max_token_limit);
+				if (config.enabled !== false && limit) contextWindow = Math.min(window, limit);
+			} catch { /* keep the raw window */ }
+		}
+		out.set(id, { contextWindow, maxTokens: Math.min(maxTokens, Math.floor(contextWindow / 2)) });
+	}
+	return out;
+}
+
+function positive(value: unknown): number | undefined {
+	const n = typeof value === "string" ? Number(value) : value;
+	return typeof n === "number" && Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
+}
+
+/** Attach live limits to catalog entries: an effort-driven entry gets the
+ *  smallest limits of its tiers. Entries agy reports nothing for keep none. */
+export function withModelLimits(entries: readonly AgyModelEntry[], limits: ReadonlyMap<string, AgyModelLimits>): AgyModelEntry[] {
+	return entries.map((entry) => {
+		const ids = entry.efforts?.length ? entry.efforts.map((effort) => `${entry.full}-${effort}`) : [entry.full];
+		const found = ids.flatMap((id) => {
+			const value = limits.get(id);
+			return value ? [value] : [];
+		});
+		if (found.length === 0) return entry;
+		return {
+			...entry,
+			limits: {
+				contextWindow: Math.min(...found.map((value) => value.contextWindow)),
+				maxTokens: Math.min(...found.map((value) => value.maxTokens)),
+			},
+		};
+	});
 }
 
 /** GPT-OSS is text-only: it cannot see images, not even through agy's native
@@ -114,7 +188,7 @@ function familyInput(full: string): Array<"text" | "image"> {
 
 export function toPiModel(entry: AgyModelEntry): Model<Api> {
 	const effortDriven = !!entry.efforts?.length;
-	const limits = familyLimits(entry.full);
+	const limits = entry.limits ?? familyLimits(entry.full);
 	return {
 		id: entry.id,
 		name: entry.name ?? entry.full,

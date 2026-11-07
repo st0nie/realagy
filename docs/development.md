@@ -43,6 +43,8 @@ REALAGY_TRACE_USAGE=/tmp/trace.jsonl pi      # turn plans, usage_update, step to
 
 `scripts/probe-context-usage.mts` checks that pi's context count matches agy's occupancy.
 
+`scripts/probe-compaction.mts [override] [rounds] [kb] [model]` grows one raw ACP session with filler prompts and prints its step types after each round: a `23` is agy's own compaction (GPT-OSS compacts past 80k, so `"" 6 64 gpt-oss` shows it within six rounds). `scripts/probe-rotation.mts [model]` runs four pi turns through the provider, drops the two big tool outputs from pi's view the way realctx does, and shows realagy moving to a fresh session before agy compacts (the code word from turn 1 must survive).
+
 ## Conventions
 
 - Keep the extension minimal: one command (`/agy setup`, `/agy usage`), no installers, sign-in flows, config panel, fallback engine, delegation framework, or global agy/MCP mutation. The one exception is realagy's hidden agent profile in `~/.gemini/config/agents/realagy-<hash>.md` (`src/agent-profile.ts`): it affects only processes started with `--agent`, and stale copies are pruned.

@@ -157,6 +157,33 @@ export async function fetchAcpQuota(
 	return parseCliUsage(body);
 }
 
+const ACP_MODELS_PATH = "/exa.language_server_pb.LanguageServerService/GetAvailableModels";
+
+/** Raw `GetAvailableModels` body of the live `agy acp` process: per-model
+ *  windows, output caps, and the compaction config agy applies (parsed by
+ *  modelLimitsFromAgy). The port is logged once the server's language
+ *  server starts, on the first session/new, so it is polled for briefly. */
+export async function fetchAcpModels(pid: number, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<string> {
+	const deadline = Date.now() + (options.timeoutMs ?? 5_000);
+	let port = findAcpHttpPort(pid);
+	while (port === undefined && Date.now() < deadline && !options.signal?.aborted) {
+		await new Promise((resolve) => setTimeout(resolve, 200));
+		port = findAcpHttpPort(pid);
+	}
+	if (port === undefined) throw new Error("agy acp language server port not found");
+	const timeoutSignal = AbortSignal.timeout(Math.max(1_000, deadline - Date.now()));
+	const signal = options.signal ? AbortSignal.any([options.signal, timeoutSignal]) : timeoutSignal;
+	const res = await fetch(`http://127.0.0.1:${port}${ACP_MODELS_PATH}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: "{}",
+		signal,
+	});
+	const body = await res.text();
+	if (!res.ok) throw new Error(`agy ACP models HTTP ${res.status}: ${body.slice(0, 200)}`);
+	return body;
+}
+
 export interface FetchUsageOptions {
 	timeoutMs?: number;
 	signal?: AbortSignal;
