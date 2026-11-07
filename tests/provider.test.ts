@@ -1340,3 +1340,93 @@ test("the reclaim policy is configurable: off keeps sessions warm, tighter value
 		roundTrips.failAll("test done");
 	}
 });
+
+test("mid-turn realctx history summaries ending on assistant steps accumulate hidden bytes, restart, and do not persist the cancelled session", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	let activeConversationId = "acp-bloated";
+	driver.cancelActive = async (reason: string): Promise<void> => {
+		const active = driver.activeHandle;
+		if (!(active instanceof FakeHandle) || active.closed) return;
+		driver.cancels.push(reason);
+		const outcome = { status: "OK", response: "", aborted: true, promptDelivered: true, conversationId: activeConversationId } as const;
+		active.complete(outcome);
+		driver.onTurnEnd?.(outcome);
+	};
+	const roundTrips = new ToolRoundTrips(driver);
+	driver.onTurnEnd = (outcome) => failParkedCalls(roundTrips, outcome);
+	const persisted: string[] = [];
+	const sessions: AcpSessions = { onWarm: (warm) => persisted.push(warm.sessionId) };
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+	const withSession = (handle: FakeHandle, id: string): void => {
+		const push = handle.pushExternal.bind(handle);
+		handle.pushExternal = (activity) => push(activity.type === "bridge_call" ? { ...activity, sessionId: id } : activity);
+	};
+	try {
+		const u1 = user("audit the whole crate");
+		const step1 = collect(stream(model, context([system(), u1])));
+		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+		const handle = driver.activeHandle as FakeHandle;
+		withSession(handle, "acp-bloated");
+
+		void roundTrips.onToolCall("c1", "read", { path: "a.rs" }, new AbortController().signal);
+		const done1 = (await step1).find((event) => event.type === "done");
+		if (done1?.type !== "done") throw new Error("no toolUse 1");
+		const r1 = toolResult("c1", "a".repeat(20_000));
+
+		const step2 = collect(stream(model, context([system(), u1, done1.message, r1])));
+		await vi.waitFor(() => assert.ok(!roundTrips.isPending("c1")));
+		void roundTrips.onToolCall("c2", "read", { path: "b.rs" }, new AbortController().signal);
+		const done2 = (await step2).find((event) => event.type === "done");
+		if (done2?.type !== "done") throw new Error("no toolUse 2");
+		const r2 = toolResult("c2", "b".repeat(20_000));
+
+		const step3 = collect(stream(model, context([system(), u1, done1.message, r1, done2.message, r2])));
+		await vi.waitFor(() => assert.ok(!roundTrips.isPending("c2")));
+		void roundTrips.onToolCall("c3", "read", { path: "c.rs" }, new AbortController().signal);
+		const done3 = (await step3).find((event) => event.type === "done");
+		if (done3?.type !== "done") throw new Error("no toolUse 3");
+		const r3 = toolResult("c3", "c".repeat(1_000));
+		const heldBeforeSummaries = sessions.step?.bytes ?? 0;
+		assert.ok(heldBeforeSummaries > 40_000);
+
+		// Part h1 replaces [u1, a1, r1]: the intact suffix starts at assistant a2 (no new user prompt).
+		// ~20 KB reclaimed is below 32 KB, so the turn stays warm AND keeps counting the 20 KB in step.bytes.
+		const h1 = user('<realctx-history part="h1" turns="1-1" replaced="5k tok">\nRead a.rs.\n</realctx-history>');
+		const step4 = collect(stream(model, context([system(), h1, done2.message, r2, done3.message, r3])));
+		await vi.waitFor(() => assert.ok(!roundTrips.isPending("c3")));
+		const call4 = roundTrips.onToolCall("c4", "read", { path: "d.rs" }, new AbortController().signal);
+		const done4 = (await step4).find((event) => event.type === "done");
+		if (done4?.type !== "done") throw new Error("no toolUse 4");
+		assert.equal(driver.cancels.length, 0);
+		assert.ok((sessions.step?.bytes ?? 0) >= heldBeforeSummaries, `${sessions.step?.bytes} < ${heldBeforeSummaries}`);
+
+		// Part h2 stacks onto h1, replacing [a2, r2] (2 items, with 2 leading summaries): ~40 KB > 32 KB & 10%.
+		activeConversationId = "acp-bloated";
+		driver.script = [{ type: "text", delta: "fresh reply" }];
+		const origRun = driver.run.bind(driver);
+		driver.run = async (request) => {
+			const next = (await origRun(request)) as FakeHandle;
+			next.complete({ status: "OK", response: "fresh reply", aborted: false, conversationId: "acp-fresh" });
+			return next;
+		};
+		const h2 = user('<realctx-history part="h2" turns="2-2" replaced="5k tok">\nRead b.rs.\n</realctx-history>');
+		const r4 = toolResult("c4", "d");
+		const done5 = (await collect(stream(model, context([system(), h1, h2, done3.message, r3, done4.message, r4])))).find((event) => event.type === "done");
+		assert.equal(done5?.type, "done");
+		await assert.rejects(call4);
+		assert.equal(driver.cancels.length, 1);
+		assert.equal(driver.requests.length, 2);
+		assert.equal(driver.requests[1].conversationId, null);
+		const freshText = driver.requests[1].contextBlock?.text ?? "";
+		assert.match(freshText, /part="h1"/);
+		assert.match(freshText, /part="h2"/);
+		assert.ok(!freshText.includes("aaaaaaaaaa"));
+		assert.ok(!freshText.includes("bbbbbbbbbb"));
+		// Only the new fresh session is persisted; the cancelled bloated session is never recorded.
+		assert.deepEqual(persisted, ["acp-fresh"]);
+	} finally {
+		roundTrips.failAll("test done");
+	}
+});

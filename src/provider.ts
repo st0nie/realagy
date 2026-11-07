@@ -698,6 +698,7 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 				}
 				if (reclaim) {
 					traceUsage("reclaim", { sessionId: step?.sessionId, held: step?.bytes, results: results.length });
+					sessions.parked = undefined;
 					deps.roundTrips.failAll(RECLAIM_REASON, { includeEscalated: true });
 					await deps.driver.cancelActive(RECLAIM_REASON);
 				} else {

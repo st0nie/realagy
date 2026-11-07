@@ -596,6 +596,17 @@ function matchWarmItems(
 		if (splitIdx !== null) return splitIdx;
 	}
 
+	if (maxSummaryLead > 0) {
+		for (let drop = 2; drop < warmItems.length; drop++) {
+			const startRole = warmItems[drop]?.role;
+			if (startRole === "toolResult") continue;
+			const target = warmItems.slice(drop);
+			if (target.length < 2 && startRole !== "assistant") continue;
+			if (body.length - maxSummaryLead < target.length) continue;
+			const splitIdx = matchSequence(body, maxSummaryLead, target, false);
+			if (splitIdx !== null) return splitIdx;
+		}
+	}
 	const maxUserLead = countLeadingUsers(body);
 	for (let drop = 2; drop <= warmItems.length - 2; drop++) {
 		if (warmItems[drop]?.role !== "user") continue;
@@ -622,7 +633,7 @@ function matchKeySuffix(
 	for (let drop = 0; drop < targetKeys.length; drop++) {
 		const kept = targetKeys.length - drop;
 		if (drop > 0 && (drop < 2 || kept < 2)) continue;
-		const maxLead = drop === 0 ? maxSummaryLead : Math.min(drop - 1, maxUserLead, body.length - kept);
+		const maxLead = drop === 0 ? maxSummaryLead : Math.min(Math.max(maxSummaryLead, Math.min(drop - 1, maxUserLead)), body.length - kept);
 		for (let lead = 0; lead <= maxLead; lead++) {
 			if (body.length - lead < kept) continue;
 			let matches = true;
@@ -889,8 +900,10 @@ function toolsUpdate(tools: string): string {
 
 /** For a running turn about to continue on `warm` (its tool-boundary
  *  checkpoint): the bytes the session holds beyond pi's current view, and
- *  whether that is enough to restart on a fresh session instead. Undefined
- *  when the checkpoint has no `bytes` or no longer matches. */
+ *  whether that is enough to restart on a fresh session instead. When an
+ *  extension rewrote history past prefix matching, the whole current
+ *  transcript is a conservative upper bound on what remains visible.
+ *  Undefined when the checkpoint has no `bytes`. */
 export function measureWarm(
 	context: TranscriptContext,
 	warm: WarmSession,
@@ -899,8 +912,8 @@ export function measureWarm(
 	if (warm.bytes === undefined) return undefined;
 	const index = new TranscriptIndex(context);
 	const split = splitWarmTranscript(index, warm);
-	if (!split) return undefined;
-	const hidden = hiddenBytes(index, warm, split.end) ?? 0;
+	const visible = split ? index.bytesBefore(split.end) : index.bytesBefore(index.messages.length);
+	const hidden = Math.max(0, warm.bytes - visible);
 	// Mid-turn the prompt cache is hot: only the share rule applies.
 	return { hidden, reclaim: shouldReclaim(hidden, warm.bytes, false, policy) };
 }
