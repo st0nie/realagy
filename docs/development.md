@@ -45,8 +45,8 @@ REALAGY_TRACE_USAGE=/tmp/trace.jsonl pi      # turn plans, usage_update, step to
 
 ## Conventions
 
-- Keep the extension minimal: one command (`/agy settings`, `/agy setup`, `/agy usage`), one small settings menu, no installers, sign-in flows, fallback engine, delegation framework, or global agy/MCP mutation. The exceptions are realagy's settings file in `~/.pi/agent/realagy/settings.json` and hidden agent profile in `~/.gemini/config/agents/realagy-<hash>.md` (`src/agent-profile.ts`): the profile affects only processes started with `--agent`, and stale copies are pruned.
-- Under the profile the model has only pi's tools; without it (`REALAGY_AGY_PROFILE=0`) agy decides which tools to use, its own or pi's. Pi owns the transcript and rendering.
+- Keep the extension minimal: one command (`/realagy settings`, `/realagy setup`, `/realagy usage`), one TUI settings view, no installers, sign-in flows, fallback engine, delegation framework, or global agy/MCP mutation. The exceptions are realagy's config file in `~/.pi/agent/realagy/config.json` (`src/settings.ts`) and hidden agent profile in `~/.gemini/config/agents/realagy-<hash>.md` (`src/agent-profile.ts`): the profile affects only processes started with `--agent`, and stale copies are pruned.
+- Under the profile (`agentProfile: true`, default) the model has only pi's tools; without it (`agentProfile: false` in `/realagy settings`) agy decides which tools to use, its own or pi's. Compaction bypass (`noAutoCompaction: true`, default) rewrites Agy's catalog over loopback so Pi owns compaction across each model's full context window. Pi owns the transcript and rendering.
 - Small functional modules, explicit types, early returns.
 - `agy acp` ignores `enabledTools`/`disabledTools`, so realagy sends neither. `eagerMcpServers: ["pi-bridge"]` avoids agy's lazy `call_mcp_tool` loop under the default agent; a custom agent ignores it, so the profile lists every bridged tool as `eager`.
 - agy refuses native reads inside its own data dir (`~/.gemini`), so never hand the model files there.
@@ -62,4 +62,4 @@ REALAGY_TRACE_USAGE=/tmp/trace.jsonl pi      # turn plans, usage_update, step to
 - The conversation store is agy's internal format. Every read degrades to "no measurement" rather than failing a turn. The stores are in WAL mode: never copy a `.db` file by itself (use `VACUUM INTO`).
 - ACP `session/cancel` is a notification. Sent as a request, agy cancels the prompt but never answers the request.
 - `session/load` of an unknown session id succeeds with an empty session. Check that `<sessionId>.db` exists before trusting a load.
-- `agy --print /usage` takes about 10 s. Run it only from `/agy usage`, never on a turn's path or in the background.
+- `agy --print /usage` takes about 10 s. Run it only from `/realagy usage`, never on a turn's path or in the background.

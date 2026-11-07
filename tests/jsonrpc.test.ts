@@ -78,10 +78,10 @@ test("ACP turn usage parses every agy field and rejects malformed counts", () =>
 	assert.equal(parseAcpTurnUsage([1]), undefined);
 });
 
-test("auth errors point at agy sign-in and /agy setup", () => {
+test("auth errors point at agy sign-in and /realagy setup", () => {
 	const err = translateError("session/new", new JsonRpcResponseError({ code: -32000, message: "auth", data: { message: "not signed in" } }));
 	assert.ok(err instanceof AcpAuthError);
-	assert.match(err.message, /not signed in.*Sign in with `agy`.*\/agy setup/);
+	assert.match(err.message, /not signed in.*Sign in with `agy`.*\/realagy setup/);
 	const typed = translateError("x", new JsonRpcResponseError({ code: -32601, message: "Method not found" }));
 	assert.equal((typed as JsonRpcResponseError).code, -32601);
 });

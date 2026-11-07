@@ -140,8 +140,3 @@ function pruneAgentProfiles(dir: string, keep: string, now: number, log?: Instal
 	}
 }
 
-/** `REALAGY_AGY_PROFILE=0|false|off` keeps agy's default agent. */
-export function agentProfileEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-	const value = env.REALAGY_AGY_PROFILE?.trim().toLowerCase();
-	return !(value === "0" || value === "false" || value === "off" || value === "no");
-}

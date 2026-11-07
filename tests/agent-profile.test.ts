@@ -6,7 +6,6 @@ import { test } from "vitest";
 import {
 	agentProfile,
 	agentProfileDir,
-	agentProfileEnabled,
 	installAgentProfile,
 	PROFILE_MAX_IDLE_MS,
 	PROFILE_PROMPT,
@@ -74,10 +73,7 @@ test("install reports failure instead of throwing", () => {
 	assert.deepEqual(logs, ["agent-profile-failed"]);
 });
 
-test("profile location and opt-out", () => {
+test("profile location honors GEMINI_HOME", () => {
 	assert.equal(agentProfileDir({ GEMINI_HOME: path.join("/g") }), path.join("/g", "config", "agents"));
 	assert.equal(agentProfileDir({}), path.join(os.homedir(), ".gemini", "config", "agents"));
-	assert.equal(agentProfileEnabled({}), true);
-	for (const value of ["0", "false", "off", "no", " OFF "]) assert.equal(agentProfileEnabled({ REALAGY_AGY_PROFILE: value }), false, value);
-	assert.equal(agentProfileEnabled({ REALAGY_AGY_PROFILE: "1" }), true);
 });

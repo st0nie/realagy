@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { entriesFromAcpModels, FALLBACK_MODELS, toAgyEffort, toPiModel } from "../src/models.js";
+import { entriesFromAcpModels, FALLBACK_MODELS, familyLimits, toAgyEffort, toPiModel } from "../src/models.js";
 
 const LIVE = [
 	{ modelId: "gemini-4-argon-medium", name: "Gemini 4 Argon (Medium)" },
@@ -25,26 +25,42 @@ test("ACP catalog exposes Gemini, Claude, and GPT with correct tiers and labels"
 	]);
 });
 
-test("Pi window and output metadata are independent editable overrides", () => {
+test("Pi models follow each model's real window by default and honor optional config overrides", () => {
 	const entries = entriesFromAcpModels(LIVE);
+	const argonEntry = entries.find((entry) => entry.id === "gemini-4-argon")!;
+	const argon = toPiModel(argonEntry);
+	assert.equal(argon.contextWindow, 1_048_576);
+	assert.equal(argon.maxTokens, 65_536);
+
 	const claudeEntry = entries.find((entry) => entry.id === "claude-sonnet-5-5")!;
 	const claude = toPiModel(claudeEntry);
-	assert.equal(claude.contextWindow, 256_000);
-	assert.equal(toPiModel(claudeEntry, { contextWindow: 100_000, maxTokens: 64_000 }).contextWindow, 100_000);
-	assert.equal(toPiModel(claudeEntry, { contextWindow: 256_000, maxTokens: 32_000 }).maxTokens, 32_000);
-	assert.equal(claude.maxTokens, 64_000);
+	assert.equal(claude.contextWindow, 1_000_000);
+	assert.equal(claude.maxTokens, 128_000);
+	assert.equal(toPiModel(claudeEntry, { contextWindow: 256_000 }).contextWindow, 256_000);
+	assert.equal(toPiModel(claudeEntry, { contextWindow: 256_000 }).maxTokens, 128_000);
+	assert.equal(toPiModel(claudeEntry, { maxOutputTokens: 32_000 }).maxTokens, 32_000);
 	assert.deepEqual(claude.input, ["text", "image"]);
 	assert.deepEqual(claude.thinkingLevelMap, { off: null, minimal: null });
 
 	const gptEntry = entries.find((entry) => entry.id === "gpt-oss-120b")!;
 	const gpt = toPiModel(gptEntry);
-	assert.equal(gpt.contextWindow, 256_000);
-	assert.equal(gpt.maxTokens, 64_000);
+	assert.equal(gpt.contextWindow, 131_072);
+	assert.equal(gpt.maxTokens, 32_768);
 	// GPT-OSS cannot see images, not even through agy's native read_file.
 	assert.deepEqual(gpt.input, ["text"]);
 	assert.equal(gpt.reasoning, true);
 	assert.deepEqual(gpt.thinkingLevelMap, { off: null, minimal: null, low: null, high: null });
-	assert.equal(toAgyEffort("high", entries.find((entry) => entry.id === "gpt-oss-120b")!.efforts!), "medium");
+	assert.equal(toAgyEffort("high", gptEntry.efforts!), "medium");
+
+	// Upstream catalog limits captured by CatalogProxy win over family fallbacks,
+	// while explicit config overrides still take precedence.
+	const liveWithLimits = entriesFromAcpModels([
+		{ modelId: "gemini-4-argon-high", name: "Gemini 4 Argon (High)", contextWindow: 2_097_152, maxTokens: 98_304 },
+	]);
+	assert.equal(toPiModel(liveWithLimits[0]).contextWindow, 2_097_152);
+	assert.equal(toPiModel(liveWithLimits[0]).maxTokens, 98_304);
+	assert.equal(toPiModel(liveWithLimits[0], { contextWindow: 500_000 }).contextWindow, 500_000);
+	assert.deepEqual(familyLimits("gemini-4-argon"), { contextWindow: 1_048_576, maxTokens: 65_536 });
 });
 
 test("unknown families remain exact-slug fixed models and noise is rejected", () => {

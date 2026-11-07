@@ -18,11 +18,15 @@ export interface AgyModelEntry {
 	id: string;
 	name?: string;
 	efforts?: AgyEffort[];
+	contextWindow?: number;
+	maxTokens?: number;
 }
 
 export interface AcpModelInfo {
 	modelId: string;
 	name?: string;
+	contextWindow?: number;
+	maxTokens?: number;
 }
 
 export function toAgyEffort(reasoning: ThinkingLevel | undefined, efforts: readonly AgyEffort[]): AgyEffort {
@@ -81,15 +85,29 @@ export function entriesFromRaw(raw: string): AgyModelEntry[] {
 	return entries.filter((entry) => entry.id.length > 0);
 }
 
-/** Convert ACP's availableModels directly. Its two fields are modelId and a
- * human label; no CLI subprocess or cached raw catalog is needed. */
+/** Convert ACP's availableModels directly, preserving any upstream token limits
+ * captured from the Cloud Code model catalog. */
 export function entriesFromAcpModels(models: readonly AcpModelInfo[]): AgyModelEntry[] {
 	const entries = entriesFromRaw(models.map((m) => m.modelId).join("\n"));
 	return entries.map((entry) => {
-		const source = models.find((m) => m.modelId === entry.full || m.modelId.startsWith(`${entry.full}-`));
-		if (!source?.name) return entry;
-		const name = entry.efforts ? source.name.replace(/\s+\((?:High|Medium|Low)\)$/i, "") : source.name;
-		return { ...entry, name: name || entry.full };
+		const variants = models.filter((m) =>
+			entry.efforts
+				? TIER_RE.exec(m.modelId)?.[1] === entry.full || m.modelId === entry.full
+				: m.modelId === entry.full,
+		);
+		const named = variants.find((m) => m.name !== undefined);
+		const rawName = named?.name
+			? entry.efforts
+				? named.name.replace(/\s+\((?:High|Medium|Low)\)$/i, "")
+				: named.name
+			: undefined;
+		const contextWindow = variants.find((m) => m.contextWindow !== undefined)?.contextWindow;
+		const maxTokens = variants.find((m) => m.maxTokens !== undefined)?.maxTokens;
+		const result: AgyModelEntry = { ...entry };
+		if (rawName !== undefined) result.name = rawName || entry.full;
+		if (contextWindow !== undefined) result.contextWindow = contextWindow;
+		if (maxTokens !== undefined) result.maxTokens = maxTokens;
+		return result;
 	});
 }
 
@@ -99,16 +117,20 @@ function thinkingLevelMapFor(efforts: readonly AgyEffort[]): ThinkingLevelMap {
 	return map as ThinkingLevelMap;
 }
 
-export const DEFAULT_CONTEXT_WINDOW = 256_000;
-export const DEFAULT_MAX_OUTPUT_TOKENS = 64_000;
-
-export interface ReportedModelLimits {
-	contextWindow: number;
-	maxTokens: number;
+/** Per-family limits from live Cloud Code model metadata (verified 2026-11).
+ * Used before live discovery finishes or when the catalog proxy is disabled. */
+export function familyLimits(full: string): { contextWindow: number; maxTokens: number } {
+	if (/^gpt-oss-/.test(full)) return { contextWindow: 131_072, maxTokens: 32_768 };
+	if (/^claude-/.test(full)) return { contextWindow: 1_000_000, maxTokens: 128_000 };
+	return { contextWindow: 1_048_576, maxTokens: 65_536 };
 }
 
-/** Independent Pi-side metadata. These values do not change Agy's real
- * model limits or whether the catalog proxy is enabled. */
+/** Optional Pi-side metadata overrides from ~/.pi/agent/realagy/config.json.
+ * Omitted fields follow each model's real context window and output limit. */
+export interface ModelLimitOverrides {
+	contextWindow?: number;
+	maxOutputTokens?: number;
+}
 
 /** GPT-OSS is text-only: it cannot see images, not even through agy's native
  *  read_file (verified live with agy 1.5.1). */
@@ -116,11 +138,9 @@ function familyInput(full: string): Array<"text" | "image"> {
 	return /^gpt-oss-/.test(full) ? ["text"] : ["text", "image"];
 }
 
-export function toPiModel(
-	entry: AgyModelEntry,
-	limits: ReportedModelLimits = { contextWindow: DEFAULT_CONTEXT_WINDOW, maxTokens: DEFAULT_MAX_OUTPUT_TOKENS },
-): Model<Api> {
+export function toPiModel(entry: AgyModelEntry, overrides?: ModelLimitOverrides): Model<Api> {
 	const effortDriven = !!entry.efforts?.length;
+	const defaults = familyLimits(entry.full);
 	return {
 		id: entry.id,
 		name: entry.name ?? entry.full,
@@ -131,8 +151,8 @@ export function toPiModel(
 		...(effortDriven ? { thinkingLevelMap: thinkingLevelMapFor(entry.efforts!) } : {}),
 		input: familyInput(entry.full),
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: limits.contextWindow,
-		maxTokens: limits.maxTokens,
+		contextWindow: overrides?.contextWindow ?? entry.contextWindow ?? defaults.contextWindow,
+		maxTokens: overrides?.maxOutputTokens ?? entry.maxTokens ?? defaults.maxTokens,
 	};
 }
 

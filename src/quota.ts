@@ -1,4 +1,4 @@
-// `/agy usage`: cache-hit rate from exact per-model-call usage (step_usage)
+// `/realagy usage`: cache-hit rate from exact per-model-call usage (step_usage)
 // and plan quota from the live `agy acp` Language Server ConnectRPC endpoint
 // (with fallback to `agy --print /usage`), plus agy's fixed "Usage Limit
 // Reached" notice, which arrives as ordinary model text.
@@ -309,7 +309,7 @@ function groupHeader(group: UsageGroup): string {
 	return models ? `${group.name} · ${models}` : group.name;
 }
 
-/** Per-extension accumulator behind `/agy usage`. */
+/** Per-extension accumulator behind `/realagy usage`. */
 export class UsageMeter {
 	prompt = 0;
 	cacheRead = 0;
@@ -336,7 +336,7 @@ export class UsageMeter {
 		this.exhausted = info;
 	}
 
-	/** Multi-line report for `/agy usage`. */
+	/** Multi-line report for `/realagy usage`. */
 	report(now = new Date()): string {
 		const lines: string[] = [];
 		lines.push(this.prompt > 0

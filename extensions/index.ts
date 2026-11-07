@@ -8,7 +8,7 @@
 import { createProvider } from "@earendil-works/pi-ai";
 import { BorderedLoader, type ExtensionAPI, type ExtensionCommandContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { AcpDriver } from "../src/acp/driver.js";
-import { agentProfileEnabled, installAgentProfile } from "../src/agent-profile.js";
+import { installAgentProfile } from "../src/agent-profile.js";
 import { backgroundMessageText, defaultBrainDir } from "../src/acp/background.js";
 import { AGY_BACKGROUND_MESSAGE, renderBackgroundCard, type BackgroundCardDetails } from "../src/background-card.js";
 import { fetchCliUsage, UsageMeter } from "../src/quota.js";
@@ -18,7 +18,15 @@ import { ensureAgyReady, MANUAL_SETUP, resolveAgyBinary } from "../src/acp/setup
 import { bridgedPiTools, bridgeInputSchema, dispatchablePiTool } from "../src/bridge-catalog.js";
 import { startMcpServer, TOKEN_HEADER, type McpServerHandle } from "../src/mcp-server.js";
 import { entriesFromAcpModels, FALLBACK_MODELS, toPiModel, type AgyModelEntry } from "../src/models.js";
-import { editRealagySettings, loadRealagySettings, realagySettingsPath, saveRealagySettings } from "../src/settings.js";
+import {
+	editRealagyConfigMenu,
+	formatConfigSummary,
+	loadRealagyConfig,
+	realagyConfigPath,
+	RealagySettingsComponent,
+	saveRealagyConfig,
+	type RealagyConfig,
+} from "../src/settings.js";
 import { AgyWorkPanel } from "../src/native-tools.js";
 import { createStreamSimple, failParkedCalls, POLL_TOOL_NAME, ToolRoundTrips } from "../src/provider.js";
 import { toolPolicyPrompt } from "../src/tool-policy.js";
@@ -31,17 +39,16 @@ const SIGN_IN = [
 	"Sign in with the Antigravity CLI in a terminal (realagy never handles credentials):",
 	"  agy                # interactive sign-in on first run",
 	"  agy acp --login    # or sign in without starting a chat",
-	"Then run /agy setup again.",
+	"Then run /realagy setup again.",
 ].join("\n");
 
 export default async function (pi: ExtensionAPI): Promise<void> {
 	const entries: AgyModelEntry[] = [...FALLBACK_MODELS];
-	// Environment supplies defaults; /agy settings persists per-field overrides.
-	let settings = loadRealagySettings();
-	const settingsPath = realagySettingsPath();
+	const configPath = realagyConfigPath();
+	let config = loadRealagyConfig(configPath);
 	pi.registerMessageRenderer(AGY_BACKGROUND_MESSAGE, renderBackgroundCard);
-	// Re-resolved by /agy setup; a missing binary fails the spawn with a
-	// pointer to /agy setup.
+	// Re-resolved by /realagy setup; a missing binary fails the spawn with a
+	// pointer to /realagy setup.
 	let bin = resolveAgyBinary() ?? "agy";
 	let bridge: McpServerHandle | null = null;
 	let stopped = false;
@@ -65,7 +72,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	const driver = new AcpDriver({
 		bin: () => bin,
-		noAutoCompaction: () => settings.noAutoCompaction,
+		noAutoCompaction: () => config.noAutoCompaction,
 		mcpServers: () => bridge ? [{
 			name: "pi-bridge",
 			type: "http",
@@ -79,7 +86,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		// Every bridged tool (and the poll helper) is marked eager in the
 		// profile; without the bridge, agy's default agent keeps its own tools.
 		agent: () =>
-			bridge && agentProfileEnabled()
+			bridge && config.agentProfile
 				? installAgentProfile([...bridgedTools().map((tool) => tool.name), POLL_TOOL_NAME])
 				: undefined,
 		onNativeTool: (event) => workPanel.update(event),
@@ -144,11 +151,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			baseUrl: "agy-bridge://antigravity",
 			auth: {
 				apiKey: {
-					name: "Antigravity CLI sign-in (see /agy setup)",
+					name: "Antigravity CLI sign-in (see /realagy setup)",
 					resolve: async () => (resolveAgyBinary() ? { auth: {}, source: "agy CLI" } : undefined),
 				},
 			},
-			models: entries.map((entry) => toPiModel(entry, settings)),
+			models: entries.map((entry) => toPiModel(entry, config)),
 			api: { stream: (model, context, options) => streamSimple(model, context, options), streamSimple },
 		}));
 	};
@@ -176,8 +183,8 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		const result = await discover();
 		if (stopped || result.ok) return;
 		ctx.ui.notify(result.missing
-			? `Antigravity: ${result.error}. Run /agy setup for install steps.`
-			: `Antigravity model discovery failed: ${result.error}. Run /agy setup to sign in.`, "warning");
+			? `Antigravity: ${result.error}. Run /realagy setup for install steps.`
+			: `Antigravity model discovery failed: ${result.error}. Run /realagy setup to sign in.`, "warning");
 	};
 
 	const syncWarmFromSession = (ctx: { sessionManager?: { getBranch?: () => unknown[]; getEntries?: () => unknown[] } }): void => {
@@ -283,11 +290,22 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		}
 	};
 
-	pi.registerCommand("agy", {
-		description: "Antigravity: /agy settings, /agy setup, or /agy usage",
+	const applySavedConfig = (next: RealagyConfig, ctx: ExtensionCommandContext): boolean => {
+		try {
+			config = saveRealagyConfig(next, configPath);
+			registerModels();
+			return true;
+		} catch (error) {
+			ctx.ui.notify(`Could not save ${configPath}: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return false;
+		}
+	};
+
+	pi.registerCommand("realagy", {
+		description: "Antigravity: /realagy settings, /realagy setup, or /realagy usage",
 		getArgumentCompletions: (prefix) => {
 			const items = [
-				{ value: "settings", label: "settings", description: "Pi token limits and the Agy auto-compaction bypass" },
+				{ value: "settings", label: "settings", description: "Configure compaction bypass, agent profile, and Pi token limits" },
 				{ value: "setup", label: "setup", description: "Check agy and show how to install it or sign in" },
 				{ value: "usage", label: "usage", description: "Cache hits and plan quota" },
 			];
@@ -297,26 +315,49 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		handler: async (args, ctx) => {
 			const sub = args.trim();
 			if (sub === "settings") {
-				const draft = await editRealagySettings(ctx.ui, settings);
-				if (stopped || !draft) return;
-				const restartAgy = draft.noAutoCompaction !== settings.noAutoCompaction;
-				try {
-					saveRealagySettings(draft, settingsPath);
-				} catch (error) {
-					ctx.ui.notify(`Could not save ${settingsPath}: ${error instanceof Error ? error.message : String(error)}`, "error");
+				const before = { ...config };
+				if (ctx.mode === "tui" && typeof ctx.ui.custom === "function") {
+					await ctx.ui.custom<void>(
+						(tui, theme, _kb, done) =>
+							new RealagySettingsComponent({
+								tui,
+								theme,
+								config,
+								configPath,
+								onChange: (next) => {
+									applySavedConfig(next, ctx);
+								},
+								onClose: () => done(undefined),
+							}),
+						{ blocked: { kind: "question", message: "Antigravity settings" } },
+					);
+				} else if (ctx.hasUI && typeof ctx.ui.select === "function" && typeof ctx.ui.input === "function") {
+					const draft = await editRealagyConfigMenu(ctx.ui, config);
+					if (stopped || !draft) return;
+					if (!applySavedConfig(draft, ctx)) return;
+				} else {
+					ctx.ui.notify(formatConfigSummary(config, configPath), "info");
 					return;
 				}
-				settings = draft;
-				registerModels();
-				if (restartAgy) await driver.restart();
 				if (stopped) return;
-				ctx.ui.notify([
-					`Saved to ${settingsPath}`,
-					`Disable Agy auto-compaction: ${settings.noAutoCompaction ? "ON" : "OFF"}`,
-					`Pi context window: ${settings.contextWindow} tokens`,
-					`Pi max output tokens: ${settings.maxTokens} tokens`,
-					...(restartAgy ? ["Agy will use the new setting on its next turn."] : []),
-				].join("\n"), "info");
+				const changed =
+					config.noAutoCompaction !== before.noAutoCompaction ||
+					config.agentProfile !== before.agentProfile ||
+					config.contextWindow !== before.contextWindow ||
+					config.maxOutputTokens !== before.maxOutputTokens;
+				if (!changed) return;
+				const restartAgy =
+					config.noAutoCompaction !== before.noAutoCompaction ||
+					config.agentProfile !== before.agentProfile;
+				if (restartAgy && !driver.activeHandle) await driver.restart();
+				if (stopped) return;
+				ctx.ui.notify(
+					[
+						formatConfigSummary(config, configPath),
+						...(restartAgy ? ["Agy will use the updated process settings on its next turn."] : []),
+					].join("\n"),
+					"info",
+				);
 				return;
 			}
 			if (sub === "setup") {
@@ -326,19 +367,19 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				if (result.ok) {
 					ctx.ui.notify(`Antigravity is ready: ${bin} is signed in and offers ${result.models} models. Pick one with /model.`, "info");
 				} else if (result.missing) {
-					ctx.ui.notify(`Antigravity: ${result.error}.\n\n${MANUAL_SETUP}\n\nThen run /agy setup again.`, "warning");
+					ctx.ui.notify(`Antigravity: ${result.error}.\n\n${MANUAL_SETUP}\n\nThen run /realagy setup again.`, "warning");
 				} else {
 					ctx.ui.notify(`Antigravity: ${bin} is installed but not usable: ${result.error}\n\n${SIGN_IN}`, "warning");
 				}
 				return;
 			}
 			if (sub !== "usage") {
-				ctx.ui.notify("Usage: /agy settings | /agy setup | /agy usage", "info");
+				ctx.ui.notify("Usage: /realagy settings | /realagy setup | /realagy usage", "info");
 				return;
 			}
 			if (!ready) {
 				const status = ensureAgyReady();
-				ctx.ui.notify(status.ok ? "Antigravity is still starting; try again shortly." : `Antigravity: ${status.error}. Run /agy setup for install steps.`, "warning");
+				ctx.ui.notify(status.ok ? "Antigravity is still starting; try again shortly." : `Antigravity: ${status.error}. Run /realagy setup for install steps.`, "warning");
 				return;
 			}
 			let quotaError = "";

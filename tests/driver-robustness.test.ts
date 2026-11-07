@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
+import http from "node:http";
 import path from "node:path";
 import { test } from "vitest";
 import { AcpDriver, type AcpDriverOptions } from "../src/acp/driver.js";
@@ -129,16 +130,16 @@ test("agy exiting mid-turn fails the turn with its exit code and last stderr lin
 	}
 });
 
-test("a missing agy binary fails turns and discovery with a /agy setup pointer", async () => {
+test("a missing agy binary fails turns and discovery with a /realagy setup pointer", async () => {
 	const driver = new AcpDriver({ bin: path.join(os.tmpdir(), "realagy-no-such-agy") });
 	try {
-		await assert.rejects(driver.listModels(process.cwd()), /Cannot start the Antigravity CLI .*realagy-no-such-agy.*Run \/agy setup/);
+		await assert.rejects(driver.listModels(process.cwd()), /Cannot start the Antigravity CLI .*realagy-no-such-agy.*Run \/realagy setup/);
 		const handle = await driver.run({ ...base, prompt: "hi" });
 		await drain(handle);
 		const outcome = await handle.outcome;
 		assert.equal(outcome.status, "ERROR");
 		assert.match(outcome.error ?? "", /ENOENT/);
-		assert.match(outcome.error ?? "", /Run \/agy setup/);
+		assert.match(outcome.error ?? "", /Run \/realagy setup/);
 	} finally {
 		await driver.close();
 	}
@@ -240,4 +241,95 @@ test("close() settles the active turn and stops the process", async () => {
 	const outcome = await handle.outcome;
 	assert.equal(outcome.status, "ERROR");
 	assert.match(outcome.error ?? "", /shut down/);
+});
+
+
+test("real-agy mode enables the catalog proxy by default, enriches listModels limits, and honors opt-out", async () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-proxy-default-"));
+	const capture = path.join(dir, "requests.ndjson");
+	fs.writeFileSync(capture, "");
+	const fakeAgy = path.join(dir, "fake-agy.mjs");
+	const fakeServer = path.join(process.cwd(), "tests/helpers/fake-acp-server.mjs");
+	fs.writeFileSync(
+		fakeAgy,
+		[
+			`#!${process.execPath}`,
+			`const idx = process.argv.indexOf("--cloud_code_endpoint");`,
+			`if (idx !== -1 && process.argv[idx + 1]) {`,
+			`  await fetch(process.argv[idx + 1] + "/v1internal:fetchAvailableModels", { method: "POST", body: "{}" });`,
+			`}`,
+			`process.env.FAKE_ACP_RECORD_ARGV = "1";`,
+			`process.argv = [process.argv[0], ${JSON.stringify(fakeServer)}, ${JSON.stringify(capture)}, ...process.argv.slice(2)];`,
+			`await import(${JSON.stringify(fakeServer)});`,
+		].join("\n"),
+		{ mode: 0o755 },
+	);
+
+	let catalogHits = 0;
+	const upstream = http.createServer((req, res) => {
+		if (req.url === "/v1internal:fetchAvailableModels") {
+			catalogHits += 1;
+			res.writeHead(200, { "content-type": "application/json" });
+			res.end(
+				JSON.stringify({
+					models: {
+						"gemini-3.8-flash-medium": {
+							maxTokens: 1_048_576,
+							maxOutputTokens: 65_536,
+							modelExperiments: {
+								experiments: {
+									CASCADE_USE_EXPERIMENT_CHECKPOINTER: {
+										stringValue: JSON.stringify({ enabled: true, max_token_limit: "80000" }),
+									},
+								},
+							},
+						},
+					},
+				}),
+			);
+			return;
+		}
+		res.writeHead(404).end();
+	});
+	await new Promise<void>((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+	const port = (upstream.address() as { port: number }).port;
+
+	let noAutoCompaction = true;
+	const logs: string[] = [];
+	const driver = new AcpDriver({
+		bin: fakeAgy,
+		noAutoCompaction: () => noAutoCompaction,
+		cloudCodeUpstream: `http://127.0.0.1:${port}`,
+		extraEnv: { NO_PROXY: "*" },
+		log: (msg) => logs.push(msg),
+	});
+	const wire = () =>
+		fs
+			.readFileSync(capture, "utf8")
+			.trim()
+			.split("\n")
+			.filter(Boolean)
+			.map((line) => JSON.parse(line) as WireRequest);
+	try {
+		const models = await driver.listModels(process.cwd());
+		assert.equal(catalogHits, 1);
+		const flash = models.find((m) => m.modelId === "gemini-3.8-flash-medium");
+		assert.equal(flash?.contextWindow, 1_048_576);
+		assert.equal(flash?.maxTokens, 65_536);
+		const firstArgv = wire().find((r) => r.method === "argv")?.params.argv as string[];
+		assert.equal(firstArgv[0], "acp");
+		assert.equal(firstArgv[1], "--cloud_code_endpoint");
+		assert.match(firstArgv[2] ?? "", /^http:\/\/127\.0\.0\.1:\d+$/);
+
+		noAutoCompaction = false;
+		await drain(await driver.run({ ...base, prompt: "after opt-out" }));
+		assert.ok(logs.includes("compaction-changed"));
+		const argvs = wire().filter((r) => r.method === "argv").map((r) => r.params.argv);
+		assert.deepEqual(argvs.at(-1), ["acp"]);
+	} finally {
+		await driver.close();
+		upstream.closeAllConnections();
+		await new Promise<void>((resolve) => upstream.close(() => resolve()));
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
 });

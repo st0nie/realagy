@@ -46,14 +46,14 @@ const DEFAULT_INACTIVITY_MIN = 5;
 const CANCEL_GRACE_MS = 10_000;
 
 export interface AcpDriverOptions {
-	/** agy binary. A function is resolved per spawn, so `/agy setup` can
+	/** agy binary. A function is resolved per spawn, so `/realagy setup` can
 	 *  point the next spawn at a newly found binary. */
 	bin: string | (() => string);
 	/** argv for the binary (tests: the fake-server script). Default `acp`.
 	 * Explicit args also disable the real-Agy catalog proxy. */
 	binArgs?: string[];
 	/** Rewrite Agy's catalog through a loopback proxy to disable its local
-	 * automatic checkpointer. Default false: keep Agy's normal limits. */
+	 * automatic checkpointer. Default true: unlock Agy's full context window. */
 	noAutoCompaction?: boolean | (() => boolean);
 	/** Cloud Code origin used by the proxy (tests may use a local HTTP server). */
 	cloudCodeUpstream?: string;
@@ -166,6 +166,8 @@ export class AcpDriver implements TurnDriver {
 	#background: BackgroundMessages | undefined;
 	/** Shared by real Agy respawns while noAutoCompaction is enabled. */
 	#catalogProxy: CatalogProxy | undefined;
+	/** Whether the live `#conn` was spawned with the catalog proxy. */
+	#connNoAutoCompaction: boolean | undefined;
 
 	constructor(opts: AcpDriverOptions) {
 		this.#opts = opts;
@@ -175,11 +177,15 @@ export class AcpDriver implements TurnDriver {
 	get pid(): number | undefined {
 		return this.#conn?.alive ? this.#conn.pid : undefined;
 	}
-	/** Read the account's live catalog through the official ACP session flow. */
-	async listModels(cwd: string): Promise<Array<{ modelId: string; name?: string }>> {
+	/** Read the account's live catalog through the official ACP session flow,
+	 * enriched with upstream per-model token limits when the proxy is active. */
+	async listModels(cwd: string): Promise<Array<{ modelId: string; name?: string; contextWindow?: number; maxTokens?: number }>> {
 		const conn = await this.#ensureConnection(cwd);
 		const session = await conn.newSession(cwd);
-		return session.availableModels;
+		return session.availableModels.map((model) => {
+			const limits = this.#catalogProxy?.modelLimits(model.modelId);
+			return limits ? { ...model, ...limits } : model;
+		});
 	}
 
 	get activeHandle(): TurnHandle | null {
@@ -648,6 +654,7 @@ export class AcpDriver implements TurnDriver {
 	#onConnectionExit(conn: AcpConnection, info: AcpExitInfo): void {
 		if (this.#conn === conn) {
 			this.#conn = undefined;
+			this.#connNoAutoCompaction = undefined;
 			this.#liveSessions.clear();
 			// agy's background tasks and subagents died with it.
 			this.#background?.forgetAll();
@@ -681,14 +688,30 @@ export class AcpDriver implements TurnDriver {
 	 *  sessions resume in the new process. */
 	#retireStaleAgent(): void {
 		const conn = this.#conn;
-		if (!this.#opts.agent || this.#starting || !conn?.alive) return;
-		const agent = this.#resolveAgent();
-		if (agent === conn.agent) return;
-		this.#log("agent-changed", { from: conn.agent ?? null, to: agent ?? null });
-		this.#conn = undefined;
-		this.#liveSessions.clear();
-		this.#background?.forgetAll();
-		conn.kill();
+		if (this.#starting || !conn?.alive) return;
+		if (this.#opts.agent) {
+			const agent = this.#resolveAgent();
+			if (agent !== conn.agent) {
+				this.#log("agent-changed", { from: conn.agent ?? null, to: agent ?? null });
+				this.#conn = undefined;
+				this.#connNoAutoCompaction = undefined;
+				this.#liveSessions.clear();
+				this.#background?.forgetAll();
+				conn.kill();
+				return;
+			}
+		}
+		if (!this.#opts.binArgs && this.#connNoAutoCompaction !== undefined) {
+			const next = this.#noAutoCompaction();
+			if (next !== this.#connNoAutoCompaction) {
+				this.#log("compaction-changed", { from: this.#connNoAutoCompaction, to: next });
+				this.#conn = undefined;
+				this.#connNoAutoCompaction = undefined;
+				this.#liveSessions.clear();
+				this.#background?.forgetAll();
+				conn.kill();
+			}
+		}
 	}
 
 	#ensureConnection(cwd: string): Promise<AcpConnection> {
@@ -705,7 +728,7 @@ export class AcpDriver implements TurnDriver {
 
 	#noAutoCompaction(): boolean {
 		const value = this.#opts.noAutoCompaction;
-		return typeof value === "function" ? value() : value === true;
+		return typeof value === "function" ? value() : value !== false;
 	}
 
 	async #startConnection(cwd: string): Promise<AcpConnection> {
@@ -714,7 +737,8 @@ export class AcpDriver implements TurnDriver {
 		let conn: AcpConnection | undefined;
 		try {
 			let binArgs = this.#opts.binArgs;
-			if (!binArgs && this.#noAutoCompaction()) {
+			const useCatalogProxy = !binArgs && this.#noAutoCompaction();
+			if (useCatalogProxy) {
 				this.#catalogProxy ??= new CatalogProxy({
 					upstream: this.#opts.cloudCodeUpstream,
 					env: { ...process.env, ...this.#opts.extraEnv },
@@ -738,8 +762,9 @@ export class AcpDriver implements TurnDriver {
 				onExit: (info) => this.#onConnectionExit(conn!, info),
 			});
 			this.#conn = conn;
+			this.#connNoAutoCompaction = useCatalogProxy;
 			this.#liveSessions.clear();
-			this.#log("spawn", { bin, agent: agent ?? null, noAutoCompaction: this.#noAutoCompaction() });
+			this.#log("spawn", { bin, agent: agent ?? null, noAutoCompaction: useCatalogProxy });
 			await conn.start();
 			return conn;
 		} catch (err) {
@@ -750,7 +775,7 @@ export class AcpDriver implements TurnDriver {
 				conn.kill();
 			}
 			this.#log("start-failed", { message: describe(err) });
-			throw new Error(`Cannot start the Antigravity CLI (${bin}): ${describe(err)}. Run /agy setup.`);
+			throw new Error(`Cannot start the Antigravity CLI (${bin}): ${describe(err)}. Run /realagy setup.`);
 		}
 	}
 
@@ -929,6 +954,7 @@ export class AcpDriver implements TurnDriver {
 		if (starting) await starting.catch(() => undefined);
 		const conn = this.#conn;
 		this.#conn = undefined;
+		this.#connNoAutoCompaction = undefined;
 		this.#liveSessions.clear();
 		conn?.kill();
 		const catalogProxy = this.#catalogProxy;
@@ -944,6 +970,7 @@ export class AcpDriver implements TurnDriver {
 		if (turn && !turn.closed) this.#failTurn(turn, "Antigravity driver shut down mid-turn");
 		const conn = this.#conn;
 		this.#conn = undefined;
+		this.#connNoAutoCompaction = undefined;
 		this.#starting = undefined;
 		this.#liveSessions.clear();
 		conn?.kill();

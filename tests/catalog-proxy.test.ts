@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import http, { type Server } from "node:http";
 import { gzipSync } from "node:zlib";
 import { test } from "vitest";
-import { CatalogProxy, isModelCatalogPath, rewriteModelCatalog } from "../src/acp/catalog-proxy.js";
+import { CatalogProxy, extractCatalogModelLimits, isModelCatalogPath, rewriteModelCatalog } from "../src/acp/catalog-proxy.js";
 
 function fixture() {
 	return {
@@ -26,6 +26,10 @@ function fixture() {
 
 test("catalog rewrite disables checkpointing and defeats both local clamps", () => {
 	const payload = fixture();
+	assert.deepEqual(extractCatalogModelLimits(payload).get("gpt-oss-120b-medium"), {
+		contextWindow: 131_072,
+		maxTokens: 32_768,
+	});
 	assert.equal(rewriteModelCatalog(payload), 1);
 	const model = payload.models["gpt-oss-120b-medium"];
 	assert.equal(model.maxTokens, 1_000_000_000);
@@ -102,6 +106,10 @@ test("loopback proxy rewrites gzip catalogs and streams other RPCs unchanged", a
 		assert.equal(response.status, 200);
 		const payload = await response.json();
 		assert.equal(payload.models["gpt-oss-120b-medium"].maxTokens, 1_000_000_000);
+		assert.deepEqual(proxy.modelLimits("gpt-oss-120b-medium"), {
+			contextWindow: 131_072,
+			maxTokens: 32_768,
+		});
 		assert.equal(authorization, "Bearer test");
 		assert.equal(requestBody, "{}");
 

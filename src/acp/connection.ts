@@ -476,7 +476,7 @@ export function translateError(method: string, err: unknown): Error {
 		if (err.code === -32000) {
 			const detail = record(err.data).message;
 			const detailText = typeof detail === "string" ? detail : err.message;
-			return new AcpAuthError(`Antigravity sign-in required (${method}: ${detailText}). Sign in with \`agy\` in a terminal, then run /agy setup.`);
+			return new AcpAuthError(`Antigravity sign-in required (${method}: ${detailText}). Sign in with \`agy\` in a terminal, then run /realagy setup.`);
 		}
 		// Typed protocol errors survive: callers may branch on .code.
 		return err;

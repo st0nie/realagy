@@ -62,6 +62,41 @@ function hasCheckpointer(modelExperiments: unknown): boolean {
 	return experiments !== undefined && Object.keys(experiments).some((key) => key.startsWith(CHECKPOINTER_PREFIX));
 }
 
+export interface CatalogModelLimits {
+	contextWindow?: number;
+	maxTokens?: number;
+}
+
+function positiveCatalogLimit(value: unknown): number | undefined {
+	const parsed = typeof value === "number"
+		? value
+		: typeof value === "string" && /^\d+$/.test(value)
+			? Number(value)
+			: Number.NaN;
+	return Number.isSafeInteger(parsed) && parsed > 0 && parsed < DISABLED_MODEL_MAX_TOKENS ? parsed : undefined;
+}
+
+/** Capture upstream per-model token limits before checkpointer rewriting
+ * raises `maxTokens` above the model window. */
+export function extractCatalogModelLimits(payload: unknown): Map<string, CatalogModelLimits> {
+	const limits = new Map<string, CatalogModelLimits>();
+	const root = object(payload);
+	const models = object(root?.models) ?? object(object(root?.response)?.models);
+	if (!models) return limits;
+	for (const [modelId, raw] of Object.entries(models)) {
+		const info = object(raw);
+		if (!info) continue;
+		const contextWindow = positiveCatalogLimit(info.maxTokens ?? info.max_tokens);
+		const maxTokens = positiveCatalogLimit(info.maxOutputTokens ?? info.max_output_tokens);
+		if (contextWindow !== undefined || maxTokens !== undefined) {
+			limits.set(modelId, {
+				...(contextWindow !== undefined ? { contextWindow } : {}),
+				...(maxTokens !== undefined ? { maxTokens } : {}),
+			});
+		}
+	}
+	return limits;
+}
 /** Rewrite Agy's local checkpointer controls in-place. Returns the number of
  * changed experiment configurations (not the number of changed fields). */
 export function rewriteModelCatalog(payload: unknown): number {
@@ -111,6 +146,7 @@ export class CatalogProxy {
 	#starting: Promise<string> | undefined;
 	#requests = new Set<AbortController>();
 	#dispatchers = new Map<string, ProxyAgent>();
+	#modelLimits = new Map<string, CatalogModelLimits>();
 
 	constructor(opts: CatalogProxyOptions = {}) {
 		this.#opts = opts;
@@ -118,6 +154,10 @@ export class CatalogProxy {
 
 	get endpoint(): string | undefined {
 		return this.#endpoint;
+	}
+
+	modelLimits(modelId: string): CatalogModelLimits | undefined {
+		return this.#modelLimits.get(modelId);
 	}
 
 	start(): Promise<string> {
@@ -154,7 +194,11 @@ export class CatalogProxy {
 		}
 		const dispatchers = [...this.#dispatchers.values()];
 		this.#dispatchers.clear();
-		await Promise.all(dispatchers.map(async (dispatcher) => dispatcher.close()));
+		this.#modelLimits.clear();
+		for (const dispatcher of dispatchers) {
+			const closable = dispatcher as { close?: () => Promise<void> | void };
+			await closable.close?.();
+		}
 	}
 
 	async #handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -187,6 +231,7 @@ export class CatalogProxy {
 			res.once("close", () => {
 				if (!res.writableEnded) controller.abort();
 			});
+			// SAFETY: Readable.toWeb(req) yields a web ReadableStream of Buffer chunks compatible with undici's fetch body.
 			const body = req.method === "GET" || req.method === "HEAD"
 				? undefined
 				: Readable.toWeb(req) as unknown as ReadableStream<Uint8Array>;
@@ -230,6 +275,9 @@ export class CatalogProxy {
 		}
 		try {
 			const payload = JSON.parse(raw.toString("utf8")) as unknown;
+			for (const [modelId, limits] of extractCatalogModelLimits(payload)) {
+				this.#modelLimits.set(modelId, limits);
+			}
 			const changed = rewriteModelCatalog(payload);
 			if (!changed) this.#opts.log?.("catalog-rewrite-warning", { reason: "no enabled checkpointer configuration changed" });
 			else this.#opts.log?.("catalog-rewrite", { configurations: changed });
@@ -288,7 +336,12 @@ function proxyFor(target: URL, env: NodeJS.ProcessEnv): URL | undefined {
 	const value = target.protocol === "https:"
 		? env.HTTPS_PROXY ?? env.https_proxy ?? env.HTTP_PROXY ?? env.http_proxy
 		: env.HTTP_PROXY ?? env.http_proxy;
-	return value ? new URL(value) : undefined;
+	if (!value) return undefined;
+	try {
+		return new URL(value);
+	} catch {
+		throw new Error(`invalid proxy URL: ${value}`);
+	}
 }
 
 function bypassProxy(hostname: string, noProxy: string | undefined): boolean {

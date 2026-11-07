@@ -4,7 +4,7 @@ import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-	ensure: vi.fn(), listModels: vi.fn(), close: vi.fn(), register: vi.fn(), fetchCliUsage: vi.fn(),
+	ensure: vi.fn(), listModels: vi.fn(), close: vi.fn(), restart: vi.fn(), register: vi.fn(), fetchCliUsage: vi.fn(),
 	driverOptions: undefined as undefined | Record<string, any>,
 	driver: undefined as undefined | Record<string, any>,
 	bridge: undefined as undefined | Record<string, any>,
@@ -18,6 +18,8 @@ vi.mock("../src/acp/driver.js", () => ({ AcpDriver: class {
 	pid = 4242;
 	listModels = mocks.listModels;
 	close = mocks.close;
+	restart = mocks.restart;
+	activeHandle = null;
 	constructor(options: Record<string, any>) { mocks.driverOptions = options; mocks.driver = this; }
 } }));
 vi.mock("../src/mcp-server.js", () => ({
@@ -49,7 +51,12 @@ function deferred<T>() {
 
 type FakeTool = { name: string; description?: string; exposure?: string; parameters?: object };
 
+let tempAgentDirs: string[] = [];
+
 async function start(tools: { all: FakeTool[]; active: string[] } = { all: [], active: [] }) {
+	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-ext-agent-"));
+	tempAgentDirs.push(agentDir);
+	process.env.PI_CODING_AGENT_DIR = agentDir;
 	const handlers = new Map<string, (...args: any[]) => void>();
 	const commands = new Map<string, any>();
 	const renderers = new Map<string, any>();
@@ -70,11 +77,17 @@ async function start(tools: { all: FakeTool[]; active: string[] } = { all: [], a
 	const ui = { setStatus: vi.fn(), notify: vi.fn(), setWidget: vi.fn(), theme: undefined };
 	const ctx = { hasUI: true, model: undefined, get ui() { if (stale) throw new Error("stale context"); return ui; } };
 	handlers.get("session_start")!({}, ctx);
-	return { shutdown: () => { handlers.get("session_shutdown")!(); stale = true; }, ui, commands, ctx, renderers, sendMessage, driver: mocks.driverOptions!, handlers, pi, tools };
+	return { agentDir, shutdown: () => { handlers.get("session_shutdown")!(); stale = true; }, ui, commands, ctx, renderers, sendMessage, driver: mocks.driverOptions!, handlers, pi, tools };
 }
 
-beforeEach(() => { vi.clearAllMocks(); mocks.close.mockResolvedValue(undefined); mocks.fetchCliUsage.mockResolvedValue([]); });
-
+beforeEach(() => {
+	vi.clearAllMocks();
+	mocks.close.mockResolvedValue(undefined);
+	mocks.restart.mockResolvedValue(undefined);
+	mocks.fetchCliUsage.mockResolvedValue([]);
+	for (const dir of tempAgentDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+	delete process.env.PI_CODING_AGENT_DIR;
+});
 const finished = {
 	sessionId: "s",
 	kind: "task" as const,
@@ -132,7 +145,7 @@ describe("extension session lifecycle", () => {
 		mocks.ensure.mockReturnValue({ ok: false, error: "the Antigravity CLI (agy) is not installed", manual: "curl -fsSL https://antigravity.google/cli/install.sh | bash" });
 		const session = await start();
 		await vi.waitFor(() => expect(session.ui.notify).toHaveBeenCalled());
-		expect(session.ui.notify.mock.calls[0][0]).toMatch(/not installed.*\/agy setup/);
+		expect(session.ui.notify.mock.calls[0][0]).toMatch(/not installed.*\/realagy setup/);
 		expect(mocks.listModels).not.toHaveBeenCalled();
 	});
 
@@ -149,19 +162,19 @@ describe("extension session lifecycle", () => {
 		expect(session.ui.notify).not.toHaveBeenCalled();
 	});
 
-	it("registers /agy with usage completion and notifies only after fresh quota resolves", async () => {
+	it("registers /realagy with completions and notifies only after fresh quota resolves", async () => {
 		const quota = deferred<never[]>();
 		mocks.ensure.mockReturnValue({ ok: true, bin: "agy" });
 		mocks.listModels.mockResolvedValue([]);
 		mocks.fetchCliUsage.mockReturnValueOnce(quota.promise);
 		const session = await start();
-		const agy = session.commands.get("agy");
-		expect([...session.commands.keys()]).toEqual(["agy"]);
-		expect(agy.getArgumentCompletions("u")).toEqual([{ value: "usage", label: "usage", description: "Cache hits and plan quota" }]);
-		expect(agy.getArgumentCompletions("").map((item: { value: string }) => item.value)).toEqual(["settings", "setup", "usage"]);
-		expect(agy.getArgumentCompletions("x")).toBeNull();
+		const realagy = session.commands.get("realagy");
+		expect([...session.commands.keys()]).toEqual(["realagy"]);
+		expect(realagy.getArgumentCompletions("u")).toEqual([{ value: "usage", label: "usage", description: "Cache hits and plan quota" }]);
+		expect(realagy.getArgumentCompletions("").map((item: { value: string }) => item.value)).toEqual(["settings", "setup", "usage"]);
+		expect(realagy.getArgumentCompletions("x")).toBeNull();
 		await vi.waitFor(() => expect(mocks.listModels).toHaveBeenCalled());
-		const pending = agy.handler("usage", session.ctx);
+		const pending = realagy.handler("usage", session.ctx);
 		expect(session.ui.notify).not.toHaveBeenCalled();
 		expect(mocks.fetchCliUsage).toHaveBeenCalledWith("agy", expect.objectContaining({ pid: 4242 }));
 		quota.resolve([]);
@@ -170,7 +183,7 @@ describe("extension session lifecycle", () => {
 		expect(session.ui.notify).toHaveBeenLastCalledWith("REPORT", "info");
 	});
 
-	it("shows a cancellable TUI loader during /agy usage and aborts fetchCliUsage on Esc", async () => {
+	it("shows a cancellable TUI loader during /realagy usage and aborts fetchCliUsage on Esc", async () => {
 		initTheme();
 		let capturedSignal: AbortSignal | undefined;
 		mocks.ensure.mockReturnValue({ ok: true, bin: "agy" });
@@ -193,27 +206,75 @@ describe("extension session lifecycle", () => {
 			loader.dispose();
 			return result;
 		});
-		await session.commands.get("agy").handler("usage", { ...session.ctx, mode: "tui", ui: { ...session.ui, custom } });
+		await session.commands.get("realagy").handler("usage", { ...session.ctx, mode: "tui", ui: { ...session.ui, custom } });
 		expect(custom).toHaveBeenCalledTimes(1);
 		expect(capturedSignal?.aborted).toBe(true);
 		expect(session.ui.notify).toHaveBeenLastCalledWith("REPORT", "info");
 	});
 
-	it("/agy setup explains install, sign-in, or readiness", async () => {
+	it("/realagy setup explains install, sign-in, or readiness", async () => {
 		mocks.ensure.mockReturnValue({ ok: false, error: "the Antigravity CLI (agy) is not installed", manual: "" });
 		const session = await start();
-		const agy = session.commands.get("agy");
-		await agy.handler("setup", session.ctx);
-		expect(session.ui.notify.mock.lastCall?.[0]).toMatch(/not installed[\s\S]*install\.sh[\s\S]*\/agy setup again/);
+		const realagy = session.commands.get("realagy");
+		await realagy.handler("setup", session.ctx);
+		expect(session.ui.notify.mock.lastCall?.[0]).toMatch(/not installed[\s\S]*install\.sh[\s\S]*\/realagy setup again/);
 
 		mocks.ensure.mockReturnValue({ ok: true, bin: "/bin/agy" });
 		mocks.listModels.mockRejectedValueOnce(new Error("ACP authentication required"));
-		await agy.handler("setup", session.ctx);
+		await realagy.handler("setup", session.ctx);
 		expect(session.ui.notify.mock.lastCall?.[0]).toMatch(/not usable[\s\S]*agy acp --login/);
 
 		mocks.listModels.mockResolvedValue([{ modelId: "gemini-3.8-flash-low" }, { modelId: "gemini-3.8-flash-high" }]);
-		await agy.handler("setup", session.ctx);
+		await realagy.handler("setup", session.ctx);
 		expect(session.ui.notify.mock.lastCall?.[0]).toMatch(/ready: \/bin\/agy is signed in and offers 1 models/);
+	});
+
+	it("enables compaction bypass and 1M Argon window by default, and persists /realagy settings to config.json", async () => {
+		initTheme();
+		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
+		const session = await start({ all: [{ name: "bash", exposure: "direct" }], active: ["bash"] });
+		expect(session.driver.noAutoCompaction()).toBe(true);
+		const initialProvider = mocks.register.mock.calls[0][0];
+		const argon = initialProvider.getModels().find((m: { id: string }) => m.id === "gemini-4-argon");
+		expect(argon.contextWindow).toBe(1_048_576);
+		expect(argon.maxTokens).toBe(65_536);
+
+		// Open /realagy settings in TUI mode, toggle noAutoCompaction off, and close with Esc.
+		const custom = vi.fn(async (factory: any) => {
+			let doneCalled = false;
+			const component = factory(
+				{ requestRender: vi.fn() },
+				{ fg: (_c: string, s: string) => s, bold: (s: string) => s },
+				{},
+				() => { doneCalled = true; },
+			);
+			component.handleInput("\r"); // toggle noAutoCompaction -> false
+			component.handleInput("\x1b"); // close
+			expect(doneCalled).toBe(true);
+		});
+		await session.commands.get("realagy").handler("settings", { ...session.ctx, mode: "tui", ui: { ...session.ui, custom } });
+		expect(session.driver.noAutoCompaction()).toBe(false);
+		expect(mocks.restart).toHaveBeenCalledTimes(1);
+		const savedFile = path.join(session.agentDir, "realagy", "config.json");
+		expect(JSON.parse(fs.readFileSync(savedFile, "utf8"))).toEqual({
+			noAutoCompaction: false,
+			agentProfile: true,
+		});
+
+		// Changing only contextWindow re-registers models immediately without restarting agy.
+		const choices = ["Pi context window: model default", "Save and close"];
+		await session.commands.get("realagy").handler("settings", {
+			...session.ctx,
+			mode: "rpc",
+			ui: {
+				...session.ui,
+				select: vi.fn(async () => choices.shift()),
+				input: vi.fn(async () => "500000"),
+			},
+		});
+		expect(mocks.restart).toHaveBeenCalledTimes(1);
+		const updatedProvider = mocks.register.mock.lastCall![0];
+		expect(updatedProvider.getModels().find((m: { id: string }) => m.id === "gemini-4-argon").contextWindow).toBe(500_000);
 	});
 
 	it("bridges every tool an extension may activate, with a stable policy, and dispatches only active tools", async () => {
@@ -259,8 +320,18 @@ describe("extension session lifecycle", () => {
 			for (const tool of ["bash", "read", "poll"]) expect(profile).toContain(`"${tool}":\n        eager: true`);
 			expect(session.driver.systemPrompt(agent)).toMatch(/mcp_pi-bridge_<name>/);
 			expect(session.driver.systemPrompt(undefined)).toMatch(/Do not use your built-in run_command/);
-			vi.stubEnv("REALAGY_AGY_PROFILE", "0");
+			const selectChoices = ["Pi-only agent profile: ON", "Save and close"];
+			await session.commands.get("realagy").handler("settings", {
+				...session.ctx,
+				mode: "rpc",
+				ui: {
+					...session.ui,
+					select: vi.fn(async () => selectChoices.shift()),
+					input: vi.fn(),
+				},
+			});
 			expect(session.driver.agent()).toBeUndefined();
+			expect(mocks.restart).toHaveBeenCalledTimes(1);
 		} finally {
 			vi.unstubAllEnvs();
 			fs.rmSync(home, { recursive: true, force: true });
