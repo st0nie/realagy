@@ -194,8 +194,12 @@ describe("native trajectory synchronization", () => {
 	it("maps a newly completed mid-turn tool result without treating it as user input", () => {
 		const dbPath = store([{ type: 14, payload: userPayload("question") }, { type: 15, payload: assistantPayload() }, { type: 132, payload: toolPayload("mcp_pi-bridge_read", "Stored tool value: RESULT") }]);
 		const result = synchronizeConversation(dbPath, [user("question"), assistant(), tool("r1", "read", "RESULT")], warmItemsForMessages([user("question"), assistant()]), false);
-		assert.equal(result.editedSteps, 1);
+		// Already what agy recorded for pi's result: kept byte-for-byte.
+		assert.equal(result.editedSteps, 0);
 		assert.equal(rows(dbPath).length, 3);
+		const changed = synchronizeConversation(dbPath, [user("question"), assistant(), tool("r1", "read", "DROPPED")], warmItemsForMessages([user("question"), assistant()]), false);
+		assert.equal(changed.editedSteps, 1);
+		assert.equal(protoTextAt(rows(dbPath)[2]!.payload, [140, 2, 1]), "DROPPED");
 	});
 	it("discards the cancelled generation after a mid-turn sync, keeping the completed tool result", () => {
 		const executing = Buffer.concat([field(5, field(4, field(2, "mcp_pi-bridge_read")))]);
@@ -395,6 +399,42 @@ describe("native trajectory synchronization", () => {
 		assert.deepEqual(rows(dbPath).map((row) => row.idx), [0, 3, 4]);
 		assert.deepEqual(rows(dbPath).slice(1), retained);
 		assert.equal(protoTextAt(rows(dbPath)[0]!.payload, [19, 3, 1]), '<realctx-history part="h2">SECOND SUMMARY</realctx-history>');
+	});
+
+	it("merges several leading history parts into the first native user step and extends them later", () => {
+		const h = (part: number, text: string) => user(`<realctx-history part="h${part}">${text}</realctx-history>`);
+		const original = [
+			user("q1"), tool("r1", "read", "ONE"), assistant("a1"),
+			user("q2"), tool("r2", "bash", "TWO"), assistant("a2"),
+			user("q3"), tool("r3", "read", "THREE"), assistant("a3"),
+		];
+		const dbPath = store([
+			{ type: 14, payload: userPayload("q1") },
+			{ type: 132, payload: toolPayload("mcp_pi-bridge_read", "ONE") },
+			{ type: 15, payload: assistantPayload() },
+			{ type: 14, payload: userPayload("q2") },
+			{ type: 132, payload: toolPayload("mcp_pi-bridge_bash", "TWO") },
+			{ type: 15, payload: assistantPayload() },
+			{ type: 14, payload: userPayload("q3") },
+			{ type: 132, payload: toolPayload("mcp_pi-bridge_read", "THREE") },
+			{ type: 15, payload: assistantPayload() },
+		]);
+		// realctx applies two history parts in one request; the tail keeps a drop.
+		const first = [h(1, "S1"), h(2, "S2"), user("q3"), tool("r3", "read", "[#9 dropped · read · 1k tok]"), assistant("a3")];
+		assert.deepEqual(synchronizeConversation(dbPath, first, syncItemsForMessages(original), false), { editedSteps: 2, deletedSteps: 5, summary: true });
+		assert.deepEqual(rows(dbPath).map((row) => row.idx), [0, 6, 7, 8]);
+		const merged = '<realctx-history part="h1">S1</realctx-history>\n\n<realctx-history part="h2">S2</realctx-history>';
+		assert.equal(protoTextAt(rows(dbPath)[0]!.payload, [19, 3, 1]), merged);
+		assert.equal(protoTextAt(rows(dbPath)[2]!.payload, [140, 2, 1]), "[#9 dropped · read · 1k tok]");
+		// Re-syncing the same effective context is a byte-for-byte no-op.
+		const before = rows(dbPath);
+		assert.deepEqual(synchronizeConversation(dbPath, first, syncItemsForMessages(first), false), { editedSteps: 0, deletedSteps: 0, summary: true });
+		assert.deepEqual(rows(dbPath), before);
+		// A later part folds the retained turn while keeping the earlier parts.
+		const second = [h(1, "S1"), h(2, "S2"), h(3, "S3"), assistant("a3")];
+		assert.deepEqual(synchronizeConversation(dbPath, second, syncItemsForMessages(first), false), { editedSteps: 1, deletedSteps: 2, summary: true });
+		assert.deepEqual(rows(dbPath).map((row) => row.idx), [0, 8]);
+		assert.equal(protoTextAt(rows(dbPath)[0]!.payload, [19, 3, 1]), `${merged}\n\n<realctx-history part="h3">S3</realctx-history>`);
 	});
 
 	it("filters system and ephemeral messages from the native history mapping", () => {
