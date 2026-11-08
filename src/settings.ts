@@ -1,6 +1,6 @@
 // User configuration in ~/.pi/agent/realagy/config.json and `/realagy settings`.
-// Compaction bypass and the Pi-only agent profile are enabled by default; model
-// context and output limits follow each model's real window unless overridden.
+// Compaction bypass, complete MCP output, and the Pi-only agent profile default
+// on; model context and output limits follow each model's real window.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -31,6 +31,9 @@ export interface RealagyConfig extends ModelLimitOverrides {
 	/** Rewrite Agy's model catalog on loopback to disable local automatic
 	 * compaction, unlocking Agy's full context window so Pi handles compaction. */
 	noAutoCompaction: boolean;
+	/** Derive a private agy copy that sends complete individual and parallel MCP
+	 * results to the model instead of agy's truncated preview. Default on. */
+	fullMcpOutput: boolean;
 	/** Run Agy with realagy's hidden agent profile (Pi's prompt and tools only)
 	 * instead of Agy's default agent. */
 	agentProfile: boolean;
@@ -47,6 +50,7 @@ export interface RealagyConfig extends ModelLimitOverrides {
 
 export const DEFAULT_REALAGY_CONFIG: Readonly<RealagyConfig> = {
 	noAutoCompaction: true,
+	fullMcpOutput: true,
 	agentProfile: true,
 };
 
@@ -254,6 +258,9 @@ export function normalizeRealagyConfig(raw: unknown): RealagyConfig {
 	const noAutoCompaction = typeof record.noAutoCompaction === "boolean"
 		? record.noAutoCompaction
 		: DEFAULT_REALAGY_CONFIG.noAutoCompaction;
+	const fullMcpOutput = typeof record.fullMcpOutput === "boolean"
+		? record.fullMcpOutput
+		: DEFAULT_REALAGY_CONFIG.fullMcpOutput;
 	const agentProfile = typeof record.agentProfile === "boolean"
 		? record.agentProfile
 		: DEFAULT_REALAGY_CONFIG.agentProfile;
@@ -261,7 +268,7 @@ export function normalizeRealagyConfig(raw: unknown): RealagyConfig {
 	const contextWindowOverrides = normalizeModelLimitOverrides(record.contextWindowOverrides);
 	const maxOutputTokens = parsePositiveInt(record.maxOutputTokens);
 	const maxOutputTokensOverrides = normalizeModelLimitOverrides(record.maxOutputTokensOverrides);
-	const result: RealagyConfig = { noAutoCompaction, agentProfile };
+	const result: RealagyConfig = { noAutoCompaction, fullMcpOutput, agentProfile };
 	if (contextWindow !== undefined) result.contextWindow = contextWindow;
 	if (contextWindowOverrides !== undefined) result.contextWindowOverrides = contextWindowOverrides;
 	if (maxOutputTokens !== undefined) result.maxOutputTokens = maxOutputTokens;
@@ -316,6 +323,7 @@ export function formatConfigSummary(config: RealagyConfig, file: string = realag
 	return [
 		`Antigravity settings (${file}):`,
 		`  Bypass Agy auto-compaction: ${config.noAutoCompaction ? "ON" : "OFF"}`,
+		`  Full MCP output (binary patch): ${config.fullMcpOutput ? "ON" : "OFF"}`,
 		`  Pi-only agent profile: ${config.agentProfile ? "ON" : "OFF"}`,
 		`  Pi context window: ${formatConfigLimit(config.contextWindow)}`,
 		...Object.entries(config.contextWindowOverrides ?? {}).map(
@@ -344,14 +352,16 @@ function withUpdatedSetting(current: RealagyConfig, id: string, rawValue: string
 	}
 
 	let noAutoCompaction = current.noAutoCompaction;
+	let fullMcpOutput = current.fullMcpOutput;
 	let agentProfile = current.agentProfile;
 	let contextWindow = current.contextWindow;
 	let maxOutputTokens = current.maxOutputTokens;
 	if (id === "noAutoCompaction") noAutoCompaction = rawValue === "true";
+	else if (id === "fullMcpOutput") fullMcpOutput = rawValue === "true";
 	else if (id === "agentProfile") agentProfile = rawValue === "true";
 	else if (id === "contextWindow") contextWindow = parseLimitChoice(rawValue);
 	else if (id === "maxOutputTokens") maxOutputTokens = parseLimitChoice(rawValue);
-	const next: RealagyConfig = { noAutoCompaction, agentProfile };
+	const next: RealagyConfig = { noAutoCompaction, fullMcpOutput, agentProfile };
 	if (contextWindow !== undefined) next.contextWindow = contextWindow;
 	if (maxOutputTokens !== undefined) next.maxOutputTokens = maxOutputTokens;
 	if (current.contextWindowOverrides !== undefined) next.contextWindowOverrides = current.contextWindowOverrides;
@@ -585,6 +595,13 @@ export class RealagySettingsComponent implements Component, Focusable {
 				values: ["true", "false"],
 			},
 			{
+				id: "fullMcpOutput",
+				label: "Full MCP output (binary patch)",
+				description: "Use a private patched agy copy so individual and parallel MCP results reach the model without agy's preview truncation",
+				currentValue: this.#state.fullMcpOutput ? "true" : "false",
+				values: ["true", "false"],
+			},
+			{
 				id: "agentProfile",
 				label: "Pi-only agent profile",
 				description: "Run Agy with realagy's hidden agent profile (Pi's prompt and tools only); false keeps Agy's default agent",
@@ -705,7 +722,7 @@ export class RealagySettingsComponent implements Component, Focusable {
 		});
 		this.#settingsList = new SettingsList(
 			items,
-			10,
+			11,
 			getSettingsListTheme(),
 			(id, newValue) => {
 				const next = withUpdatedSetting(this.#state, id, newValue);
@@ -771,6 +788,7 @@ export async function editRealagyConfigMenu(
 	for (;;) {
 		const choice = await ui.select("Antigravity settings", [
 			`Bypass Agy auto-compaction: ${draft.noAutoCompaction ? "ON" : "OFF"}`,
+			`Full MCP output (binary patch): ${draft.fullMcpOutput ? "ON" : "OFF"}`,
 			`Pi-only agent profile: ${draft.agentProfile ? "ON" : "OFF"}`,
 			`Pi context window: ${formatConfigLimit(draft.contextWindow)}`,
 			`Pi max output tokens: ${formatConfigLimit(draft.maxOutputTokens)}`,
@@ -784,6 +802,10 @@ export async function editRealagyConfigMenu(
 		if (choice === "Save and close") return draft;
 		if (choice.startsWith("Bypass Agy auto-compaction:")) {
 			draft = withUpdatedSetting(draft, "noAutoCompaction", draft.noAutoCompaction ? "false" : "true");
+			continue;
+		}
+		if (choice.startsWith("Full MCP output (binary patch):")) {
+			draft = withUpdatedSetting(draft, "fullMcpOutput", draft.fullMcpOutput ? "false" : "true");
 			continue;
 		}
 		if (choice.startsWith("Pi-only agent profile:")) {

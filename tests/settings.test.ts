@@ -29,16 +29,19 @@ test("config defaults enable compaction bypass and agent profile with model-defa
 		assert.equal(file, path.join(directory, "realagy", "config.json"));
 		assert.deepEqual(loadRealagyConfig(file), {
 			noAutoCompaction: true,
+			fullMcpOutput: true,
 			agentProfile: true,
 		});
 		assert.deepEqual(DEFAULT_REALAGY_CONFIG, {
 			noAutoCompaction: true,
+			fullMcpOutput: true,
 			agentProfile: true,
 		});
 
 		const saved = saveRealagyConfig(
 			{
 				noAutoCompaction: false,
+				fullMcpOutput: false,
 				agentProfile: false,
 				contextWindow: 256_000,
 				contextWindowOverrides: { "gemini-4-argon": 900_000 },
@@ -49,6 +52,7 @@ test("config defaults enable compaction bypass and agent profile with model-defa
 		);
 		assert.deepEqual(saved, {
 			noAutoCompaction: false,
+			fullMcpOutput: false,
 			agentProfile: false,
 			contextWindow: 256_000,
 			contextWindowOverrides: { "gemini-4-argon": 900_000 },
@@ -59,10 +63,11 @@ test("config defaults enable compaction bypass and agent profile with model-defa
 		assert.equal(fs.statSync(file).mode & 0o777, 0o600);
 
 		// Clearing overrides omits limit keys from config.json so models follow their real windows.
-		const reset = saveRealagyConfig({ noAutoCompaction: true, agentProfile: true }, file);
-		assert.deepEqual(reset, { noAutoCompaction: true, agentProfile: true });
+		const reset = saveRealagyConfig({ noAutoCompaction: true, fullMcpOutput: true, agentProfile: true }, file);
+		assert.deepEqual(reset, { noAutoCompaction: true, fullMcpOutput: true, agentProfile: true });
 		assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), {
 			noAutoCompaction: true,
+			fullMcpOutput: true,
 			agentProfile: true,
 		});
 
@@ -71,6 +76,7 @@ test("config defaults enable compaction bypass and agent profile with model-defa
 		assert.deepEqual(
 			normalizeRealagyConfig({
 				noAutoCompaction: "bad",
+				fullMcpOutput: "bad",
 				agentProfile: false,
 				contextWindow: "500,000",
 				contextWindowOverrides: {
@@ -85,6 +91,7 @@ test("config defaults enable compaction bypass and agent profile with model-defa
 			}),
 			{
 				noAutoCompaction: true,
+				fullMcpOutput: true,
 				agentProfile: false,
 				contextWindow: 500_000,
 				contextWindowOverrides: {
@@ -135,6 +142,7 @@ test("RealagySettingsComponent renders TUI list, toggles booleans, edits custom 
 	const initialLines = component.render(100).join("\n");
 	assert.match(initialLines, /Antigravity Settings/);
 	assert.match(initialLines, /Bypass Agy auto-compaction.*true/);
+	assert.match(initialLines, /Full MCP output \(binary patch\).*true/);
 	assert.match(initialLines, /Pi-only agent profile.*true/);
 	assert.match(initialLines, /Pi context window.*model default/);
 	assert.match(initialLines, /Per-model context windows.*1 override/);
@@ -145,12 +153,17 @@ test("RealagySettingsComponent renders TUI list, toggles booleans, edits custom 
 	component.handleInput("\r");
 	assert.equal(changes.at(-1)?.noAutoCompaction, false);
 
-	// Move down to agentProfile (row 1) and toggle with Enter.
+	// Full MCP output defaults on and can be disabled independently (row 1).
+	component.handleInput("\x1b[B");
+	component.handleInput("\r");
+	assert.equal(changes.at(-1)?.fullMcpOutput, false);
+
+	// Move down to agentProfile (row 2) and toggle with Enter.
 	component.handleInput("\x1b[B");
 	component.handleInput("\r");
 	assert.equal(changes.at(-1)?.agentProfile, false);
 
-	// Move down to contextWindow (row 2), open submenu, navigate to Custom… (last item), and submit custom value.
+	// Move down to contextWindow (row 3), open submenu, navigate to Custom… (last item), and submit custom value.
 	component.handleInput("\x1b[B");
 	component.handleInput("\r");
 	for (let i = 0; i < 6; i++) component.handleInput("\x1b[B");
@@ -227,10 +240,11 @@ test("fallback menu edits global and grouped per-model limits, resets inheritanc
 		contextWindowOverrides: { "gemini-4-argon": 900_000 },
 		maxOutputTokensOverrides: { "gemini-4-argon": 64_000 },
 	};
-	const ui = menuUi([0, 1, 2, 3, 10], ["300000", "32000"]);
+	const ui = menuUi([0, 1, 2, 3, 4, 11], ["300000", "32000"]);
 	const result = await editRealagyConfigMenu(ui, initial, modelIds);
 	assert.deepEqual(result, {
 		noAutoCompaction: false,
+		fullMcpOutput: false,
 		agentProfile: false,
 		contextWindow: 300_000,
 		contextWindowOverrides: { "gemini-4-argon": 900_000 },
@@ -239,10 +253,11 @@ test("fallback menu edits global and grouped per-model limits, resets inheritanc
 	});
 	assert.equal(ui.messages.length, 0);
 
-	const resetUi = menuUi([2, 2, 10], ["not-a-number", ""]);
+	const resetUi = menuUi([3, 3, 11], ["not-a-number", ""]);
 	const resetResult = await editRealagyConfigMenu(resetUi, result!, modelIds);
 	assert.deepEqual(resetResult, {
 		noAutoCompaction: false,
+		fullMcpOutput: false,
 		contextWindowOverrides: { "gemini-4-argon": 900_000 },
 		agentProfile: false,
 		maxOutputTokens: 32_000,
@@ -251,7 +266,7 @@ test("fallback menu edits global and grouped per-model limits, resets inheritanc
 	assert.equal(resetUi.messages.length, 1);
 
 	const perModelUi = menuUi(
-		[4, 1, 4, 1, 4, 0, 4, 2, 5, 0, 5, 1, 5, 1, 5, 2, 10],
+		[5, 1, 5, 1, 5, 0, 5, 2, 6, 0, 6, 1, 6, 1, 6, 2, 11],
 		["bad", "450000", "", "48000", "32000", ""],
 	);
 	const perModelResult = await editRealagyConfigMenu(perModelUi, result!, modelIds);
@@ -260,7 +275,7 @@ test("fallback menu edits global and grouped per-model limits, resets inheritanc
 	assert.equal(perModelUi.messages.length, 1);
 	assert.match(perModelUi.messages[0], /inherit global/);
 
-	const cancelled = menuUi([11], []);
+	const cancelled = menuUi([12], []);
 	assert.equal(await editRealagyConfigMenu(cancelled, DEFAULT_REALAGY_CONFIG, modelIds), undefined);
 });
 
@@ -321,8 +336,8 @@ test("reclaim settings cycle in the TUI and keep other settings", () => {
 	assert.match(lines, /Release: minimum share.*50%/);
 	assert.match(lines, /Release: cold cache after.*5 min/);
 
-	// Rows: 0-3 globals, 4-5 per-model menus, 6-9 reclaim.
-	for (let i = 0; i < 6; i++) component.handleInput("\x1b[B");
+	// Rows: 0-4 globals, 5-6 per-model menus, 7-10 reclaim.
+	for (let i = 0; i < 7; i++) component.handleInput("\x1b[B");
 	component.handleInput("\r");
 	assert.equal(changes.at(-1)?.reclaimContext, false);
 	component.handleInput("\x1b[B");
@@ -345,8 +360,8 @@ test("reclaim settings cycle in the TUI and keep other settings", () => {
 });
 
 test("fallback menu edits reclaim settings with presets, custom values, and validation", async () => {
-	// Top-level rows: 0-5 as before, 6-9 reclaim, 10 save, 11 cancel.
-	const ui = menuUi([6, 7, 1, 8, 6, 8, 6, 9, 0, 10], ["12.5%", "abc"]);
+	// Top-level rows: 0-6 globals/model menus, 7-10 reclaim, 11 save, 12 cancel.
+	const ui = menuUi([7, 8, 1, 9, 6, 9, 6, 10, 0, 11], ["12.5%", "abc"]);
 	const result = await editRealagyConfigMenu(ui, DEFAULT_REALAGY_CONFIG, ["gemini-4-argon"]);
 	assert.deepEqual(result, {
 		...DEFAULT_REALAGY_CONFIG,

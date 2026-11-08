@@ -34,6 +34,7 @@ import { BackgroundMessages, type BackgroundItem, type BackgroundNotice } from "
 import { AcpConnection, type AcpExitInfo, type AcpMcpServer } from "./connection.js";
 import { CatalogProxy } from "./catalog-proxy.js";
 import { isAgyRetryNotice, mapStopReason, mapUpdate, TextAccumulator, type AcpEditDiff } from "./events.js";
+import { deriveAgyFullMcpOutput } from "./output-patch.js";
 import { conversationDbPath, lastStepIdx, readStepState, siblingUsage, summarizeSteps, userInputSince, type StepTokens, type StepUsage } from "./step-usage.js";
 import { nativeToolLabel, nativeToolTarget, PI_BRIDGE_SERVER, type NativeToolEvent } from "../native-tools.js";
 import { traceUsage } from "../usage-trace.js";
@@ -52,6 +53,9 @@ export interface AcpDriverOptions {
 	/** argv for the binary (tests: the fake-server script). Default `acp`.
 	 * Explicit args also disable the real-Agy catalog proxy. */
 	binArgs?: string[];
+	/** Derive a private agy copy that gives the model complete MCP tool results.
+	 * Default true. Ignored for explicit binArgs (test servers and other ACP implementations). */
+	fullMcpOutput?: boolean | (() => boolean);
 	/** Rewrite Agy's catalog through a loopback proxy to disable its local
 	 * automatic checkpointer. Default true: unlock Agy's full context window. */
 	noAutoCompaction?: boolean | (() => boolean);
@@ -732,10 +736,14 @@ export class AcpDriver implements TurnDriver {
 	}
 
 	async #startConnection(cwd: string): Promise<AcpConnection> {
-		const bin = typeof this.#opts.bin === "function" ? this.#opts.bin() : this.#opts.bin;
+		let bin = typeof this.#opts.bin === "function" ? this.#opts.bin() : this.#opts.bin;
 		const agent = this.#resolveAgent();
 		let conn: AcpConnection | undefined;
 		try {
+			const fullMcpOutput = typeof this.#opts.fullMcpOutput === "function" ? this.#opts.fullMcpOutput() : this.#opts.fullMcpOutput !== false;
+			if (!this.#opts.binArgs && fullMcpOutput) {
+				bin = await deriveAgyFullMcpOutput(bin, { log: (msg, data) => this.#log(msg, data) });
+			}
 			let binArgs = this.#opts.binArgs;
 			const useCatalogProxy = !binArgs && this.#noAutoCompaction();
 			if (useCatalogProxy) {

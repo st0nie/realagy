@@ -336,6 +336,7 @@ describe("extension session lifecycle", () => {
 		expect(mocks.restart).not.toHaveBeenCalled();
 		expect(JSON.parse(fs.readFileSync(path.join(session.agentDir, "realagy", "config.json"), "utf8"))).toEqual({
 			noAutoCompaction: true,
+			fullMcpOutput: true,
 			agentProfile: true,
 			contextWindow: 500_000,
 			contextWindowOverrides: {
@@ -351,6 +352,7 @@ describe("extension session lifecycle", () => {
 		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
 		const session = await start({ all: [{ name: "bash", exposure: "direct" }], active: ["bash"] });
 		expect(session.driver.noAutoCompaction()).toBe(true);
+		expect(session.driver.fullMcpOutput()).toBe(true);
 		const initialProvider = mocks.register.mock.calls[0][0];
 		const argon = initialProvider.getModels().find((m: { id: string }) => m.id === "gemini-4-argon");
 		expect(argon.contextWindow).toBe(1_048_576);
@@ -375,6 +377,7 @@ describe("extension session lifecycle", () => {
 		const savedFile = path.join(session.agentDir, "realagy", "config.json");
 		expect(JSON.parse(fs.readFileSync(savedFile, "utf8"))).toEqual({
 			noAutoCompaction: false,
+			fullMcpOutput: true,
 			agentProfile: true,
 		});
 
@@ -392,6 +395,23 @@ describe("extension session lifecycle", () => {
 		expect(mocks.restart).toHaveBeenCalledTimes(1);
 		const updatedProvider = mocks.register.mock.lastCall![0];
 		expect(updatedProvider.getModels().find((m: { id: string }) => m.id === "gemini-4-argon").contextWindow).toBe(500_000);
+	});
+
+	it("exposes full MCP output as a default-on setting and restarts agy when disabled", async () => {
+		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
+		const session = await start({ all: [], active: [] });
+		expect(session.driver.fullMcpOutput()).toBe(true);
+		const choices = ["Full MCP output (binary patch): ON", "Save and close"];
+		await session.commands.get("realagy").handler("settings", {
+			...session.ctx,
+			mode: "rpc",
+			ui: { ...session.ui, select: vi.fn(async () => choices.shift()), input: vi.fn() },
+		});
+		expect(session.driver.fullMcpOutput()).toBe(false);
+		expect(mocks.restart).toHaveBeenCalledTimes(1);
+		expect(JSON.parse(fs.readFileSync(path.join(session.agentDir, "realagy", "config.json"), "utf8"))).toMatchObject({
+			fullMcpOutput: false,
+		});
 	});
 
 	it("bridges every tool an extension may activate, with a stable policy, and dispatches only active tools", async () => {

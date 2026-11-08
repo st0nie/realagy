@@ -80,6 +80,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	const driver = new AcpDriver({
 		bin: () => bin,
+		fullMcpOutput: () => config.fullMcpOutput,
 		noAutoCompaction: () => config.noAutoCompaction,
 		mcpServers: () => bridge ? [{
 			name: "pi-bridge",
@@ -375,6 +376,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				});
 				const changed =
 					config.noAutoCompaction !== before.noAutoCompaction ||
+					config.fullMcpOutput !== before.fullMcpOutput ||
 					config.agentProfile !== before.agentProfile ||
 					config.contextWindow !== before.contextWindow ||
 					config.maxOutputTokens !== before.maxOutputTokens ||
@@ -383,6 +385,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				if (!changed) return;
 				const restartAgy =
 					config.noAutoCompaction !== before.noAutoCompaction ||
+					config.fullMcpOutput !== before.fullMcpOutput ||
 					config.agentProfile !== before.agentProfile;
 				if (restartAgy && !driver.activeHandle) await driver.restart();
 				if (stopped) return;
