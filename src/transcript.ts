@@ -38,6 +38,8 @@ export interface WarmItem {
 	syncName?: string;
 	syncMediaHash?: string;
 	summary?: boolean;
+	/** An empty failed/aborted assistant turn (`isEmptyFailedAssistant`). */
+	failed?: boolean;
 }
 
 /** What a reusable ACP session is known to hold. */
@@ -331,6 +333,17 @@ export function persistentMessages(messages: Message[]): Message[] {
 	return messages.filter((message) => !isEphemeralMessage(message));
 }
 
+/** A failed or aborted assistant turn that produced nothing. agy may hold no
+ *  native step for it (a failed sync or spawn never reached the model) or a
+ *  planner step (the prompt was delivered), so native trajectory sync maps it
+ *  optionally. */
+export function isEmptyFailedAssistant(message: Message): boolean {
+	if (message.role !== "assistant" || (message.stopReason !== "error" && message.stopReason !== "aborted")) return false;
+	return message.content.every((block) =>
+		(block.type === "text" && !block.text.trim()) || (block.type === "thinking" && !block.thinking.trim()),
+	);
+}
+
 
 /** realctx placeholder for dropped user images: `· user image` or `· 2 user images`. */
 export const REALCTX_USER_IMAGE_DROP = /\[#\d+ (?:dropped|summarized|superseded) · (?:\d+ )?user images?\b/;
@@ -406,6 +419,7 @@ function toWarmItem(message: Exclude<Message, { role: "system" }>, key = message
 		item.syncText = contentText(message.content);
 		item.syncName = message.toolName;
 	}
+	if (isEmptyFailedAssistant(message)) item.failed = true;
 	const media = (Array.isArray(message.content) ? message.content : []).filter((block) => block.type === "image");
 	if (media.length > 0) {
 		const hash = createHash("sha256");
@@ -907,7 +921,10 @@ export function planTurn(context: TranscriptContext, cwd: string, warm: WarmSess
 
 /** Plan against remembered sessions, most preferred first. A rewritten prefix
  * belongs to its exact native branch and is never bypassed via an older warm
- * checkpoint. With none usable, report the first candidate's fresh reason. */
+ * checkpoint; but an exact match on a more preferred checkpoint that reaches
+ * at least as far wins over a rewrite against an older one, whose native
+ * history may since have been rewritten or extended. With none usable, report
+ * the first candidate's fresh reason. */
 export function planTurnFrom(context: TranscriptContext, cwd: string, candidates: readonly WarmSession[]): TurnPlan {
 	const index = new TranscriptIndex(context);
 	let best: Extract<WarmMatch, { warm: WarmSession }> | undefined;
@@ -915,8 +932,10 @@ export function planTurnFrom(context: TranscriptContext, cwd: string, candidates
 	for (const candidate of candidates) {
 		const match = matchWarmPrefix(index, cwd, candidate);
 		if ("reason" in match) {
-			if (match.reason === "context-sync") return planFromMatch(index, match);
-			firstFailure ??= match;
+			if (match.reason === "context-sync" && match.delta && (!best || match.delta.length < best.delta.length)) {
+				return planFromMatch(index, match);
+			}
+			if (match.reason !== "context-sync") firstFailure ??= match;
 			continue;
 		}
 		if (!best || match.delta.length < best.delta.length) {
@@ -967,7 +986,7 @@ export interface SessionEntryLike {
 
 function toWarmItemEntry(raw: unknown): WarmItem | null {
 	if (!raw || typeof raw !== "object") return null;
-	const candidate = raw as { role?: unknown; key?: unknown; userText?: unknown; syncText?: unknown; syncName?: unknown; syncMediaHash?: unknown; summary?: unknown };
+	const candidate = raw as { role?: unknown; key?: unknown; userText?: unknown; syncText?: unknown; syncName?: unknown; syncMediaHash?: unknown; summary?: unknown; failed?: unknown };
 	if (candidate.role !== "user" && candidate.role !== "assistant" && candidate.role !== "toolResult") return null;
 	if (typeof candidate.key !== "string" || !candidate.key) return null;
 	const item: WarmItem = { role: candidate.role, key: candidate.key };
@@ -976,6 +995,7 @@ function toWarmItemEntry(raw: unknown): WarmItem | null {
 	if (typeof candidate.syncName === "string") item.syncName = candidate.syncName;
 	if (typeof candidate.syncMediaHash === "string") item.syncMediaHash = candidate.syncMediaHash;
 	if (typeof candidate.summary === "boolean") item.summary = candidate.summary;
+	if (candidate.failed === true) item.failed = true;
 	return item;
 }
 

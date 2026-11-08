@@ -201,6 +201,33 @@ describe("native trajectory synchronization", () => {
 		assert.equal(changed.editedSteps, 1);
 		assert.equal(protoTextAt(rows(dbPath)[2]!.payload, [140, 2, 1]), "DROPPED");
 	});
+	it("maps an empty failed turn whether or not agy recorded a planner step for it", () => {
+		const failed = { ...assistant(), content: [], stopReason: "error", errorMessage: "sync failed" } as unknown as Message;
+		const previous = syncItemsForMessages([user("q1"), tool("r1", "read", "OLD"), assistant(), user("q2"), failed]);
+		const messages = [user("q1"), tool("r1", "read", "NEW"), assistant(), user("q2"), failed, user("resume")];
+		const head = [{ type: 14, payload: userPayload("q1") }, { type: 132, payload: toolPayload("mcp_pi-bridge_read", "OLD") }, { type: 15, payload: assistantPayload() }, { type: 14, payload: userPayload("q2") }];
+		// The model failed before any planner step.
+		const bare = store(head);
+		assert.deepEqual(synchronizeConversation(bare, messages, previous, true), { editedSteps: 1, deletedSteps: 0, summary: false });
+		assert.equal(protoTextAt(rows(bare)[1]!.payload, [140, 2, 1]), "NEW");
+		// The prompt reached the model, which recorded a planner step.
+		const planned = store([...head, { type: 15, payload: assistantPayload() }]);
+		assert.deepEqual(synchronizeConversation(planned, messages, previous, true), { editedSteps: 1, deletedSteps: 0, summary: false });
+		assert.equal(rows(planned).length, 5);
+		// A failed turn appended since the checkpoint maps the same way.
+		const appended = store(head);
+		assert.deepEqual(synchronizeConversation(appended, messages, previous.slice(0, 4), true), { editedSteps: 1, deletedSteps: 0, summary: false });
+	});
+
+	it("summarizes everything before an empty failed turn agy never recorded", () => {
+		const failed = { ...assistant(), content: [], stopReason: "aborted", errorMessage: "aborted" } as unknown as Message;
+		const dbPath = store([{ type: 14, payload: userPayload("old question") }, { type: 132, payload: toolPayload("mcp_pi-bridge_read", "OLD") }, { type: 15, payload: assistantPayload() }]);
+		const summary = user('<realctx-history part="h1">SUMMARY</realctx-history>');
+		const previous = syncItemsForMessages([user("old question"), tool("r1", "read", "OLD"), assistant(), failed]);
+		assert.deepEqual(synchronizeConversation(dbPath, [summary, failed], previous, false), { editedSteps: 1, deletedSteps: 2, summary: true });
+		assert.deepEqual(rows(dbPath).map((row) => row.idx), [0]);
+	});
+
 	it("discards the cancelled generation after a mid-turn sync, keeping the completed tool result", () => {
 		const executing = Buffer.concat([field(5, field(4, field(2, "mcp_pi-bridge_read")))]);
 		const steps = [

@@ -157,6 +157,23 @@ test("planTurnFrom picks the candidate with the smallest delta and matches planT
 	assert.deepEqual(planTurnFrom(now, "/w", []), planTurn(now, "/w", undefined));
 });
 
+test("an exact match on the newest checkpoint beats a context sync against an older one", () => {
+	// Checkpoint `before` predates a realctx drop; the sync that applied the
+	// drop rewrote native history and recorded `after`, which pi still matches.
+	const head = [system("Test system", ["read"]), user("inspect"), toolUse("c1", "read"), result("c1", "read", "HUGE")];
+	const before = warmAfterTurn(ctx(head), assistant("found it"), "s1", "/w", 3);
+	const dropped = [head[0]!, head[1]!, head[2]!, result("c1", "read", "[#1 dropped]"), assistant("found it"), user("q2")];
+	const after = warmAfterTurn(ctx(dropped), assistant("a2"), "s1", "/w", 5);
+	// Mid-turn: several messages past `after`, so the planner keeps looking.
+	const now = ctx([...dropped, assistant("a2"), user("q3"), toolUse("c2", "read"), result("c2", "read", "R2")]);
+	// Provider order: the latest checkpoint is the most preferred.
+	const plan = planTurnFrom(now, "/w", [after, before]);
+	assert.equal(plan.kind, "warm");
+	assert.deepEqual(plan.kind === "warm" && [plan.maxStepIdx, plan.deltaMessages], [5, 3]);
+	// Only the stale checkpoint left: the rewrite must be synchronized.
+	assert.equal(planTurnFrom(now, "/w", [before]).kind, "context-sync");
+});
+
 const LENS_TOOLS = ["lens_symbols", "lens_references", "lens_diagnostics", "lens_rename", "lens_outline"];
 const toolsDeclared = (names: string[]): Message =>
 	({ role: "system", content: "", toolsAdded: names.map(tool), timestamp: 5 }) as unknown as Message;

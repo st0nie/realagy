@@ -6,7 +6,7 @@
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import type { Message } from "@earendil-works/pi-ai";
-import { FRESH_PROMPT, IMAGE_ONLY_PROMPT, isHistorySummary, REALCTX_USER_IMAGE_DROP, persistentMessages, warmItemsForMessages, type WarmItem } from "../transcript.js";
+import { FRESH_PROMPT, IMAGE_ONLY_PROMPT, isEmptyFailedAssistant, isHistorySummary, REALCTX_USER_IMAGE_DROP, persistentMessages, warmItemsForMessages, type WarmItem } from "../transcript.js";
 import { decodeProtoFields, optionalProtoBytesAt, protoTextAt, removeProtoFields, repeatedProtoBytesAt, replaceRepeatedProtoTextPart, rewriteRepeatedProtoFields, setProtoText } from "./trajectory-proto.js";
 
 const USER_STEP = 14;
@@ -77,6 +77,10 @@ interface Descriptor {
 	previousText?: string;
 	previousMediaHash?: string;
 	hasPrevious: boolean;
+	/** An empty failed/aborted assistant turn: agy may or may not hold a
+	 *  planner step for it, so it maps to the next native assistant step only
+	 *  when one comes next. */
+	optional?: boolean;
 	message?: Message;
 }
 
@@ -105,6 +109,7 @@ function descriptorForMessage(message: Message, previous?: WarmItem): Descriptor
 		previousText: message.role === "toolResult" ? previous?.syncText : undefined,
 		previousMediaHash: previous?.syncMediaHash,
 		hasPrevious: previous !== undefined,
+		optional: isEmptyFailedAssistant(message) || undefined,
 		message,
 	};
 }
@@ -117,6 +122,7 @@ function descriptorForWarmItem(item: WarmItem): Descriptor {
 		previousText: item.syncText,
 		previousMediaHash: item.syncMediaHash,
 		hasPrevious: true,
+		optional: item.failed || undefined,
 	};
 }
 
@@ -418,6 +424,8 @@ interface Mapping {
 	mapped: MappedStep[];
 	/** Native position carrying each descriptor, in descriptor order. */
 	positions: number[];
+	/** Optional descriptors that own no native step (their position is the next step's). */
+	skipped: Set<number>;
 }
 
 /** Strict ordered mapping: skipping another semantic step would leave stale
@@ -428,6 +436,7 @@ interface Mapping {
 function mapSteps(steps: NativeStep[], descriptors: Descriptor[], startPosition = 0): Mapping {
 	const mapped: MappedStep[] = [];
 	const positions: number[] = [];
+	const skipped = new Set<number>();
 	const orphans = bridgeOrphans(steps);
 	let position = startPosition;
 	let index = 0;
@@ -440,6 +449,20 @@ function mapSteps(steps: NativeStep[], descriptors: Descriptor[], startPosition 
 			position++;
 		}
 		const step = steps[position];
+		if (descriptor.optional) {
+			// An empty failed/aborted turn: it owns the next native planner step
+			// only when agy recorded one (the prompt reached the model).
+			const next = descriptors[index + 1];
+			positions.push(position);
+			if (step?.type === ASSISTANT_STEP && next?.role !== "assistant") {
+				mapped.push({ step, position, descriptor });
+				position++;
+			} else {
+				skipped.add(index);
+			}
+			index++;
+			continue;
+		}
 		if (!step) throw new TrajectorySyncError(`Native trajectory ended before ${descriptor.role} message ${index + 1}`);
 		const expected = semanticType(descriptor.role);
 		if (step.type !== expected) {
@@ -461,7 +484,7 @@ function mapSteps(steps: NativeStep[], descriptors: Descriptor[], startPosition 
 		}
 		position++;
 	}
-	return { mapped, positions };
+	return { mapped, positions, skipped };
 }
 
 function sameIdentity(message: Message, item: WarmItem): boolean {
@@ -503,11 +526,12 @@ function mergedSummaryItem(items: WarmItem[], count: number): WarmItem {
 
 /** Native descriptors for warm items, with leading summaries merged into one
  *  user step; `positionOf` maps a warm item index to its native position. */
-function mapWarmItems(steps: NativeStep[], items: WarmItem[]): { positionOf: (index: number) => number } {
+function mapWarmItems(steps: NativeStep[], items: WarmItem[]): { positionOf: (index: number) => number; ownsStep: (index: number) => boolean } {
 	const merged = leadingSummaryItemCount(items);
 	const collapsed = merged > 1 ? [mergedSummaryItem(items, merged), ...items.slice(merged)] : items;
-	const { positions } = mapSteps(steps, collapsed.map(descriptorForWarmItem));
-	return { positionOf: (index) => positions[merged > 1 ? Math.max(0, index - merged + 1) : index]! };
+	const { positions, skipped } = mapSteps(steps, collapsed.map(descriptorForWarmItem));
+	const at = (index: number) => merged > 1 ? Math.max(0, index - merged + 1) : index;
+	return { positionOf: (index) => positions[at(index)]!, ownsStep: (index) => !skipped.has(at(index)) };
 }
 
 /** Locate the unchanged old suffix after new history summaries. Tool-result
@@ -743,12 +767,14 @@ export function synchronizeConversation(
 			const summaryStep = steps[oldMapping.positionOf(0)]!;
 			if (summaryStep.type !== USER_STEP) throw new TrajectorySyncError("History summary must replace a native user step");
 			const tailPosition = oldMapping.positionOf(suffixStart);
-			if (tailPosition === oldMapping.positionOf(suffixStart - 1)) {
+			if (oldMapping.ownsStep(suffixStart - 1) && tailPosition === oldMapping.positionOf(suffixStart - 1)) {
 				throw new TrajectorySyncError("History summary boundary splits one native tool step");
 			}
-			const tailFirst = steps[tailPosition]!;
+			// No native step left after the summary only when the whole retained
+			// suffix is empty failed turns agy never recorded.
+			const tailIdx = steps[tailPosition]?.idx ?? Number.POSITIVE_INFINITY;
 			for (const step of steps) {
-				if (step.idx > summaryStep.idx && step.idx < tailFirst.idx) deletes.add(step.idx);
+				if (step.idx > summaryStep.idx && step.idx < tailIdx) deletes.add(step.idx);
 			}
 			const summaryDescriptor = descriptorForMessage(summaryMessage!, mergedSummaryItem(previousItems, leadingSummaryItemCount(previousItems)));
 			const summaryPayload = editedPayload(summaryStep, summaryDescriptor);
@@ -761,7 +787,7 @@ export function synchronizeConversation(
 				throw new TrajectorySyncError("Messages were removed without a history summary; native prefix deletion is ambiguous");
 			}
 			const added = effective.slice(previousItems.length);
-			if (added.some((message) => message.role !== "toolResult")) {
+			if (added.some((message) => message.role !== "toolResult" && !isEmptyFailedAssistant(message))) {
 				throw new TrajectorySyncError("Only newly completed tool results may be appended during native continuation");
 			}
 			for (let index = 0; index < previousItems.length; index++) {
@@ -775,7 +801,7 @@ export function synchronizeConversation(
 		const lastPosition = mapped.at(-1)?.position ?? -1;
 		const orphans = bridgeOrphans(steps);
 		for (const step of steps.slice(lastPosition + 1)) {
-			if (![USER_STEP, ASSISTANT_STEP, TOOL_RESULT_STEP, CHECKPOINT_STEP].includes(step.type)) continue;
+			if (deletes.has(step.idx) || ![USER_STEP, ASSISTANT_STEP, TOOL_RESULT_STEP, CHECKPOINT_STEP].includes(step.type)) continue;
 			if (options.discardCancelledTail && (step.type === ASSISTANT_STEP || step.type === TOOL_RESULT_STEP)) {
 				deletes.add(step.idx);
 				continue;
