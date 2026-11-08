@@ -3,7 +3,7 @@ import { createAssistantMessageEventStream, type AssistantMessage, type Assistan
 import { calculateContextTokens } from "@earendil-works/pi-coding-agent";
 import { test } from "vitest";
 import { createStreamSimple, ToolRoundTrips, type AcpSessions } from "../src/provider.js";
-import { DELTA_PROMPT, FRESH_PROMPT, MAX_TRANSCRIPT_BYTES, MAX_TRANSCRIPT_PARTS, planTurn, planTurnFrom, splitUtf8, warmAfterTurn } from "../src/transcript.js";
+import { DELTA_PROMPT, FRESH_PROMPT, MAX_TRANSCRIPT_BYTES, planTurn, planTurnFrom, splitUtf8, warmAfterTurn } from "../src/transcript.js";
 import { treeRestoreExtras } from "../src/tool-loadout.js";
 import { UsageMeter } from "../src/quota.js";
 import { FALLBACK_MODELS, toPiModel } from "../src/models.js";
@@ -86,6 +86,7 @@ class ScriptDriver implements TurnDriver {
 	}
 	reentry(): TurnHandle | null { return null; }
 	kickIdle(): void {}
+	async awaitBridgeResults(): Promise<void> {}
 	async cancelActive(): Promise<void> {}
 	async close(): Promise<void> {}
 }
@@ -239,7 +240,7 @@ test("splitUtf8 keeps pieces under the cap, prefers line ends, and never splits 
 	assert.ok(Buffer.byteLength(wide[0], "utf8") >= 90);
 });
 
-test("a large delta after switching to agy goes in parts; past the part cap the middle is omitted", () => {
+test("fresh and delta transcripts retain every message across bounded UTF-8 parts", () => {
 	const turn1 = [system(), user("hello")];
 	const warm = warmAfterTurn(ctx(turn1), assistant("hi"), "s1", "/w");
 	const big = (n: number) => assistant(`other model\n${"line of output\n".repeat(n)}`);
@@ -254,17 +255,17 @@ test("a large delta after switching to agy goes in parts; past the part cap the 
 	assert.equal(whole.split("line of output").length - 1, 25_000);
 	assert.match(whole, /^<user>\naudit\n<\/user>/);
 	assert.match(whole, /<user>\ncontinue with agy\n<\/user>$/);
-	// The fallback (fresh session) carries the whole transcript in parts too.
 	assert.ok((plan.fallback.parts?.length ?? 0) >= 2);
 
-	// 2 MB of history: at most MAX_TRANSCRIPT_PARTS prompts, oldest middle omitted.
+	// There is no aggregate replay budget: only the safe per-request byte cap remains.
 	const runs = Array.from({ length: 20 }, (_, index) => [user(`step ${index}`), big(6_700)]).flat();
 	const huge = planTurn(ctx([system(), ...runs, user("tail")]), "/w", undefined);
 	const hugeParts = huge.input.parts ?? [];
-	assert.ok(hugeParts.length + 1 <= MAX_TRANSCRIPT_PARTS && hugeParts.length >= MAX_TRANSCRIPT_PARTS - 2);
-	for (const part of hugeParts) assert.ok(Buffer.byteLength(part.contextBlock.text, "utf8") <= MAX_TRANSCRIPT_BYTES);
-	assert.match(hugeParts[0].contextBlock.text, /^<pi-system>[\s\S]*<pi-transcript-omitted messages="\d+">/);
-	assert.ok(!hugeParts[0].contextBlock.text.includes("<user>\nstep 0\n</user>"));
+	assert.ok(hugeParts.length + 1 > 8);
+	for (const part of [...hugeParts, huge.input]) assert.ok(Buffer.byteLength(part.contextBlock!.text, "utf8") <= MAX_TRANSCRIPT_BYTES);
+	assert.match(hugeParts[0].contextBlock.text, /^<pi-system>/);
+	assert.ok(hugeParts.some((part) => part.contextBlock.text.includes("<user>\nstep 0\n</user>")));
+	assert.doesNotMatch([...hugeParts, huge.input].map((part) => part.contextBlock!.text).join(""), /pi-transcript-omitted/);
 	assert.match(huge.input.contextBlock!.text, /<user>\ntail\n<\/user>$/);
 });
 

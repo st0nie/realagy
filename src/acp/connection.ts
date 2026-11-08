@@ -114,9 +114,11 @@ export class AcpConnection {
 	#suppressUpdates = false;
 	#canResume = false;
 	#serverVersion: string | undefined;
-
+	#exitPromise: Promise<void>;
+	#resolveExit!: () => void;
 	constructor(opts: AcpConnectionOptions) {
 		this.#opts = opts;
+		this.#exitPromise = new Promise<void>((resolve) => { this.#resolveExit = resolve; });
 	}
 
 	get alive(): boolean {
@@ -408,6 +410,12 @@ export class AcpConnection {
 			if (!this.#exited) this.#signalGroup("SIGKILL");
 		}, KILL_GRACE_MS).unref?.();
 	}
+	/** Stop the process and wait until its exit/close handlers have run. Native
+	 *  trajectory edits must happen only after agy can no longer rewrite them. */
+	async stop(): Promise<void> {
+		this.kill();
+		if (this.#child) await this.#exitPromise;
+	}
 
 	#signalGroup(signal: NodeJS.Signals): void {
 		const child = this.#child;
@@ -421,6 +429,7 @@ export class AcpConnection {
 
 	#finish(reason: string, code: number | null, signal: string | null): void {
 		if (this.#exited) return;
+		this.#resolveExit();
 		this.#exited = true;
 		const detail = lastLine(this.#stderrTail);
 		const full = redactText(detail ? `${reason}: ${detail}` : reason);

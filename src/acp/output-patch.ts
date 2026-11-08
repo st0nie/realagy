@@ -11,17 +11,14 @@
 // only while the relevant machine code is recognisable; otherwise startup fails
 // instead of patching an unrelated address.
 
-import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { promisify } from "node:util";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { inspectExecutable, type ExecutableImage, type ExecutableRegion } from "./binary-image.js";
+import { inspectExecutable, signMacOSBinary, type ExecutableImage, type ExecutableRegion } from "./binary-image.js";
 
 const CACHE_DIR = path.join(getAgentDir(), "realagy", "derived-bin");
 const CACHE_SUFFIX = "full-mcp-output";
-const execFileAsync = promisify(execFile);
 
 interface PatchAdapter {
 	prefix: Buffer;
@@ -170,19 +167,6 @@ async function cachedOutput(output: string): Promise<boolean> {
 		return /^[a-f0-9]{64}$/.test(expected) && await fileSha256(output) === expected;
 	} catch {
 		return false;
-	}
-}
-
-async function signMacOSBinary(file: string): Promise<void> {
-	if (process.platform !== "darwin") return;
-	try {
-		// Apple Silicon requires a valid signature after code bytes change. Ad-hoc
-		// signing only makes the local derivative executable; it does not alter agy's
-		// client identity or any application-level telemetry/request signatures.
-		await execFileAsync("codesign", ["--force", "--sign", "-", file]);
-		await execFileAsync("codesign", ["--verify", file]);
-	} catch (error) {
-		throw new Error(`Cannot sign derived macOS agy: ${error instanceof Error ? error.message : String(error)}`);
 	}
 }
 

@@ -1,6 +1,11 @@
 // Minimal executable inspection for the supported agy output patch. Only mapped
 // instruction bytes are searched; offsets and addresses stay format-specific.
 
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+
 export type BinaryFormat = "elf" | "pe" | "macho";
 export type BinaryArch = "x64" | "arm64";
 export type ExecutableRegion = { offset: number; vaddr: number; size: number };
@@ -134,4 +139,18 @@ export function inspectExecutable(data: Buffer): ExecutableImage {
 	else throw new Error("Unsupported agy binary: expected ELF, PE32+, or 64-bit Mach-O.");
 	if (image.executable.length === 0) throw new Error("Invalid agy binary: no executable instruction region.");
 	return image;
+}
+
+/** Re-sign a derived Mach-O executable; required on Apple Silicon after code bytes change. */
+export async function signMacOSBinary(file: string): Promise<void> {
+	if (process.platform !== "darwin") return;
+	try {
+		// Apple Silicon requires a valid signature after code bytes change. Ad-hoc
+		// signing only makes the local derivative executable; it does not alter agy's
+		// client identity or any application-level telemetry/request signatures.
+		await execFileAsync("codesign", ["--force", "--sign", "-", file]);
+		await execFileAsync("codesign", ["--verify", file]);
+	} catch (error) {
+		throw new Error(`Cannot sign derived macOS agy: ${error instanceof Error ? error.message : String(error)}`);
+	}
 }

@@ -21,11 +21,8 @@ import { agyCapacityNotice } from "./acp/events.js";
 import type { BridgeResult } from "./mcp-server.js";
 import {
 	formatToolResult,
-	measureWarm,
 	planTurnFrom,
 	warmAfterTurn,
-	DEFAULT_RECLAIM_POLICY,
-	type ReclaimPolicy,
 	type TurnPlan,
 	type WarmSession,
 } from "./transcript.js";
@@ -592,8 +589,6 @@ export interface AcpSessions {
 	 *  is still running, its outcome records a warm checkpoint at `assistant`. */
 	parked?: { handle: TurnHandle };
 }
-/** Why a running turn is cancelled and restarted on a fresh session. */
-const RECLAIM_REASON = "pi's context manager dropped or summarized enough of this session's history to restart it on a fresh session";
 
 /** The ACP session a pi request continues, and how many bytes it holds
  *  beyond pi's view of its prefix (`TurnPlan.hidden`). */
@@ -609,7 +604,7 @@ function heldBeyondView(base: TurnBase | undefined, sessionId: string): number {
 	return base && base.sessionId === sessionId ? base.hidden : 0;
 }
 
-function selectTurnPlan(context: TranscriptContext, cwd: string, sessions: AcpSessions, policy: Readonly<ReclaimPolicy> | null): TurnPlan {
+function selectTurnPlan(context: TranscriptContext, cwd: string, sessions: AcpSessions): TurnPlan {
 	const candidates: WarmSession[] = [];
 	if (sessions.warm) candidates.push(sessions.warm);
 	const history = sessions.checkpoints ?? [];
@@ -617,7 +612,7 @@ function selectTurnPlan(context: TranscriptContext, cwd: string, sessions: AcpSe
 		const item = history[i];
 		if (item && item !== sessions.warm) candidates.push(item);
 	}
-	const plan = planTurnFrom(context, cwd, candidates, policy);
+	const plan = planTurnFrom(context, cwd, candidates);
 	if (plan.kind !== "warm") return plan;
 	return { ...plan, sessionId: resolveSessionAtStep(sessions.conversationsDir?.(), plan.sessionId, plan.maxStepIdx) };
 }
@@ -628,10 +623,6 @@ export interface StreamSimpleDeps {
 	roundTrips: ToolRoundTrips;
 	sessions?: AcpSessions;
 	meter?: UsageMeter;
-	/** Live reclaim policy (`/realagy settings`); null keeps warm sessions
-	 *  however much pi's context managers dropped. Defaults to
-	 *  DEFAULT_RECLAIM_POLICY. */
-	reclaim?: () => Readonly<ReclaimPolicy> | null;
 }
 
 export function createStreamSimple(deps: StreamSimpleDeps) {
@@ -667,7 +658,6 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 		/** The session this call continues and the bytes it holds beyond pi's
 		 *  view of its prefix; set below, before any checkpoint is recorded. */
 		let base: TurnBase | undefined;
-		const policy = deps.reclaim ? deps.reclaim() : DEFAULT_RECLAIM_POLICY;
 		const onCompleted = (outcome: TurnOutcome, final: AssistantMessage): void => {
 			recordWarm(context, outcome, final, base);
 		};
@@ -686,30 +676,33 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 				const results = context.messages.filter((message): message is Extract<Message, { role: "toolResult" }> =>
 					message.role === "toolResult" && deps.roundTrips.isPending(message.toolCallId),
 				);
-				// The running turn's session still holds everything pi's context
-				// managers have since dropped or summarized. Past the reclaim
-				// threshold, restart on a fresh session instead of continuing it.
-				let reclaim = false;
-				const step = sessions.step;
-				if (results.length > 0 && step && !options?.signal?.aborted && deps.driver.reentry()) {
-					const measured = measureWarm(context, step, policy);
-					if (measured?.reclaim) reclaim = true;
-					else if (measured) base = { sessionId: step.sessionId, hidden: measured.hidden };
+				const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+				const plan = selectTurnPlan(context, cwd, sessions);
+				const syncing = plan.kind === "context-sync";
+				let cancelledForSync = false;
+				// Settle completed Pi calls before cancelling the old model turn.
+				// Otherwise its generic abort handler can reject an already-completed
+				// MCP request before the native continuation consumes its result.
+				for (const result of results) {
+					const trailing = !syncing && result === results.at(-1)
+						? context.messages.slice(context.messages.lastIndexOf(result) + 1)
+						: [];
+					const payload = formatToolResult(result, trailing);
+					deps.roundTrips.resolve(result.toolCallId, payload.text, result.isError, payload.images);
 				}
-				if (reclaim) {
-					traceUsage("reclaim", { sessionId: step?.sessionId, held: step?.bytes, results: results.length });
-					sessions.parked = undefined;
-					deps.roundTrips.failAll(RECLAIM_REASON, { includeEscalated: true });
-					await deps.driver.cancelActive(RECLAIM_REASON);
-				} else {
-					for (let i = 0; i < results.length; i++) {
-						const result = results[i];
-						const trailing = i === results.length - 1 ? context.messages.slice(context.messages.lastIndexOf(result) + 1) : [];
-						const payload = formatToolResult(result, trailing);
-						deps.roundTrips.resolve(result.toolCallId, payload.text, result.isError, payload.images);
+				// A changed prefix must be synchronized before continuing. Cancel
+				// only the parked model turn; native tool results are already stored.
+				if (results.length > 0 && sessions.step && !options?.signal?.aborted && deps.driver.reentry()) {
+					if (syncing) {
+						sessions.parked = undefined;
+						await deps.driver.awaitBridgeResults();
+						await deps.driver.cancelActive("pi context changed; synchronizing native trajectory");
+						cancelledForSync = true;
+					} else if (plan.kind === "warm") {
+						base = { sessionId: plan.sessionId, hidden: plan.hidden };
 					}
 				}
-				const active = !reclaim && results.length > 0 && !deps.roundTrips.hasPendingBatchCalls() ? deps.driver.reentry() : null;
+				const active = !syncing && results.length > 0 && !deps.roundTrips.hasPendingBatchCalls() ? deps.driver.reentry() : null;
 				if (active) {
 					sessions.parked = undefined;
 					await consumeTurn(stream, blocks, active, model, options, onCompleted, onToolCall, deps.meter);
@@ -743,13 +736,13 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 				await deps.driver.cancelActive("superseded by a new pi turn");
 				sessions.parked = undefined;
 
-				const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 				const entry = deps.entries.find((candidate) => candidate.id === model.id);
-				const plan = selectTurnPlan(context, cwd, sessions, policy);
-				base = plan.kind === "warm" ? { sessionId: plan.sessionId, hidden: plan.hidden } : undefined;
+				base = plan.kind === "warm" || plan.kind === "context-sync" ? { sessionId: plan.sessionId, hidden: plan.kind === "warm" ? plan.hidden : 0 } : undefined;
 				traceUsage("plan", plan.kind === "warm"
 					? { kind: plan.kind, sessionId: plan.sessionId, deltaMessages: plan.deltaMessages, delta: plan.input.contextBlock ? "transcript" : "user", parts: plan.input.parts?.length ?? 0, hidden: plan.hidden }
-					: { kind: plan.kind, reason: plan.reason, messages: context.messages.length, parts: plan.input.parts?.length ?? 0 });
+					: plan.kind === "context-sync"
+						? { kind: plan.kind, sessionId: plan.sessionId, deltaMessages: plan.deltaMessages, hasNewUser: plan.hasNewUser }
+						: { kind: plan.kind, reason: plan.reason, messages: context.messages.length, parts: plan.input.parts?.length ?? 0 });
 				// Unknown until this turn reaches a tool boundary or settles.
 				sessions.warm = undefined;
 				sessions.step = undefined;
@@ -763,12 +756,18 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					// approved; the tool policy steers the model to pi's tools,
 					// which run under pi's permission policy.
 					skipPermissions: true,
-					conversationId: plan.kind === "warm" ? plan.sessionId : null,
+					conversationId: plan.kind === "warm" || plan.kind === "context-sync" ? plan.sessionId : null,
 					prompt: plan.input.prompt,
 					images: plan.input.images,
 					...(plan.input.contextBlock ? { contextBlock: plan.input.contextBlock } : {}),
 					...(plan.input.parts ? { parts: plan.input.parts } : {}),
 					...(plan.kind === "warm" ? { fallback: plan.fallback } : {}),
+					...(plan.kind === "context-sync" ? { contextSync: {
+						messages: plan.messages,
+						previousItems: plan.previousItems,
+						hasNewUser: plan.hasNewUser,
+						...(cancelledForSync ? { discardCancelledTail: true } : {}),
+					} } : {}),
 					signal: options?.signal,
 					inactivityMin: 5,
 				};

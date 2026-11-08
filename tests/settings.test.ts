@@ -15,7 +15,6 @@ import {
 	normalizeRealagyConfig,
 	parsePositiveInt,
 	realagyConfigPath,
-	reclaimPolicy,
 	RealagySettingsComponent,
 	saveRealagyConfig,
 	type RealagyConfig,
@@ -240,7 +239,7 @@ test("fallback menu edits global and grouped per-model limits, resets inheritanc
 		contextWindowOverrides: { "gemini-4-argon": 900_000 },
 		maxOutputTokensOverrides: { "gemini-4-argon": 64_000 },
 	};
-	const ui = menuUi([0, 1, 2, 3, 4, 11], ["300000", "32000"]);
+	const ui = menuUi([0, 1, 2, 3, 4, 7], ["300000", "32000"]);
 	const result = await editRealagyConfigMenu(ui, initial, modelIds);
 	assert.deepEqual(result, {
 		noAutoCompaction: false,
@@ -253,7 +252,7 @@ test("fallback menu edits global and grouped per-model limits, resets inheritanc
 	});
 	assert.equal(ui.messages.length, 0);
 
-	const resetUi = menuUi([3, 3, 11], ["not-a-number", ""]);
+	const resetUi = menuUi([3, 3, 7], ["not-a-number", ""]);
 	const resetResult = await editRealagyConfigMenu(resetUi, result!, modelIds);
 	assert.deepEqual(resetResult, {
 		noAutoCompaction: false,
@@ -266,8 +265,8 @@ test("fallback menu edits global and grouped per-model limits, resets inheritanc
 	assert.equal(resetUi.messages.length, 1);
 
 	const perModelUi = menuUi(
-		[5, 1, 5, 1, 5, 0, 5, 2, 6, 0, 6, 1, 6, 1, 6, 2, 11],
-		["bad", "450000", "", "48000", "32000", ""],
+		[5, 0, 5, 1, 5, 2, 6, 0, 6, 0, 6, 2, 7],
+		["", "450000", "not-a-number", "48000"],
 	);
 	const perModelResult = await editRealagyConfigMenu(perModelUi, result!, modelIds);
 	assert.deepEqual(perModelResult?.contextWindowOverrides, { "claude-sonnet-5-5": 450_000 });
@@ -275,7 +274,7 @@ test("fallback menu edits global and grouped per-model limits, resets inheritanc
 	assert.equal(perModelUi.messages.length, 1);
 	assert.match(perModelUi.messages[0], /inherit global/);
 
-	const cancelled = menuUi([12], []);
+	const cancelled = menuUi([8], []);
 	assert.equal(await editRealagyConfigMenu(cancelled, DEFAULT_REALAGY_CONFIG, modelIds), undefined);
 });
 
@@ -291,85 +290,13 @@ function menuUi(selections: number[], inputs: string[]): SettingsMenuUI & { mess
 	};
 }
 
-test("reclaim settings: defaults, config.json validation, policy, and summary", () => {
-	assert.deepEqual(reclaimPolicy(DEFAULT_REALAGY_CONFIG), { minBytes: 32_000, minShare: 0.5, coldMs: 300_000 });
-	assert.match(formatConfigSummary(DEFAULT_REALAGY_CONFIG, "/x"), /Release context dropped by pi extensions: ON \(≥ 8,000 tokens and ≥ 50% of the session, or any such amount after 5 min idle\)/);
-
-	const custom = normalizeRealagyConfig({
-		...DEFAULT_REALAGY_CONFIG,
-		reclaimMinTokens: "20,000",
-		reclaimMinPercent: "25%",
-		reclaimColdMinutes: 0,
-	});
-	assert.deepEqual(custom, { ...DEFAULT_REALAGY_CONFIG, reclaimMinTokens: 20_000, reclaimMinPercent: 25, reclaimColdMinutes: 0 });
-	assert.deepEqual(reclaimPolicy(custom), { minBytes: 80_000, minShare: 0.25, coldMs: 0 });
-	assert.doesNotMatch(formatConfigSummary(custom, "/x"), /idle/);
-
-	// Invalid values and values equal to the defaults are dropped from the file.
-	const invalid = normalizeRealagyConfig({ reclaimContext: "yes", reclaimMinTokens: -5, reclaimMinPercent: 150, reclaimColdMinutes: "soon" });
-	assert.deepEqual(invalid, DEFAULT_REALAGY_CONFIG);
-	assert.deepEqual(normalizeRealagyConfig({ reclaimContext: true, reclaimMinTokens: 8000, reclaimMinPercent: 50, reclaimColdMinutes: 5 }), DEFAULT_REALAGY_CONFIG);
-
-	const off = normalizeRealagyConfig({ reclaimContext: false });
-	assert.equal(off.reclaimContext, false);
-	assert.equal(reclaimPolicy(off), null);
-	assert.match(formatConfigSummary(off, "/x"), /Release context dropped by pi extensions: OFF/);
-});
-
-test("reclaim settings cycle in the TUI and keep other settings", () => {
-	initTheme();
-	const changes: RealagyConfig[] = [];
-	const tui = { requestRender: () => {} } as unknown as TUI;
-	const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text } as unknown as Theme;
-	const component = new RealagySettingsComponent({
-		tui,
-		theme,
-		config: { ...DEFAULT_REALAGY_CONFIG, contextWindow: 500_000 },
-		modelIds: ["gemini-4-argon"],
-		configPath: "/tmp/realagy/config.json",
-		onChange: (next) => changes.push(next),
-		onClose: () => {},
-	});
-	const lines = component.render(140).join("\n");
-	assert.match(lines, /Release dropped context.*true/);
-	assert.match(lines, /Release: minimum tokens.*8,000/);
-	assert.match(lines, /Release: minimum share.*50%/);
-	assert.match(lines, /Release: cold cache after.*5 min/);
-
-	// Rows: 0-4 globals, 5-6 per-model menus, 7-10 reclaim.
-	for (let i = 0; i < 7; i++) component.handleInput("\x1b[B");
-	component.handleInput("\r");
-	assert.equal(changes.at(-1)?.reclaimContext, false);
-	component.handleInput("\x1b[B");
-	component.handleInput("\r");
-	assert.equal(changes.at(-1)?.reclaimMinTokens, 16_000);
-	component.handleInput("\x1b[B");
-	component.handleInput("\r");
-	assert.equal(changes.at(-1)?.reclaimMinPercent, 75);
-	component.handleInput("\x1b[B");
-	component.handleInput("\r");
-	assert.equal(changes.at(-1)?.reclaimColdMinutes, 10);
-	assert.deepEqual(changes.at(-1), {
-		...DEFAULT_REALAGY_CONFIG,
-		contextWindow: 500_000,
-		reclaimContext: false,
-		reclaimMinTokens: 16_000,
-		reclaimMinPercent: 75,
-		reclaimColdMinutes: 10,
-	});
-});
-
-test("fallback menu edits reclaim settings with presets, custom values, and validation", async () => {
-	// Top-level rows: 0-6 globals/model menus, 7-10 reclaim, 11 save, 12 cancel.
-	const ui = menuUi([7, 8, 1, 9, 6, 9, 6, 10, 0, 11], ["12.5%", "abc"]);
-	const result = await editRealagyConfigMenu(ui, DEFAULT_REALAGY_CONFIG, ["gemini-4-argon"]);
-	assert.deepEqual(result, {
+test("legacy reclaim keys are ignored rather than disabling native context synchronization", () => {
+	assert.deepEqual(normalizeRealagyConfig({
 		...DEFAULT_REALAGY_CONFIG,
 		reclaimContext: false,
-		reclaimMinTokens: 4_000,
-		reclaimMinPercent: 12.5,
+		reclaimMinTokens: 1,
+		reclaimMinPercent: 0,
 		reclaimColdMinutes: 0,
-	});
-	assert.equal(ui.messages.length, 1);
-	assert.match(ui.messages[0], /percentage from 0 to 100/);
+	}), DEFAULT_REALAGY_CONFIG);
+	assert.doesNotMatch(formatConfigSummary(DEFAULT_REALAGY_CONFIG, "/x"), /Release context dropped/);
 });

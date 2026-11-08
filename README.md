@@ -34,7 +34,7 @@ The catalog comes live from agy and depends on the account.
 | Command | What it does |
 | --- | --- |
 | `/realagy` | Open an interactive Settings / Usage / Setup menu (cancel returns without running a command) |
-| `/realagy settings` | Configure Agy auto-compaction bypass, Pi-only agent profile, optional Pi token-limit overrides, and when dropped context is released (`~/.pi/agent/realagy/config.json`) |
+| `/realagy settings` | Configure Agy auto-compaction bypass, Pi-only agent profile, optional Pi token-limit overrides (`~/.pi/agent/realagy/config.json`) |
 | `/realagy setup` | Checks agy: shows install steps when it is missing, sign-in steps when it cannot start a session, and reloads the model catalog when it is ready |
 | `/realagy usage` | Cache-hit rate for this session plus every quota group's 5-hour and weekly remaining share and reset times (from the live `agy acp` server, or `agy --print /usage`) |
 
@@ -90,7 +90,7 @@ Out of the box (`noAutoCompaction: true`), realagy starts an embedded loopback C
 
 
 With `fullMcpOutput: true` (the default), realagy derives a private agy executable in `~/.pi/agent/realagy/derived-bin/` that returns complete individual and `parallel` MCP tool results instead of agy's truncated preview. The source agy is never modified, and the derivative is launched by absolute path without changing `PATH`. Windows x64, Linux x64, and macOS arm64 are supported; macOS derivatives are ad-hoc signed locally after patching. Every source is SHA-256 keyed and must contain one unique, architecture-specific instruction signature whose original branch target is preserved. An unrecognized upgrade or unsupported architecture fails explicitly rather than applying fixed offsets. Set `fullMcpOutput: false` to use the original agy and its normal output truncation. This does not raise the model's context limit or change Pi's own display truncation; authentication, telemetry, client identity, and request signing code remain untouched.
-Run `/realagy settings` (or edit `~/.pi/agent/realagy/config.json`) to toggle the compaction bypass (`noAutoCompaction`), complete MCP output (`fullMcpOutput`), and the Pi-only agent profile (`agentProfile`), override Pi's reported global `contextWindow` and `maxOutputTokens`, or tune when context dropped by pi extensions is released (`reclaimContext`, `reclaimMinTokens`, `reclaimMinPercent`, `reclaimColdMinutes`; see the table below). Changes save atomically and apply without restarting Pi: model metadata refreshes immediately, and process-level changes (`noAutoCompaction`, `fullMcpOutput`, or `agentProfile`) restart `agy acp` cleanly for the next turn while preserving remembered sessions.
+Run `/realagy settings` (or edit `~/.pi/agent/realagy/config.json`) to toggle the compaction bypass (`noAutoCompaction`), complete MCP output (`fullMcpOutput`), and the Pi-only agent profile (`agentProfile`), or override Pi's reported global `contextWindow` and `maxOutputTokens`. Changes save atomically and apply without restarting Pi: model metadata refreshes immediately, and process-level changes (`noAutoCompaction`, `fullMcpOutput`, or `agentProfile`) restart `agy acp` cleanly for the next turn while preserving remembered sessions.
 
 For model-specific limits, open `/realagy settings` and choose **Per-model context windows** or **Per-model output tokens**. Each submenu lists the available models with either its override or `inherit global`; select a model to choose a preset, enter a custom positive integer, or restore inheritance. The main settings list shows only the two submenu entries and their override counts. RPC hosts expose the same two submenus. Changes are stored in `contextWindowOverrides` and `maxOutputTokensOverrides`, whose keys are exact, case-sensitive Pi model IDs shown after `antigravity/` in `/model` (without the provider prefix); one entry covers every thinking tier grouped into that Pi model. A matching per-model value takes precedence over its corresponding global `contextWindow` or `maxOutputTokens`; models without an entry use the global value, then the upstream catalog or family default. The equivalent JSON configuration is:
 
@@ -115,6 +115,8 @@ Here Gemini 3.8 Flash reports a 1,048,576-token context window and 65,536-token 
 
 The bypass does not increase real server-side model limits; when a conversation exceeds the upstream window without Pi compaction, the request fails rather than triggering Agy's local summary.
 
+When Pi's effective context changes (a realctx drop or summary, a dropped image, Pi compaction, or several rewrites in a row), realagy writes the change into agy's existing conversation instead of opening a new session or replaying the transcript. It stops `agy acp`, edits the affected steps of `~/.gemini/antigravity-cli/conversations/<session>.db` in one SQLite transaction, and resumes the same session ID, so the model sees only the synchronized history. This is always on and has no setting. If history changes while a turn waits on Pi tools, the finished tool results are handed to agy first and are never re-run. A trajectory layout realagy has not verified fails the turn with an error and leaves the database untouched; it never falls back to stale history. A synchronized turn with no new user message needs a private empty-prompt continuation derivative (Windows/Linux x64, macOS arm64). It is derived the first time it is needed, like the full-output derivative; when `fullMcpOutput` is on it is applied on top of that derivative, so one binary carries both patches. The installed agy is never modified. See `docs/architecture.md` for details.
+
 | Setting (`~/.pi/agent/realagy/config.json`) | Default | Effect |
 | --- | --- | --- |
 | `noAutoCompaction` | `true` | Enable the loopback catalog proxy and disable Agy's local automatic compaction |
@@ -124,10 +126,6 @@ The bypass does not increase real server-side model limits; when a conversation 
 | `contextWindowOverrides` | *(none)* | Optional map of exact Pi model IDs to positive-integer context windows; each match takes precedence over `contextWindow` |
 | `maxOutputTokens` | *(model default)* | Optional positive integer overriding the output limit reported to Pi for all models |
 | `maxOutputTokensOverrides` | *(none)* | Optional map of exact Pi model IDs to positive-integer output limits; each match takes precedence over `maxOutputTokens` |
-| `reclaimContext` | `true` | Start a fresh agy session once pi extensions such as realctx dropped or summarized enough of what the current one holds (agy otherwise keeps the full text, so their savings never reach the model); `false` keeps warm sessions |
-| `reclaimMinTokens` | `8000` | Least dropped context, in tokens, worth re-sending the smaller transcript to a fresh session |
-| `reclaimMinPercent` | `50` | ...that is also at least this percentage (0-100) of the session's context while the prompt cache is warm |
-| `reclaimColdMinutes` | `5` | After this many minutes without a reply the prompt cache is cold, so `reclaimMinTokens` alone decides; `0` turns this off |
 
 | Environment | Effect |
 | --- | --- |
@@ -152,6 +150,7 @@ The bypass does not increase real server-side model limits; when a conversation 
 | `src/acp/output-patch.ts`, `binary-image.ts` | SHA-256-keyed private agy derivative, ELF/PE/Mach-O inspection, target-preserving output-decorator patch |
 | `src/acp/connection.ts`, `driver.ts`, `events.ts`, `jsonrpc.ts` | `agy acp` process, ACP protocol, serialized turns, frame mapping |
 | `src/acp/catalog-proxy.ts` | Loopback Cloud Code proxy (default on), upstream limit capture, catalog compaction rewrite, upstream proxy support |
+| `src/acp/trajectory-sync.ts`, `trajectory-proto.ts`, `continuation-patch.ts` | In-place native trajectory synchronization of Pi's effective context, schema-directed protobuf editing, empty-prompt continuation derivative |
 | `src/acp/step-usage.ts` | Exact per-model-call tokens from agy's conversation store, and `/tree` forks of it |
 | `src/agent-profile.ts`, `src/tool-policy.ts` | agy's custom agent profile (realagy's system prompt, eager pi tools) and the tool policy appended to it |
 | `src/native-tools.ts`, `src/acp/background.ts`, `src/background-card.ts` | Thinking lines and the live panel for agy's own tool calls; finished background work as a conversation card that wakes pi's agent |

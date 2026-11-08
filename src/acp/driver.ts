@@ -34,8 +34,10 @@ import { BackgroundMessages, type BackgroundItem, type BackgroundNotice } from "
 import { AcpConnection, type AcpExitInfo, type AcpMcpServer } from "./connection.js";
 import { CatalogProxy } from "./catalog-proxy.js";
 import { isAgyRetryNotice, mapStopReason, mapUpdate, TextAccumulator, type AcpEditDiff } from "./events.js";
+import { deriveAgyNativeContinuation } from "./continuation-patch.js";
 import { deriveAgyFullMcpOutput } from "./output-patch.js";
 import { conversationDbPath, lastStepIdx, readStepState, siblingUsage, summarizeSteps, userInputSince, type StepTokens, type StepUsage } from "./step-usage.js";
+import { synchronizeConversation } from "./trajectory-sync.js";
 import { nativeToolLabel, nativeToolTarget, PI_BRIDGE_SERVER, type NativeToolEvent } from "../native-tools.js";
 import { traceUsage } from "../usage-trace.js";
 import type { AgyStepUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../driver-types.js";
@@ -45,6 +47,8 @@ export type { AcpMcpServer } from "./connection.js";
 const DEFAULT_INACTIVITY_MIN = 5;
 /** How long a cancelled prompt may take to settle before teardown. */
 const CANCEL_GRACE_MS = 10_000;
+/** How long agy may take to record pi tool results it was already sent. */
+const BRIDGE_RESULT_WAIT_MS = 30_000;
 
 export interface AcpDriverOptions {
 	/** agy binary. A function is resolved per spawn, so `/realagy setup` can
@@ -132,6 +136,8 @@ interface ActiveTurn {
 	natives: Map<string, BackgroundItem>;
 	/** Subagents started by this prompt (they finish in the background). */
 	subagents: BackgroundItem[];
+	/** Woken when the last pending pi-bridge call completes or the turn settles. */
+	bridgeWaiters: Set<() => void>;
 	promptStartedAt: number;
 	/** agy echoes the prompt as user_message_chunk. Content frames before
 	 *  that echo are leftovers of background work that finished between
@@ -166,12 +172,17 @@ export class AcpDriver implements TurnDriver {
 	#onTurnEnd: ((outcome: TurnOutcome) => void) | undefined;
 	/** Sessions held in memory by the current server process (reset on respawn). */
 	#liveSessions = new Set<string>();
+	/** A failed or interrupted sync cannot be bypassed by an ordinary prompt. */
+	#unsynchronizedSessions = new Set<string>();
 	/** Watches agy's brain directory for background work (created lazily). */
 	#background: BackgroundMessages | undefined;
 	/** Shared by real Agy respawns while noAutoCompaction is enabled. */
 	#catalogProxy: CatalogProxy | undefined;
 	/** Whether the live `#conn` was spawned with the catalog proxy. */
 	#connNoAutoCompaction: boolean | undefined;
+	/** A verified native continuation is derived lazily on the first sync that
+	 *  has no new user input; ordinary turns keep the existing runtime. */
+	#nativeContinuation = false;
 
 	constructor(opts: AcpDriverOptions) {
 		this.#opts = opts;
@@ -262,6 +273,26 @@ export class AcpDriver implements TurnDriver {
 		return this.activeHandle;
 	}
 
+	/** Resolve once agy has completed every pending pi-bridge tool call of the
+	 *  active turn (its tool_call_update arrived), so a following cancel cannot
+	 *  discard a result pi already returned. Rejects if agy does not confirm. */
+	async awaitBridgeResults(timeoutMs = BRIDGE_RESULT_WAIT_MS): Promise<void> {
+		const turn = this.#active;
+		if (!turn || turn.closed || !hasPendingBridgeCall(turn)) return;
+		await new Promise<void>((resolve, reject) => {
+			const done = () => {
+				clearTimeout(timer);
+				turn.bridgeWaiters.delete(done);
+				resolve();
+			};
+			const timer = setTimeout(() => {
+				turn.bridgeWaiters.delete(done);
+				reject(new Error("agy did not record the pi tool results before synchronization"));
+			}, timeoutMs);
+			turn.bridgeWaiters.add(done);
+		});
+	}
+
 	async cancelActive(reason: string): Promise<void> {
 		const turn = this.#active;
 		if (!turn || turn.closed) return;
@@ -300,9 +331,34 @@ export class AcpDriver implements TurnDriver {
 		return Promise.resolve(this.#makeHandle(turn));
 	}
 
+	/** Persist pi's effective history into the existing native session. The old
+	 *  process is fully stopped first; reopening then uses the same session ID. */
+	async #prepareContextSync(request: DriverTurnRequest): Promise<void> {
+		const sync = request.contextSync;
+		const sessionId = request.conversationId;
+		if (!sync || !sessionId) throw new Error("Native context sync requires an existing agy session");
+		const dir = this.#opts.conversationsDir?.();
+		if (!dir) throw new Error("Native context sync requires agy's conversation store");
+		this.#unsynchronizedSessions.add(sessionId);
+		const previous = this.#conn;
+		this.#conn = undefined;
+		this.#connNoAutoCompaction = undefined;
+		this.#liveSessions.clear();
+		this.#background?.forgetAll();
+		if (previous) await previous.stop();
+		const dbPath = conversationDbPath(dir, sessionId);
+		if (!dbPath) throw new Error("Cannot locate agy's native conversation store");
+		const result = synchronizeConversation(dbPath, sync.messages, sync.previousItems, sync.hasNewUser, { discardCancelledTail: sync.discardCancelledTail });
+		if (!sync.hasNewUser) this.#nativeContinuation = true;
+		this.#log("context-sync", { sessionId, ...result });
+	}
 	async #executeTurn(turn: ActiveTurn): Promise<void> {
 		const request = turn.request;
-		this.#retireStaleAgent();
+		if (!request.contextSync && request.conversationId && this.#unsynchronizedSessions.has(request.conversationId)) {
+			throw new Error("Native history synchronization is incomplete; retry synchronization before sending another prompt");
+		}
+		if (request.contextSync) await this.#prepareContextSync(request);
+		else this.#retireStaleAgent();
 		const conn = await this.#ensureConnection(request.cwd);
 		if (turn.closed) return;
 		turn.conn = conn;
@@ -340,6 +396,9 @@ export class AcpDriver implements TurnDriver {
 		}
 		if (turn.closed) return;
 
+		// Native empty continuation has no user echo to await. Ordinary prompts
+		// retain the existing echo gate, including transcript priming parts.
+		if (request.contextSync && !request.contextSync.hasNewUser) turn.echoSeen = true;
 		this.#armIdle(turn);
 		turn.promptStarted = true;
 		turn.promptStartedAt = Date.now();
@@ -422,8 +481,12 @@ export class AcpDriver implements TurnDriver {
 				return undefined;
 			}
 			this.#log("session-reopen-failed", { sessionId: id, message: describe(err) });
+			if (turn.request.contextSync) throw new Error(`Cannot reopen synchronized agy session ${id}: ${describe(err)}`, { cause: err });
 		}
 		if (turn.closed) return undefined;
+		if (turn.request.contextSync) {
+			throw new Error(`Cannot fall back to a fresh session after native context sync (${id ?? "unknown"})`);
+		}
 		try {
 			const created = await conn.newSession(turn.request.cwd);
 			turn.sessionId = created.sessionId;
@@ -549,6 +612,7 @@ export class AcpDriver implements TurnDriver {
 					toolCallId: mapped.toolCallId,
 				});
 				this.#nativeEnded(turn, mapped.toolCallId, "ok");
+				this.#wakeBridgeWaiters(turn);
 				return;
 			}
 			case "tool_error": {
@@ -556,11 +620,17 @@ export class AcpDriver implements TurnDriver {
 				turn.toolCalls.delete(mapped.toolCallId);
 				this.#emit(turn, { type: "tool_error", name: entry?.name ?? "tool", message: mapped.message, mcpServer: mapped.mcpServer ?? entry?.mcpServer, toolCallId: mapped.toolCallId });
 				this.#nativeEnded(turn, mapped.toolCallId, "failed");
+				this.#wakeBridgeWaiters(turn);
 				return;
 			}
 			case "replay_user":
 				return; // load replay or a repeated echo: never live text
 		}
+	}
+
+	#wakeBridgeWaiters(turn: ActiveTurn): void {
+		if (turn.bridgeWaiters.size === 0 || (!turn.closed && hasPendingBridgeCall(turn))) return;
+		for (const wake of [...turn.bridgeWaiters]) wake();
 	}
 
 	/** One of agy's own tools started: show it live and pause the inactivity
@@ -744,6 +814,9 @@ export class AcpDriver implements TurnDriver {
 			if (!this.#opts.binArgs && fullMcpOutput) {
 				bin = await deriveAgyFullMcpOutput(bin, { log: (msg, data) => this.#log(msg, data) });
 			}
+			if (!this.#opts.binArgs && this.#nativeContinuation) {
+				bin = await deriveAgyNativeContinuation(bin, { log: (msg, data) => this.#log(msg, data) });
+			}
 			let binArgs = this.#opts.binArgs;
 			const useCatalogProxy = !binArgs && this.#noAutoCompaction();
 			if (useCatalogProxy) {
@@ -846,6 +919,7 @@ export class AcpDriver implements TurnDriver {
 			toolCalls: new Map(),
 			natives: new Map(),
 			subagents: [],
+			bridgeWaiters: new Set(),
 			promptStartedAt: 0,
 			echoSeen: false,
 			held: [],
@@ -876,6 +950,9 @@ export class AcpDriver implements TurnDriver {
 
 	#settle(turn: ActiveTurn, outcome: TurnOutcome, opts: { collected?: boolean } = {}): void {
 		if (turn.closed) return;
+		if (turn.request.contextSync && outcome.status === "OK" && !outcome.aborted) {
+			this.#unsynchronizedSessions.delete(turn.sessionId);
+		}
 		const flushed = turn.response.flush();
 		if (flushed) this.#emit(turn, { type: "text", delta: flushed });
 		outcome.response = turn.response.text;
@@ -896,6 +973,7 @@ export class AcpDriver implements TurnDriver {
 		if (this.#active === turn) this.#active = undefined;
 		for (const wake of turn.wake) wake();
 		turn.wake = [];
+		this.#wakeBridgeWaiters(turn);
 		turn.resolve(outcome);
 		try {
 			this.#onTurnEnd?.(outcome);
@@ -992,6 +1070,11 @@ export class AcpDriver implements TurnDriver {
 
 /** Content frames that can be leftovers of background work; status frames
  *  (usage, config, commands) describe the session now and always apply. */
+function hasPendingBridgeCall(turn: ActiveTurn): boolean {
+	for (const call of turn.toolCalls.values()) if (call.mcpServer === PI_BRIDGE_SERVER) return true;
+	return false;
+}
+
 const LEFTOVER_KINDS = new Set(["agent_message_chunk", "agent_thought_chunk", "tool_call", "tool_call_update"]);
 
 function record(value: unknown): Record<string, unknown> {

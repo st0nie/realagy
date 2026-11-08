@@ -32,6 +32,12 @@ export interface WarmItem {
 	/** Normalized text of a `user` message, used for line-bounded prefix/suffix
 	 *  matching when an extension decorates only the active turn's prompt. */
 	userText?: string;
+	/** Original model-visible text used to identify a native step before a sync. */
+	syncText?: string;
+	/** Stable tool name and native media digest; never derived from dropped text. */
+	syncName?: string;
+	syncMediaHash?: string;
+	summary?: boolean;
 }
 
 /** What a reusable ACP session is known to hold. */
@@ -42,10 +48,15 @@ export interface WarmSession {
 	count: number;
 	/** Fingerprint of those messages. */
 	hash: string;
+	/** Exact model-visible content hash of the persistent prefix, including
+	 *  realctx drop placeholders, image bytes, and history summaries. */
+	contentHash?: string;
 	/** Per-message hashes of non-system, non-summary messages in order. */
 	keys?: string[];
 	/** Structured non-system message descriptors for extension-invariant matching. */
 	items?: WarmItem[];
+	/** Full persistent history (including summaries) for native trajectory sync. */
+	syncItems?: WarmItem[];
 	/** Highest `steps.idx` in `~/.gemini/antigravity-cli/conversations/<sessionId>.db`
 	 *  when this turn completed. Used to fork a truncated store on `/tree` rewind. */
 	maxStepIdx?: number;
@@ -146,14 +157,6 @@ function serializeRange(messages: Message[], imageBase = 0): { text: string; ima
  *  from the end, which would cut off recent messages and the user's prompt. */
 export const MAX_TRANSCRIPT_BYTES = 160_000;
 
-/** Most prompts one transcript is delivered in. Past
- *  MAX_TRANSCRIPT_PARTS × 90% × MAX_TRANSCRIPT_BYTES, older middle messages
- *  are omitted instead (see serializeBounded). */
-export const MAX_TRANSCRIPT_PARTS = 8;
-
-/** Every part but the last is filled to at least 90% of the cap, so a body
- *  of this size never needs more than MAX_TRANSCRIPT_PARTS parts. */
-const MAX_PARTED_BYTES = Math.floor((MAX_TRANSCRIPT_PARTS * MAX_TRANSCRIPT_BYTES * 9) / 10);
 
 /** Prompt of an earlier part: the model only acknowledges it. */
 export function transcriptPartPrompt(index: number, total: number): string {
@@ -184,7 +187,8 @@ export function splitUtf8(text: string, maxBytes: number): string[] {
  *  `session/prompt`, otherwise earlier parts sent ahead of the final prompt,
  *  so the whole transcript reaches agy instead of a truncated one. */
 function transcriptInput(uri: string, prompt: string, header: string, messages: Message[]): AcpInput {
-	const body = serializeBounded(header, messages, MAX_PARTED_BYTES);
+	const serialized = serializeRange(messages.filter((message) => message.role !== "system"));
+	const body = { text: [header, serialized.text].filter(Boolean).join("\n\n"), images: serialized.images };
 	const pieces = splitUtf8(body.text, MAX_TRANSCRIPT_BYTES);
 	const total = pieces.length;
 	const last = pieces[total - 1] ?? "";
@@ -215,45 +219,14 @@ function isHistorySummaryText(text: string): boolean {
 	);
 }
 
-function isHistorySummary(message: Message): boolean {
+export function isHistorySummary(message: Message): boolean {
 	if (message.role !== "user") return false;
 	return isHistorySummaryText(contentText(message.content));
 }
 
-/** When a warm session is abandoned for a fresh one because a context manager
- *  shrank pi's view of what the session holds (`/realagy settings`). */
-export interface ReclaimPolicy {
-	/** Least reclaimable bytes (`messageBytes` units) worth a fresh session... */
-	minBytes: number;
-	/** ...that are also at least this share (0-1) of what the session holds,
-	 *  so a re-read of the whole (smaller) transcript pays for itself... */
-	minShare: number;
-	/** ...unless the latest reply is at least this old (ms): the provider's
-	 *  prompt cache is cold anyway. 0 turns this rule off. */
-	coldMs: number;
-}
-
-/** Rough UTF-8 bytes per token, for policies configured in tokens. */
-export const BYTES_PER_TOKEN = 4;
-
-/** 8k tokens and 50% of a hot session, or ≥ 8k tokens after 5 idle minutes. */
-export const DEFAULT_RECLAIM_POLICY: Readonly<ReclaimPolicy> = {
-	minBytes: 8_000 * BYTES_PER_TOKEN,
-	minShare: 0.5,
-	coldMs: 5 * 60_000,
-};
 
 /** Byte weight of one attached image (about 1.5k tokens). */
 const IMAGE_BYTES = 6_000;
-
-/** Whether `reclaim` bytes held by a session of `held` bytes, but no longer
- *  in pi's view, justify replacing the session with a fresh one. A null
- *  policy never reclaims. */
-export function shouldReclaim(reclaim: number, held: number, cold: boolean, policy: Readonly<ReclaimPolicy> | null = DEFAULT_RECLAIM_POLICY): boolean {
-	if (!policy || reclaim <= 0 || reclaim < policy.minBytes) return false;
-	return cold || reclaim >= held * policy.minShare;
-}
-
 /** Size of one message as the ACP session sees it: serialized text plus a
  *  fixed weight per image. System messages are not part of the conversation. */
 export function messageBytes(message: Message): number {
@@ -273,84 +246,6 @@ function utf8Bytes(text: string): number {
 	return Buffer.byteLength(text, "utf8");
 }
 
-function clipHeadToUtf8Bytes(text: string, maxBytes: number): string {
-	if (utf8Bytes(text) <= maxBytes) return text;
-	const marker = "...[older content clipped]...\n";
-	const budget = Math.max(0, maxBytes - utf8Bytes(marker));
-	if (budget === 0) return "";
-	const buf = Buffer.from(text, "utf8");
-	let start = buf.length - budget;
-	while (start < buf.length && ((buf[start] ?? 0) & 0xc0) === 0x80) start++;
-	return marker + buf.subarray(start).toString("utf8");
-}
-
-/** Serialize header + messages within `maxBytes`, keeping `<pi-system>`,
- *  leading `<realctx-history>` summaries, and the newest messages intact while
- *  collapsing older middle messages into `<pi-transcript-omitted>`. */
-export function serializeBounded(
-	header: string,
-	messages: Message[],
-	maxBytes = MAX_TRANSCRIPT_BYTES,
-): { text: string; images: AcpImage[] } {
-	const visible = messages.filter((message) => message.role !== "system");
-	const full = serializeRange(visible);
-	const fullText = [header, full.text].filter(Boolean).join("\n\n");
-	if (utf8Bytes(fullText) <= maxBytes || visible.length === 0) {
-		return { text: fullText, images: full.images };
-	}
-
-	let prefixEnd = 0;
-	while (prefixEnd < visible.length - 1) {
-		const candidate = visible[prefixEnd];
-		if (!candidate || !isHistorySummary(candidate)) break;
-		prefixEnd++;
-	}
-
-	const sizes = visible.map((message) => utf8Bytes(serializeMessage(message, 0).text));
-	const headerBytes = header ? utf8Bytes(header) + 2 : 0;
-	const markerReserve = 128;
-	const minSuffixReserve = Math.min(32_000, Math.floor(maxBytes / 4));
-	const maxPrefixBytes = Math.max(0, maxBytes - headerBytes - markerReserve - minSuffixReserve);
-
-	let keptPrefix = 0;
-	let prefixBytes = 0;
-	while (keptPrefix < prefixEnd) {
-		const sz = sizes[keptPrefix] ?? 0;
-		const add = sz > 0 ? sz + (prefixBytes > 0 ? 2 : 0) : 0;
-		if (prefixBytes + add > maxPrefixBytes) break;
-		prefixBytes += add;
-		keptPrefix++;
-	}
-
-	const remainingBudget = Math.max(
-		Math.min(4_096, Math.floor(maxBytes / 4)),
-		maxBytes - headerBytes - (prefixBytes > 0 ? prefixBytes + 2 : 0) - markerReserve,
-	);
-	let suffixStart = visible.length;
-	let suffixBytes = 0;
-	while (suffixStart > keptPrefix) {
-		const sz = sizes[suffixStart - 1] ?? 0;
-		const add = sz > 0 ? sz + (suffixBytes > 0 ? 2 : 0) : 0;
-		if (suffixBytes + add > remainingBudget) break;
-		suffixBytes += add;
-		suffixStart--;
-	}
-	if (suffixStart === visible.length) {
-		suffixStart = visible.length - 1;
-	}
-
-	const prefix = serializeRange(visible.slice(0, keptPrefix), 0);
-	const omitted = suffixStart - keptPrefix;
-	const marker = omitted > 0
-		? `<pi-transcript-omitted messages="${omitted}">\nOlder messages omitted to fit the ACP prompt limit.\n</pi-transcript-omitted>`
-		: "";
-	const suffix = serializeRange(visible.slice(suffixStart), prefix.images.length);
-	const suffixText = utf8Bytes(suffix.text) > remainingBudget
-		? clipHeadToUtf8Bytes(suffix.text, remainingBudget)
-		: suffix.text;
-	const text = [header, prefix.text, marker, suffixText].filter(Boolean).join("\n\n");
-	return { text, images: [...prefix.images, ...suffix.images] };
-}
 
 /** Format a pi toolResult for the MCP bridge response, attaching any user
  *  steering messages (or system updates) pi appended after the tool ran. */
@@ -419,6 +314,9 @@ export function freshInput(context: TranscriptContext): AcpInput {
 
 /** Content fingerprint: role, visible text, tool identities, and image bytes.
  *  Thinking is excluded; it is model-private and may be redacted by pi. */
+/** Native prompt text agy stores for a user turn that has images but no text. */
+export const IMAGE_ONLY_PROMPT = "See the attached images.";
+
 const EPHEMERAL_USER_PREFIX = /^\[pi-lens automated (?:check|context) — not a user request\]/;
 
 /** True for transient one-request messages injected by pi-lens's `context`
@@ -434,7 +332,8 @@ export function persistentMessages(messages: Message[]): Message[] {
 }
 
 
-const REALCTX_USER_IMAGE_DROP = /\[#\d+ (?:dropped|summarized|superseded) · user images?\b/;
+/** realctx placeholder for dropped user images: `· user image` or `· 2 user images`. */
+export const REALCTX_USER_IMAGE_DROP = /\[#\d+ (?:dropped|summarized|superseded) · (?:\d+ )?user images?\b/;
 const EPHEMERAL_USER_INLINE = /(?:^|\n+)\[pi-lens automated (?:check|context) — not a user request\][\s\S]*$/;
 
 function cleanUserBlockText(text: string): string {
@@ -500,6 +399,18 @@ function toWarmItem(message: Exclude<Message, { role: "system" }>, key = message
 	};
 	if (message.role === "user") {
 		item.userText = fullUserText(message.content);
+		item.syncText = contentText(message.content);
+		item.summary = isHistorySummary(message);
+	}
+	if (message.role === "toolResult") {
+		item.syncText = contentText(message.content);
+		item.syncName = message.toolName;
+	}
+	const media = (Array.isArray(message.content) ? message.content : []).filter((block) => block.type === "image");
+	if (media.length > 0) {
+		const hash = createHash("sha256");
+		for (const block of media) hash.update(block.mimeType).update("\0").update(block.data).update("\0");
+		item.syncMediaHash = hash.digest("hex");
 	}
 	return item;
 }
@@ -522,12 +433,34 @@ export function warmItemsForMessages(messages: Message[]): WarmItem[] {
 	return out;
 }
 
+export function syncItemsForMessages(messages: Message[]): WarmItem[] {
+	return persistentMessages(messages)
+		.filter((message): message is Exclude<Message, { role: "system" }> => message.role !== "system")
+		.map((message) => toWarmItem(message));
+}
+
 export function fingerprint(messages: Message[]): string {
 	const hash = createHash("sha256");
 	for (const message of messages) hash.update(messageKey(message)).update("\0");
 	return hash.digest("hex");
 }
 
+/** Unlike `fingerprint`, this includes content mutations that preserve message
+ *  identity: realctx drops, image removal, and native/history summaries. */
+export function contentFingerprint(messages: Message[]): string {
+	const hash = createHash("sha256");
+	for (const message of persistentMessages(messages)) {
+		const serialized = serializeMessage(message, 0);
+		hash.update(JSON.stringify([
+			message.role,
+			serialized.text,
+			serialized.images,
+			message.role === "toolResult" ? [message.toolCallId, message.toolName, Boolean(message.isError)] : null,
+			message.role === "user" && isHistorySummary(message),
+		])).update("\0");
+	}
+	return hash.digest("hex");
+}
 function userTextsMatch(a: string, b: string): boolean {
 	if (a === b) return true;
 	if (!a || !b) return false;
@@ -613,9 +546,6 @@ function matchWarmItems(
 	warmItems: ReadonlyArray<WarmItem>,
 ): number | null {
 	if (warmItems.length === 0 || body.length === 0) return null;
-	if (body[0]?.isCompaction && warmItems[0]?.key !== body[0].item.key) {
-		return null;
-	}
 
 	const maxSummaryLead = countLeadingSummaries(body);
 	for (let lead = 0; lead <= maxSummaryLead; lead++) {
@@ -652,9 +582,6 @@ function matchKeySuffix(
 	targetKeys: readonly string[],
 ): number | null {
 	if (targetKeys.length === 0 || body.length === 0) return null;
-	if (body[0]?.isCompaction && targetKeys[0] !== body[0].item.key) {
-		return null;
-	}
 	const maxSummaryLead = countLeadingSummaries(body);
 	const maxUserLead = countLeadingUsers(body);
 	for (let drop = 0; drop < targetKeys.length; drop++) {
@@ -847,9 +774,24 @@ export type TurnPlan =
 		/** Bytes the session holds beyond pi's current view of its prefix
 		 *  (see `WarmSession.bytes`); carried into the next checkpoint. */
 		hidden: number;
+	}
+	| {
+		kind: "context-sync";
+		sessionId: string;
+		maxStepIdx?: number;
+		/** Current effective pi context, used for native trajectory edits. */
+		messages: Message[];
+		/** Native-prefix identities from the matched checkpoint. */
+		previousItems: WarmItem[];
+		/** Whether input is a genuinely new user message rather than continuation. */
+		hasNewUser: boolean;
+		/** A genuinely new user input, or an empty native continuation. */
+		input: AcpInput;
+		deltaMessages: number;
 	};
-
-type WarmMatch = { warm: WarmSession; end: number; delta: Message[]; hidden: number } | { reason: string };
+type WarmMatch =
+	| { warm: WarmSession; end: number; delta: Message[]; hidden: number }
+	| { reason: string; warm?: WarmSession; end?: number; delta?: Message[] };
 
 /** Bytes `warm` holds beyond pi's view of the messages it matched (negative
  *  when pi's view grew), or undefined for checkpoints without `bytes`. */
@@ -870,23 +812,41 @@ function matchWarmPrefix(index: TranscriptIndex, cwd: string, warm: WarmSession 
 	}
 	if (split.delta.length === 0) return { reason: "history-shrank" };
 	if (!split.delta.some((message) => message.role === "user" || message.role === "toolResult")) return { reason: "no-user-message" };
+	const prefix = persistentMessages(index.messages.slice(0, split.end));
+	if (warm.contentHash !== contentFingerprint(prefix)) {
+		return { reason: "context-sync", warm, end: split.end, delta: split.delta };
+	}
 	const hidden = hiddenBytes(index, warm, split.end) ?? 0;
 	return { warm, end: split.end, delta: split.delta, hidden };
 }
 
-function applyReclaim(index: TranscriptIndex, match: WarmMatch, policy: Readonly<ReclaimPolicy> | null): WarmMatch {
-	if ("reason" in match) return match;
-	// Matching tolerates context managers rewriting what the session already
-	// holds, but the session keeps the original: once enough was dropped or
-	// summarized, only a fresh session actually releases that context.
-	if (match.warm.bytes !== undefined && policy && shouldReclaim(match.hidden, match.warm.bytes, index.cold(policy.coldMs), policy)) {
-		return { reason: "context-reclaimed" };
-	}
-	return match;
-}
 
 function planFromMatch(index: TranscriptIndex, match: WarmMatch): TurnPlan {
-	if ("reason" in match) return { kind: "fresh", input: index.fresh(), reason: match.reason };
+	if ("reason" in match) {
+		if (match.reason === "context-sync" && match.warm && match.end !== undefined && match.delta) {
+			const texts: string[] = [];
+			const images: AcpImage[] = [];
+			for (const message of match.delta) {
+				if (message.role !== "user" || isHistorySummary(message)) continue;
+				const text = contentText(message.content);
+				if (text) texts.push(text);
+				for (const block of Array.isArray(message.content) ? message.content : []) {
+					if (block.type === "image") images.push({ data: block.data, mimeType: block.mimeType });
+				}
+			}
+			return {
+				kind: "context-sync",
+				sessionId: match.warm.sessionId,
+				maxStepIdx: match.warm.maxStepIdx,
+				messages: persistentMessages(index.messages),
+				previousItems: match.warm.syncItems ?? match.warm.items ?? [],
+				hasNewUser: texts.length > 0 || images.length > 0,
+				input: { prompt: texts.join("\n\n") || (images.length > 0 ? IMAGE_ONLY_PROMPT : ""), images },
+				deltaMessages: match.delta.length,
+			};
+		}
+		return { kind: "fresh", input: index.fresh(), reason: match.reason };
+	}
 	const { warm, end, delta, hidden } = match;
 	const systemPrompt = index.systemPrompt();
 	const systemChanged = systemPrompt !== warm.systemPrompt && getCurrentSystemPrompt(index.messages) !== warm.systemPrompt;
@@ -905,7 +865,7 @@ function planFromMatch(index: TranscriptIndex, match: WarmMatch): TurnPlan {
 				if (block.type === "image") images.push({ data: block.data, mimeType: block.mimeType });
 			}
 		}
-		input = { prompt: texts.join("\n\n") || "See the attached images.", images };
+		input = { prompt: texts.join("\n\n") || IMAGE_ONLY_PROMPT, images };
 	} else {
 		const headers: string[] = [];
 		if (systemChanged) {
@@ -939,54 +899,23 @@ function toolsUpdate(tools: string): string {
 	return `<pi-tools-update>\n${text}\n</pi-tools-update>`;
 }
 
-/** For a running turn about to continue on `warm` (its tool-boundary
- *  checkpoint): the bytes the session holds beyond pi's current view, and
- *  whether that is enough to restart on a fresh session instead. When an
- *  extension rewrote history past prefix matching, the whole current
- *  transcript is a conservative upper bound on what remains visible.
- *  Undefined when the checkpoint has no `bytes`. */
-export function measureWarm(
-	context: TranscriptContext,
-	warm: WarmSession,
-	policy: Readonly<ReclaimPolicy> | null = DEFAULT_RECLAIM_POLICY,
-): { hidden: number; reclaim: boolean } | undefined {
-	if (warm.bytes === undefined) return undefined;
+
+export function planTurn(context: TranscriptContext, cwd: string, warm: WarmSession | undefined): TurnPlan {
 	const index = new TranscriptIndex(context);
-	const split = splitWarmTranscript(index, warm);
-	const visible = split ? index.bytesBefore(split.end) : index.bytesBefore(index.messages.length);
-	const hidden = Math.max(0, warm.bytes - visible);
-	// Mid-turn the prompt cache is hot: only the share rule applies.
-	return { hidden, reclaim: shouldReclaim(hidden, warm.bytes, false, policy) };
+	return planFromMatch(index, matchWarmPrefix(index, cwd, warm));
 }
 
-export function planTurn(
-	context: TranscriptContext,
-	cwd: string,
-	warm: WarmSession | undefined,
-	policy: Readonly<ReclaimPolicy> | null = DEFAULT_RECLAIM_POLICY,
-): TurnPlan {
-	const index = new TranscriptIndex(context);
-	return planFromMatch(index, applyReclaim(index, matchWarmPrefix(index, cwd, warm), policy));
-}
-
-/** Plan against several remembered sessions (most preferred first): the one
- *  with the smallest delta wins, and reclaim policy runs on that winner rather
- *  than falling back to an older checkpoint on the same branch (which would
- *  fork the conversation DB, invalidate prompt cache, and replay intervening
- *  turns as deltas). With none usable, the first candidate's fresh reason is
- *  reported. Inputs are built only for the winner. */
-export function planTurnFrom(
-	context: TranscriptContext,
-	cwd: string,
-	candidates: readonly WarmSession[],
-	policy: Readonly<ReclaimPolicy> | null = DEFAULT_RECLAIM_POLICY,
-): TurnPlan {
+/** Plan against remembered sessions, most preferred first. A rewritten prefix
+ * belongs to its exact native branch and is never bypassed via an older warm
+ * checkpoint. With none usable, report the first candidate's fresh reason. */
+export function planTurnFrom(context: TranscriptContext, cwd: string, candidates: readonly WarmSession[]): TurnPlan {
 	const index = new TranscriptIndex(context);
 	let best: Extract<WarmMatch, { warm: WarmSession }> | undefined;
 	let firstFailure: { reason: string } | undefined;
 	for (const candidate of candidates) {
 		const match = matchWarmPrefix(index, cwd, candidate);
 		if ("reason" in match) {
+			if (match.reason === "context-sync") return planFromMatch(index, match);
 			firstFailure ??= match;
 			continue;
 		}
@@ -995,10 +924,7 @@ export function planTurnFrom(
 			if (best.delta.length === 1) break;
 		}
 	}
-	const chosen = best
-		? applyReclaim(index, best, policy)
-		: (firstFailure ?? matchWarmPrefix(index, cwd, candidates[0]));
-	return planFromMatch(index, chosen);
+	return planFromMatch(index, best ?? (firstFailure ?? matchWarmPrefix(index, cwd, candidates[0])));
 }
 
 /** State after a completed turn: the session holds pi's persistent messages
@@ -1020,8 +946,10 @@ export function warmAfterTurn(
 		count: messages.length,
 		bytes: Math.max(0, transcriptBytes(messages) + hidden),
 		hash: fingerprint(messages),
+		contentHash: contentFingerprint(messages),
 		keys: nonHistoryKeys(messages),
 		items: warmItemsForMessages(messages),
+		syncItems: syncItemsForMessages(messages),
 		systemPrompt: renderPiSystemPrompt(context.messages),
 		tools: toolsKey(context),
 	};
@@ -1039,11 +967,15 @@ export interface SessionEntryLike {
 
 function toWarmItemEntry(raw: unknown): WarmItem | null {
 	if (!raw || typeof raw !== "object") return null;
-	const candidate = raw as { role?: unknown; key?: unknown; userText?: unknown };
+	const candidate = raw as { role?: unknown; key?: unknown; userText?: unknown; syncText?: unknown; syncName?: unknown; syncMediaHash?: unknown; summary?: unknown };
 	if (candidate.role !== "user" && candidate.role !== "assistant" && candidate.role !== "toolResult") return null;
 	if (typeof candidate.key !== "string" || !candidate.key) return null;
 	const item: WarmItem = { role: candidate.role, key: candidate.key };
 	if (typeof candidate.userText === "string") item.userText = candidate.userText;
+	if (typeof candidate.syncText === "string") item.syncText = candidate.syncText;
+	if (typeof candidate.syncName === "string") item.syncName = candidate.syncName;
+	if (typeof candidate.syncMediaHash === "string") item.syncMediaHash = candidate.syncMediaHash;
+	if (typeof candidate.summary === "boolean") item.summary = candidate.summary;
 	return item;
 }
 
@@ -1059,10 +991,15 @@ function toWarmSession(data: Partial<WarmSession> | null | undefined): WarmSessi
 		systemPrompt: String(data.systemPrompt),
 		tools: String(data.tools),
 	};
+	if (typeof data.contentHash === "string") warm.contentHash = data.contentHash;
 	if (Array.isArray(data.keys)) warm.keys = data.keys.map((key) => String(key));
 	if (Array.isArray(data.items)) {
 		const items = data.items.map(toWarmItemEntry).filter((item): item is WarmItem => item !== null);
 		if (items.length > 0) warm.items = items;
+	}
+	if (Array.isArray(data.syncItems)) {
+		const items = data.syncItems.map(toWarmItemEntry).filter((item): item is WarmItem => item !== null);
+		if (items.length > 0) warm.syncItems = items;
 	}
 	if (data.maxStepIdx !== undefined && Number.isFinite(data.maxStepIdx)) {
 		warm.maxStepIdx = Number(data.maxStepIdx);
