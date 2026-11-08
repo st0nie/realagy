@@ -298,7 +298,7 @@ test("real-agy mode enables the catalog proxy by default, enriches listModels li
 	const logs: string[] = [];
 	const driver = new AcpDriver({
 		bin: fakeAgy,
-		fullMcpOutput: false, // This fake ACP script is not an agy machine-code binary.
+		deriveBin: async (source) => source, // This fake ACP script is not an agy machine-code binary.
 		noAutoCompaction: () => noAutoCompaction,
 		cloudCodeUpstream: `http://127.0.0.1:${port}`,
 		extraEnv: { NO_PROXY: "*" },

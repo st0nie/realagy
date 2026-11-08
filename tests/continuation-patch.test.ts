@@ -1,10 +1,6 @@
 import assert from "node:assert/strict";
-import crypto from "node:crypto";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { test } from "vitest";
-import { deriveAgyNativeContinuation, patchAgyNativeContinuation } from "../src/acp/continuation-patch.js";
+import { patchAgyNativeContinuation } from "../src/acp/continuation-patch.js";
 
 const SIGNATURE = 0x1100;
 const SEGMENT_OFFSET = 0x1000;
@@ -65,23 +61,6 @@ test("continuation signature matching is unique and confined to executable x64 c
 	const nonExecutable = fixture();
 	nonExecutable.writeUInt32LE(4, 68);
 	assert.throws(() => patchAgyNativeContinuation(nonExecutable), /no executable instruction region/);
-});
-
-test("continuation derivation is source-hash cached and leaves the source untouched", async () => {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-continuation-test-"));
-	const sourcePath = path.join(root, "agy");
-	const cacheDir = path.join(root, "derived");
-	const source = fixture();
-	fs.writeFileSync(sourcePath, source);
-	const first = await deriveAgyNativeContinuation(sourcePath, { cacheDir });
-	const second = await deriveAgyNativeContinuation(sourcePath, { cacheDir });
-	assert.equal(first, second);
-	assert.equal(path.basename(first), `agy-${crypto.createHash("sha256").update(source).digest("hex")}-native-continuation`);
-	assert.deepEqual(fs.readFileSync(sourcePath), source);
-	assert.ok(fs.statSync(first).mode & 0o111);
-	fs.writeFileSync(sourcePath, Buffer.alloc(0x2000));
-	await assert.rejects(deriveAgyNativeContinuation(sourcePath, { cacheDir }), /expected ELF|found 0/);
-	assert.deepEqual(fs.readFileSync(first), patchAgyNativeContinuation(source).data, "an invalid update cannot replace the prior cached binary");
 });
 
 // agy 1.5.3 darwin-arm64 prompt admission, relocated into a minimal Mach-O.
@@ -162,16 +141,4 @@ test("macOS arm64 continuation matching is structural, unique, and fails closed"
 	const macX64 = machoFixture();
 	macX64.writeUInt32LE(0x01000007, 4);
 	assert.throws(() => patchAgyNativeContinuation(macX64), /supported targets/);
-});
-
-test("macOS arm64 continuation derivation is cached by source hash", async () => {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-continuation-macho-test-"));
-	const sourcePath = path.join(root, "agy");
-	const cacheDir = path.join(root, "derived");
-	const source = machoFixture();
-	fs.writeFileSync(sourcePath, source);
-	const derived = await deriveAgyNativeContinuation(sourcePath, { cacheDir });
-	assert.equal(path.basename(derived), `agy-${crypto.createHash("sha256").update(source).digest("hex")}-native-continuation`);
-	assert.deepEqual(fs.readFileSync(derived), patchAgyNativeContinuation(source).data);
-	assert.deepEqual(fs.readFileSync(sourcePath), source);
 });

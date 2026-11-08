@@ -1,17 +1,13 @@
-// Derive native empty-prompt continuation separately from the full-output patch.
+// Native empty-prompt continuation patch, applied in memory by
+// src/acp/derived-agy.ts together with the full-output patch.
 // agy already has the required continuation control flow; ACP rejects an empty
 // prompt before reaching it. The x64 (ELF/PE) and macOS arm64 adapters apply the
 // same three-instruction control-flow change: ordinary prompt handling is kept
 // and only the empty case is redirected through the existing native path.
 // Unknown instruction layouts fail closed without modifying the source.
 
-import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { inspectExecutable, signMacOSBinary, type ExecutableImage, type ExecutableRegion } from "./binary-image.js";
+import { inspectExecutable, type ExecutableImage, type ExecutableRegion } from "./binary-image.js";
 
-const CACHE_DIR = path.join(getAgentDir(), "realagy", "derived-bin");
 const X64_PREFIX = Buffer.from([0x48, 0x85, 0xf6, 0x0f, 0x85]);
 const X64_SUFFIX = Buffer.from([0x48, 0x8b, 0x94, 0x24, 0x78, 0x02, 0x00, 0x00]);
 const SECOND_FROM_FIRST = 0xcf;
@@ -172,75 +168,4 @@ export function patchAgyNativeContinuation(source: Buffer): ContinuationPatchRes
 	if ((image.format === "elf" || image.format === "pe") && image.arch === "x64") return patchX64(source, image);
 	if (image.format === "macho" && image.arch === "arm64") return patchArm64(source, image);
 	throw new Error("Cannot derive native-continuation agy: supported targets are Windows x64, Linux x64, and macOS arm64; no bytes were written.");
-}
-
-const sha256 = (data: Buffer): string => crypto.createHash("sha256").update(data).digest("hex");
-
-async function fileSha256(file: string): Promise<string | undefined> {
-	try {
-		const hash = crypto.createHash("sha256");
-		for await (const chunk of fs.createReadStream(file)) hash.update(chunk);
-		return hash.digest("hex");
-	} catch {
-		return undefined;
-	}
-}
-
-async function validCache(output: string): Promise<boolean> {
-	try {
-		const expected = (await fs.promises.readFile(`${output}.sha256`, "utf8")).trim();
-		return /^[a-f0-9]{64}$/.test(expected) && await fileSha256(output) === expected;
-	} catch {
-		return false;
-	}
-}
-
-export interface DeriveContinuationOptions {
-	cacheDir?: string;
-	log?: (msg: string, data?: unknown) => void;
-}
-
-const inFlight = new Map<string, Promise<string>>();
-
-async function derive(sourcePath: string, cacheDir: string, log?: DeriveContinuationOptions["log"]): Promise<string> {
-	const source = await fs.promises.readFile(sourcePath);
-	const sourceHash = sha256(source);
-	const image = inspectExecutable(source);
-	const extension = image.format === "pe" ? ".exe" : "";
-	const output = path.join(cacheDir, `agy-${sourceHash}-native-continuation${extension}`);
-	if (await validCache(output)) return output;
-	const patched = patchAgyNativeContinuation(source);
-	await fs.promises.mkdir(cacheDir, { recursive: true, mode: 0o700 });
-	const temporary = `${output}.${process.pid}.${crypto.randomUUID()}.tmp`;
-	const hashTemporary = `${output}.sha256.${process.pid}.${crypto.randomUUID()}.tmp`;
-	try {
-		await fs.promises.writeFile(temporary, patched.data, { mode: 0o755 });
-		await fs.promises.chmod(temporary, 0o755);
-		if (patched.format === "macho") await signMacOSBinary(temporary);
-		const outputHash = await fileSha256(temporary);
-		if (!outputHash) throw new Error("Cannot hash the derived native-continuation agy executable.");
-		await fs.promises.rename(temporary, output);
-		await fs.promises.writeFile(hashTemporary, `${outputHash}\n`, { mode: 0o600 });
-		await fs.promises.rename(hashTemporary, `${output}.sha256`);
-		log?.("native-continuation-derived", { source: sourcePath, sourceSha256: sourceHash, output, outputSha256: outputHash, format: patched.format, arch: patched.arch, offsets: patched.offsets });
-		return output;
-	} finally {
-		await fs.promises.unlink(temporary).catch(() => undefined);
-		await fs.promises.unlink(hashTemporary).catch(() => undefined);
-	}
-}
-
-/** Cache by the exact input bytes, including a prior full-output derivative. */
-export function deriveAgyNativeContinuation(sourcePath: string, options: DeriveContinuationOptions = {}): Promise<string> {
-	const source = path.resolve(sourcePath);
-	const cacheDir = options.cacheDir ?? CACHE_DIR;
-	const key = `${source}\0${cacheDir}`;
-	let pending = inFlight.get(key);
-	if (!pending) {
-		pending = derive(source, cacheDir, options.log).finally(() => {
-			if (inFlight.get(key) === pending) inFlight.delete(key);
-		});
-		inFlight.set(key, pending);
-	}
-	return pending;
 }

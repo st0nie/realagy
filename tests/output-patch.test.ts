@@ -1,10 +1,6 @@
 import assert from "node:assert/strict";
-import crypto from "node:crypto";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { test } from "vitest";
-import { deriveAgyFullMcpOutput, patchAgyOutputTruncation } from "../src/acp/output-patch.js";
+import { patchAgyOutputTruncation } from "../src/acp/output-patch.js";
 
 const SIGNATURE_OFFSET = 0x1100;
 const SEGMENT_OFFSET = 0x1000;
@@ -87,8 +83,6 @@ function changedOffsets(before: Buffer, after: Buffer): number[] {
 	return changed;
 }
 
-const tempDir = (): string => fs.mkdtempSync(path.join(os.tmpdir(), "realagy-output-patch-test-"));
-
 test("the agy output patch replaces only JLE with a target-preserving JMP and NOP", () => {
 	const source = fixture();
 	const original = Buffer.from(source);
@@ -157,53 +151,4 @@ test("an out-of-text branch target is rejected instead of patched", () => {
 	const source = fixture();
 	source.writeInt32LE(SEGMENT_SIZE, SIGNATURE_OFFSET + 5);
 	assert.throws(() => patchAgyOutputTruncation(source), /outside executable memory/);
-});
-
-test("derivation is atomic, cached by source hash, and never modifies the source", async () => {
-	const root = tempDir();
-	const sourcePath = path.join(root, "agy");
-	const cacheDir = path.join(root, "cache");
-	const source = fixture();
-	fs.writeFileSync(sourcePath, source);
-	const sourceHash = crypto.createHash("sha256").update(source).digest("hex");
-	const logs: Array<{ msg: string; data: unknown }> = [];
-	const options = { cacheDir, log: (msg: string, data: unknown) => logs.push({ msg, data }) };
-
-	const [first, concurrent] = await Promise.all([
-		deriveAgyFullMcpOutput(sourcePath, options),
-		deriveAgyFullMcpOutput(sourcePath, options),
-	]);
-	assert.equal(first, concurrent);
-	assert.equal(path.basename(first), `agy-${sourceHash}-full-mcp-output`);
-	assert.deepEqual(fs.readFileSync(sourcePath), source);
-	assert.equal(changedOffsets(source, fs.readFileSync(first)).length, 4);
-	assert.ok(fs.statSync(first).mode & 0o111);
-	assert.deepEqual(logs.map((entry) => entry.msg), ["output-patch-derived"]);
-
-	const before = fs.statSync(first).mtimeMs;
-	assert.equal(await deriveAgyFullMcpOutput(sourcePath, options), first);
-	assert.equal(fs.statSync(first).mtimeMs, before, "a verified cache entry is reused");
-	assert.equal(logs.length, 1);
-
-	// A changed source is treated as an upgrade and gets a distinct derivative;
-	// the previous version's cache entry is not overwritten.
-	const upgraded = fixture();
-	upgraded[0x1800] = 0x42;
-	fs.writeFileSync(sourcePath, upgraded);
-	const second = await deriveAgyFullMcpOutput(sourcePath, options);
-	assert.notEqual(second, first);
-	assert.equal(changedOffsets(upgraded, fs.readFileSync(second)).length, 4);
-	assert.deepEqual(fs.readFileSync(first), patchAgyOutputTruncation(source).data);
-	assert.equal(logs.length, 2);
-});
-
-test("a corrupt cache artifact is rebuilt from the unmodified source", async () => {
-	const root = tempDir();
-	const sourcePath = path.join(root, "agy");
-	const cacheDir = path.join(root, "cache");
-	fs.writeFileSync(sourcePath, fixture());
-	const output = await deriveAgyFullMcpOutput(sourcePath, { cacheDir });
-	fs.writeFileSync(output, fixture());
-	assert.equal(await deriveAgyFullMcpOutput(sourcePath, { cacheDir }), output);
-	assert.equal(changedOffsets(fixture(), fs.readFileSync(output)).length, 4);
 });

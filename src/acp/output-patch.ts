@@ -1,4 +1,5 @@
-// Derive a private agy copy whose tool-output decorator is disabled.
+// Full-MCP-output patch: disable agy's tool-output decorator. Applied in memory
+// by src/acp/derived-agy.ts, which writes realagy's single private agy copy.
 //
 // agy 1.5.3 stores complete MCP results, but its decorator gives the model a
 // truncated preview. The patch replaces only the decorator construction's
@@ -11,14 +12,8 @@
 // only while the relevant machine code is recognisable; otherwise startup fails
 // instead of patching an unrelated address.
 
-import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { inspectExecutable, signMacOSBinary, type ExecutableImage, type ExecutableRegion } from "./binary-image.js";
+import { inspectExecutable, type ExecutableImage, type ExecutableRegion } from "./binary-image.js";
 
-const CACHE_DIR = path.join(getAgentDir(), "realagy", "derived-bin");
-const CACHE_SUFFIX = "full-mcp-output";
 
 interface PatchAdapter {
 	prefix: Buffer;
@@ -94,13 +89,6 @@ export interface OutputPatchResult {
 	target: number;
 }
 
-export interface DeriveOutputPatchOptions {
-	cacheDir?: string;
-	log?: (msg: string, data?: unknown) => void;
-}
-
-const inFlight = new Map<string, Promise<string>>();
-
 function assertExecutableTarget(target: number, executable: readonly ExecutableRegion[]): void {
 	if (!executable.some((item) => target >= item.vaddr && target < item.vaddr + item.size)) {
 		throw new Error("Cannot derive full-MCP-output agy: decorator branch target is outside executable memory; no bytes were written.");
@@ -147,81 +135,4 @@ export function patchAgyOutputTruncation(source: Buffer): OutputPatchResult {
 	const data = Buffer.from(source);
 	const target = adapter.patch(data, offset, vaddr, image.executable);
 	return { data, format: image.format, arch: image.arch, offset, target };
-}
-
-const sha256 = (data: Buffer): string => crypto.createHash("sha256").update(data).digest("hex");
-
-async function fileSha256(file: string): Promise<string | undefined> {
-	try {
-		const hash = crypto.createHash("sha256");
-		for await (const chunk of fs.createReadStream(file)) hash.update(chunk);
-		return hash.digest("hex");
-	} catch {
-		return undefined;
-	}
-}
-
-async function cachedOutput(output: string): Promise<boolean> {
-	try {
-		const expected = (await fs.promises.readFile(`${output}.sha256`, "utf8")).trim();
-		return /^[a-f0-9]{64}$/.test(expected) && await fileSha256(output) === expected;
-	} catch {
-		return false;
-	}
-}
-
-async function derive(sourcePath: string, cacheDir: string, log?: DeriveOutputPatchOptions["log"]): Promise<string> {
-	const source = await fs.promises.readFile(sourcePath);
-	const sourceHash = sha256(source);
-	const image = inspectExecutable(source);
-	adapterFor(image);
-	const extension = image.format === "pe" ? ".exe" : "";
-	const output = path.join(cacheDir, `agy-${sourceHash}-${CACHE_SUFFIX}${extension}`);
-	if (await cachedOutput(output)) return output;
-	const patched = patchAgyOutputTruncation(source);
-	await fs.promises.mkdir(cacheDir, { recursive: true, mode: 0o700 });
-
-	// The source itself is never opened for writing. Same-content racing writers
-	// are harmless; rename exposes only a complete executable to other pi processes.
-	const temporary = `${output}.${process.pid}.${crypto.randomUUID()}.tmp`;
-	const hashTemporary = `${output}.sha256.${process.pid}.${crypto.randomUUID()}.tmp`;
-	try {
-		await fs.promises.writeFile(temporary, patched.data, { mode: 0o755 });
-		await fs.promises.chmod(temporary, 0o755);
-		if (patched.format === "macho") await signMacOSBinary(temporary);
-		const outputHash = await fileSha256(temporary);
-		if (!outputHash) throw new Error("Cannot hash the derived agy executable.");
-		await fs.promises.rename(temporary, output);
-		await fs.promises.writeFile(hashTemporary, `${outputHash}\n`, { mode: 0o600 });
-		await fs.promises.rename(hashTemporary, `${output}.sha256`);
-		log?.("output-patch-derived", {
-			source: sourcePath,
-			sourceSha256: sourceHash,
-			output,
-			outputSha256: outputHash,
-			format: patched.format,
-			arch: patched.arch,
-			offset: patched.offset,
-			target: patched.target,
-		});
-		return output;
-	} finally {
-		await fs.promises.unlink(temporary).catch(() => undefined);
-		await fs.promises.unlink(hashTemporary).catch(() => undefined);
-	}
-}
-
-/** Return a verified cached derivative, rebuilding whenever agy's bytes change. */
-export function deriveAgyFullMcpOutput(sourcePath: string, options: DeriveOutputPatchOptions = {}): Promise<string> {
-	const source = path.resolve(sourcePath);
-	const cacheDir = options.cacheDir ?? CACHE_DIR;
-	const key = `${source}\0${cacheDir}`;
-	let pending = inFlight.get(key);
-	if (!pending) {
-		pending = derive(source, cacheDir, options.log).finally(() => {
-			if (inFlight.get(key) === pending) inFlight.delete(key);
-		});
-		inFlight.set(key, pending);
-	}
-	return pending;
 }
