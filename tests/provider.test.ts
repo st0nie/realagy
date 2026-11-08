@@ -16,6 +16,7 @@ import {
 	freshInput,
 	MAX_TRANSCRIPT_BYTES,
 	planTurn,
+	planTurnFrom,
 	restoreWarmSessions,
 	serializeBounded,
 	WARM_SESSION_ENTRY,
@@ -1402,7 +1403,7 @@ test("mid-turn realctx history summaries ending on assistant steps accumulate hi
 		assert.equal(driver.cancels.length, 0);
 		assert.ok((sessions.step?.bytes ?? 0) >= heldBeforeSummaries, `${sessions.step?.bytes} < ${heldBeforeSummaries}`);
 
-		// Part h2 stacks onto h1, replacing [a2, r2] (2 items, with 2 leading summaries): ~40 KB > 32 KB & 10%.
+		// Part h2 stacks onto h1, replacing [a2, r2] (2 items, with 2 leading summaries): ~40 KB > 32 KB & 50%.
 		activeConversationId = "acp-bloated";
 		driver.script = [{ type: "text", delta: "fresh reply" }];
 		const origRun = driver.run.bind(driver);
@@ -1426,6 +1427,116 @@ test("mid-turn realctx history summaries ending on assistant steps accumulate hi
 		assert.ok(!freshText.includes("bbbbbbbbbb"));
 		// Only the new fresh session is persisted; the cancelled bloated session is never recorded.
 		assert.deepEqual(persisted, ["acp-fresh"]);
+	} finally {
+		roundTrips.failAll("test done");
+	}
+});
+
+test("context-reclaimed never falls back to an older checkpoint on the same branch or forks its DB", async () => {
+	const u1 = user("check status");
+	const a1 = reclaimAssistant([{ type: "text", text: "Clean." }]);
+	const cp1 = warmAfterTurn(context([system(), u1]), a1, "acp-branch", "/repo", 2);
+
+	const u2 = user("inspect huge log");
+	const a2 = readCall("c-big");
+	const r2 = toolResult("c-big", "x".repeat(200_000));
+	const a3 = reclaimAssistant([{ type: "text", text: "Found error." }]);
+	const cp2 = warmAfterTurn(context([system(), u1, a1, u2, a2, r2]), a3, "acp-branch", "/repo", 6);
+
+	// Dropping turn 2's 200 KB output reclaims >50% of cp2, while cp1 (turn 1) has hidden = 0.
+	// Neither candidate order may pick cp1 and replay turns 2-3 as a delta.
+	const r2Dropped = toolResult("c-big", "[#1 dropped · read c-big · 50k tok]");
+	const afterDrop = [system(), u1, a1, u2, a2, r2Dropped, a3, user("fix it")];
+	for (const candidates of [[cp2, cp1], [cp1, cp2]] as const) {
+		const plan = planTurnFrom(context(afterDrop), "/repo", candidates);
+		assert.equal(plan.kind, "fresh");
+		if (plan.kind === "fresh") assert.equal(plan.reason, "context-reclaimed");
+	}
+
+	// End-to-end through createStreamSimple: conversationId must be null (fresh), never cp1 or a fork.
+	const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-reclaim-nofork-"));
+	try {
+		const { DatabaseSync } = createRequire(import.meta.url)("node:sqlite") as typeof import("node:sqlite");
+		const db = new DatabaseSync(conversationDbPath(dbDir, "acp-branch")!);
+		db.exec("CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB)");
+		for (let idx = 0; idx <= 6; idx++) db.prepare("INSERT INTO steps VALUES (?, 15, NULL)").run(idx);
+		db.close();
+
+		const driver = new FakeDriver();
+		driver.script = [{ type: "text", delta: "fixed" }];
+		const roundTrips = new ToolRoundTrips(driver);
+		const sessions: AcpSessions = { warm: cp2, checkpoints: [cp1, cp2], conversationsDir: () => dbDir };
+		const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+		const done = (await collect(stream(toPiModel(FALLBACK_MODELS[0]), context(afterDrop), { cwd: "/repo" } as never))).find((event) => event.type === "done");
+		assert.equal(done?.type, "done");
+		assert.equal(driver.requests.length, 1);
+		assert.equal(driver.requests[0].conversationId, null);
+		assert.equal(driver.requests[0].contextBlock?.uri, "pi://transcript");
+		assert.deepEqual(fs.readdirSync(dbDir).filter((name) => name.endsWith(".db")), ["acp-branch.db"]);
+	} finally {
+		fs.rmSync(dbDir, { recursive: true, force: true });
+	}
+});
+
+test("moderate (<50%) drops keep a hot session warm both mid-turn and between turns, reclaiming once cold", async () => {
+	const hot = Date.now();
+	const u1 = user("load baseline");
+	const a1 = readCall("c-base");
+	const baseResult = toolResult("c-base", "b".repeat(150_000));
+	const a2 = readCall("c-drop");
+	const dropResult = toolResult("c-drop", "d".repeat(50_000));
+	const a3 = reclaimAssistant([{ type: "text", text: "Loaded." }], hot);
+
+	// 50 KB dropped out of ~200 KB (~25%): above 8k tokens (32 KB), below 50% hot share.
+	const warmHot = warmAfterTurn(context([system(), u1, a1, baseResult, a2, dropResult]), a3, "acp-mod", "/repo");
+	const dropped = toolResult("c-drop", "[#2 dropped · read c-drop · 12k tok]");
+	const hotPlan = planTurn(context([system(), u1, a1, baseResult, a2, dropped, a3, user("next")]), "/repo", warmHot);
+	assert.equal(hotPlan.kind, "warm");
+	if (hotPlan.kind === "warm") assert.ok(hotPlan.hidden > 49_000);
+
+	// Once idle past 5 minutes, the same 25% drop reclaims on a fresh session.
+	const a3Cold = reclaimAssistant([{ type: "text", text: "Loaded." }], hot - 6 * 60_000);
+	const warmCold = warmAfterTurn(context([system(), u1, a1, baseResult, a2, dropResult]), a3Cold, "acp-mod", "/repo");
+	const coldPlan = planTurn(context([system(), u1, a1, baseResult, a2, dropped, a3Cold, user("next")]), "/repo", warmCold);
+	assert.equal(coldPlan.kind, "fresh");
+	if (coldPlan.kind === "fresh") assert.equal(coldPlan.reason, "context-reclaimed");
+
+	// Mid-turn reentry also preserves the hot session for a ~25% drop instead of cancelling it.
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const roundTrips = new ToolRoundTrips(driver);
+	const sessions: AcpSessions = {};
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+	try {
+		const step1 = collect(stream(model, context([system(), u1])));
+		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+		const handle = driver.activeHandle as FakeHandle;
+		const push = handle.pushExternal.bind(handle);
+		handle.pushExternal = (activity) => push(activity.type === "bridge_call" ? { ...activity, sessionId: "acp-hot-mid" } : activity);
+
+		void roundTrips.onToolCall("c-base", "read", {}, new AbortController().signal);
+		const d1 = (await step1).find((e) => e.type === "done");
+		if (d1?.type !== "done") throw new Error("no toolUse 1");
+
+		const step2 = collect(stream(model, context([system(), u1, d1.message, baseResult])));
+		await vi.waitFor(() => assert.ok(!roundTrips.isPending("c-base")));
+		void roundTrips.onToolCall("c-drop", "read", {}, new AbortController().signal);
+		const d2 = (await step2).find((e) => e.type === "done");
+		if (d2?.type !== "done") throw new Error("no toolUse 2");
+
+		const step3 = collect(stream(model, context([system(), u1, d1.message, baseResult, d2.message, dropResult])));
+		await vi.waitFor(() => assert.ok(!roundTrips.isPending("c-drop")));
+		const call3 = roundTrips.onToolCall("c-tail", "read", {}, new AbortController().signal);
+		const d3 = (await step3).find((e) => e.type === "done");
+		if (d3?.type !== "done") throw new Error("no toolUse 3");
+
+		const step4 = collect(stream(model, context([system(), u1, d1.message, baseResult, d2.message, dropped, d3.message, toolResult("c-tail", "tail-ok")])));
+		assert.match(JSON.stringify(await call3), /tail-ok/);
+		handle.complete({ status: "OK", response: "done", aborted: false, conversationId: "acp-hot-mid" });
+		await step4;
+		assert.equal(driver.cancels.length, 0);
+		assert.equal(driver.requests.length, 1);
 	} finally {
 		roundTrips.failAll("test done");
 	}

@@ -277,8 +277,8 @@ function menuUi(selections: number[], inputs: string[]): SettingsMenuUI & { mess
 }
 
 test("reclaim settings: defaults, config.json validation, policy, and summary", () => {
-	assert.deepEqual(reclaimPolicy(DEFAULT_REALAGY_CONFIG), { minBytes: 32_000, minShare: 0.1, coldMs: 300_000 });
-	assert.match(formatConfigSummary(DEFAULT_REALAGY_CONFIG, "/x"), /Release context dropped by pi extensions: ON \(≥ 8,000 tokens and ≥ 10% of the session, or any such amount after 5 min idle\)/);
+	assert.deepEqual(reclaimPolicy(DEFAULT_REALAGY_CONFIG), { minBytes: 32_000, minShare: 0.5, coldMs: 300_000 });
+	assert.match(formatConfigSummary(DEFAULT_REALAGY_CONFIG, "/x"), /Release context dropped by pi extensions: ON \(≥ 8,000 tokens and ≥ 50% of the session, or any such amount after 5 min idle\)/);
 
 	const custom = normalizeRealagyConfig({
 		...DEFAULT_REALAGY_CONFIG,
@@ -293,7 +293,7 @@ test("reclaim settings: defaults, config.json validation, policy, and summary", 
 	// Invalid values and values equal to the defaults are dropped from the file.
 	const invalid = normalizeRealagyConfig({ reclaimContext: "yes", reclaimMinTokens: -5, reclaimMinPercent: 150, reclaimColdMinutes: "soon" });
 	assert.deepEqual(invalid, DEFAULT_REALAGY_CONFIG);
-	assert.deepEqual(normalizeRealagyConfig({ reclaimContext: true, reclaimMinTokens: 8000, reclaimMinPercent: 10, reclaimColdMinutes: 5 }), DEFAULT_REALAGY_CONFIG);
+	assert.deepEqual(normalizeRealagyConfig({ reclaimContext: true, reclaimMinTokens: 8000, reclaimMinPercent: 50, reclaimColdMinutes: 5 }), DEFAULT_REALAGY_CONFIG);
 
 	const off = normalizeRealagyConfig({ reclaimContext: false });
 	assert.equal(off.reclaimContext, false);
@@ -318,7 +318,7 @@ test("reclaim settings cycle in the TUI and keep other settings", () => {
 	const lines = component.render(140).join("\n");
 	assert.match(lines, /Release dropped context.*true/);
 	assert.match(lines, /Release: minimum tokens.*8,000/);
-	assert.match(lines, /Release: minimum share.*10%/);
+	assert.match(lines, /Release: minimum share.*50%/);
 	assert.match(lines, /Release: cold cache after.*5 min/);
 
 	// Rows: 0-3 globals, 4-5 per-model menus, 6-9 reclaim.
@@ -330,7 +330,7 @@ test("reclaim settings cycle in the TUI and keep other settings", () => {
 	assert.equal(changes.at(-1)?.reclaimMinTokens, 16_000);
 	component.handleInput("\x1b[B");
 	component.handleInput("\r");
-	assert.equal(changes.at(-1)?.reclaimMinPercent, 20);
+	assert.equal(changes.at(-1)?.reclaimMinPercent, 75);
 	component.handleInput("\x1b[B");
 	component.handleInput("\r");
 	assert.equal(changes.at(-1)?.reclaimColdMinutes, 10);
@@ -339,7 +339,7 @@ test("reclaim settings cycle in the TUI and keep other settings", () => {
 		contextWindow: 500_000,
 		reclaimContext: false,
 		reclaimMinTokens: 16_000,
-		reclaimMinPercent: 20,
+		reclaimMinPercent: 75,
 		reclaimColdMinutes: 10,
 	});
 });

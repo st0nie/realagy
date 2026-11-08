@@ -279,3 +279,82 @@ test("prefix fingerprints skip transient messages exactly like the stored finger
 	assert.equal(plan.kind === "warm" && plan.deltaMessages, 2);
 	assert.equal(plan.kind === "warm" && plan.input.prompt.includes("q3"), true);
 });
+
+test("structured system prompts omit duplicate sections.tools and send incremental section updates on warm turns", () => {
+	const structuredSystem = (extraSections: Record<string, string | null> = {}, tools = ["read", "bash"]): Message => ({
+		role: "system",
+		content: "",
+		sections: {
+			preamble: "You are a coding assistant running inside pi.",
+			tools: "<tools>\n- read: Read a file\n- bash: Run commands\n</tools>",
+			rules: "<rules>\n- Be concise\n</rules>",
+			docs: "<docs>\nPi docs\n</docs>",
+			cwd: "<cwd>\n/w\n</cwd>",
+			...extraSections,
+		},
+		toolsAdded: tools.map(tool),
+		timestamp: 0,
+	}) as unknown as Message;
+
+	const head = [structuredSystem(), user("hello")];
+	const fresh = planTurn(ctx(head), "/w", undefined);
+	assert.equal(fresh.kind, "fresh");
+	const freshText = fresh.input.contextBlock!.text;
+	assert.match(freshText, /You are a coding assistant running inside pi\./);
+	assert.match(freshText, /<rules>\n- Be concise\n<\/rules>/);
+	assert.match(freshText, /<docs>\nPi docs\n<\/docs>/);
+	assert.ok(!freshText.includes("<tools>"), "duplicate sections.tools prose must be omitted");
+
+	const warm = warmAfterTurn(ctx(head), assistant("hi"), "s-struct", "/w");
+	assert.ok(!warm.systemPrompt.includes("<tools>"));
+
+	// Mid-session tool activation that only updates sections.tools + toolsAdded emits <pi-tools-update> without <pi-system-update>.
+	const toolsOnlyPatch = {
+		role: "system",
+		content: "",
+		sections: { tools: "<tools>\n- read: Read a file\n- bash: Run commands\n- lens_symbols: Find symbols\n</tools>" },
+		toolsAdded: ["lens_symbols"].map(tool),
+		timestamp: 3,
+	} as unknown as Message;
+	const activated = planTurn(ctx([...head, assistant("hi"), toolsOnlyPatch, user("find foo")]), "/w", warm);
+	assert.equal(activated.kind, "warm");
+	if (activated.kind !== "warm") return;
+	const activatedDelta = activated.input.contextBlock!.text;
+	assert.match(activatedDelta, /<pi-tools-update>\nThe active pi tools are now: bash, lens_symbols, read\./);
+	assert.ok(!activatedDelta.includes("<pi-system-update>"), "tools-only section change should not send <pi-system-update>");
+
+	// When another section (e.g. rules) changes, <pi-system-update> carries only the changed section, not preamble/docs/tools.
+	const rulesPatch = {
+		role: "system",
+		content: "",
+		sections: {
+			tools: "<tools>\n- read: Read a file\n</tools>",
+			rules: "<rules>\n- Be concise\n- Prefer lens_symbols\n</rules>",
+		},
+		timestamp: 4,
+	} as unknown as Message;
+	const ruleUpdated = planTurn(ctx([...head, assistant("hi"), rulesPatch, user("next")]), "/w", warm);
+	assert.equal(ruleUpdated.kind, "warm");
+	if (ruleUpdated.kind !== "warm") return;
+	const ruleDelta = ruleUpdated.input.contextBlock!.text;
+	assert.match(ruleDelta, /<pi-system-update>\n<rules>\n- Be concise\n- Prefer lens_symbols\n<\/rules>\n<\/pi-system-update>/);
+	assert.ok(!ruleDelta.includes("Pi docs"), "unchanged sections should not be re-sent in <pi-system-update>");
+	assert.ok(!ruleDelta.includes("<tools>"));
+
+	// Legacy checkpoints saved before sections.tools stripping remain plain user prompts on /resume.
+	const legacyWarm = {
+		...warm,
+		systemPrompt: [
+			"You are a coding assistant running inside pi.",
+			"<tools>\n- read: Read a file\n- bash: Run commands\n</tools>",
+			"<rules>\n- Be concise\n</rules>",
+			"<docs>\nPi docs\n</docs>",
+			"<cwd>\n/w\n</cwd>",
+		].join("\n\n"),
+	};
+	const legacyPlan = planTurn(ctx([...head, assistant("hi"), user("continue")]), "/w", legacyWarm);
+	assert.equal(legacyPlan.kind, "warm");
+	if (legacyPlan.kind === "warm") {
+		assert.deepEqual(legacyPlan.input, { prompt: "continue", images: [] });
+	}
+});

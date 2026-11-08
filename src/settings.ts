@@ -58,12 +58,12 @@ type ReclaimSettingKey = (typeof RECLAIM_SETTING_KEYS)[number];
 export const DEFAULT_RECLAIM_SETTINGS: Readonly<ReclaimSettings> = {
 	reclaimContext: true,
 	reclaimMinTokens: 8_000,
-	reclaimMinPercent: 10,
+	reclaimMinPercent: 50,
 	reclaimColdMinutes: 5,
 };
 
 const RECLAIM_TOKEN_VALUES = ["2,000", "4,000", "8,000", "16,000", "32,000", "64,000"];
-const RECLAIM_PERCENT_VALUES = ["0%", "5%", "10%", "20%", "30%", "50%"];
+const RECLAIM_PERCENT_VALUES = ["0%", "10%", "20%", "30%", "50%", "75%"];
 const RECLAIM_COLD_VALUES = ["off", "1 min", "5 min", "10 min", "15 min", "30 min", "60 min"];
 /** Reclaim entries of the fallback (non-TUI) settings menu. */
 const RECLAIM_MENU: ReadonlyArray<{ key: ReclaimSettingKey; label: string; values: readonly string[]; hint: string }> = [

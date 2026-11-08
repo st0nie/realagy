@@ -12,7 +12,7 @@
 // can activate, so the session can already call it.
 
 import { createHash } from "node:crypto";
-import { getCurrentSystemPrompt, getCurrentTools, type AssistantMessage, type Message, type TranscriptContext } from "@earendil-works/pi-ai";
+import { getCurrentSystemMessage, getCurrentSystemPrompt, getCurrentTools, getSystemMessageText, type AssistantMessage, type Message, type TranscriptContext } from "@earendil-works/pi-ai";
 import type { TurnPart } from "./driver-types.js";
 
 export type AcpImage = { data: string; mimeType: string };
@@ -236,10 +236,10 @@ export interface ReclaimPolicy {
 /** Rough UTF-8 bytes per token, for policies configured in tokens. */
 export const BYTES_PER_TOKEN = 4;
 
-/** 8k tokens, 10% of the session, or any such reclaim after 5 idle minutes. */
+/** 8k tokens and 50% of a hot session, or ≥ 8k tokens after 5 idle minutes. */
 export const DEFAULT_RECLAIM_POLICY: Readonly<ReclaimPolicy> = {
 	minBytes: 8_000 * BYTES_PER_TOKEN,
-	minShare: 0.1,
+	minShare: 0.5,
 	coldMs: 5 * 60_000,
 };
 
@@ -364,11 +364,8 @@ export function formatToolResult(
 		: [];
 	if (trailing.length === 0) return { text, images };
 	const notes: string[] = [];
-	for (const message of trailing) {
-		if (message.role === "system" && typeof message.content === "string" && message.content.trim()) {
-			notes.push(`<pi-system-update>\n${message.content}\n</pi-system-update>`);
-		}
-	}
+	const systemUpdate = renderSystemDelta(trailing);
+	if (systemUpdate) notes.push(`<pi-system-update>\n${systemUpdate}\n</pi-system-update>`);
 	const steered = serializeRange(trailing.filter((message) => message.role !== "system"), images.length);
 	if (steered.text) notes.push(steered.text);
 	if (notes.length === 0) return { text, images };
@@ -381,11 +378,41 @@ export function formatToolResult(
 	};
 }
 
+/** Render Pi's system prompt without its `tools` section: every bridged tool's
+ *  description is already in its MCP schema and named by `toolPolicyPrompt`. */
+export function renderPiSystemPrompt(messages: readonly Message[]): string {
+	const message = getCurrentSystemMessage(messages as Message[]);
+	if (!message) return "";
+	if (!message.sections || !("tools" in message.sections)) return getSystemMessageText(message);
+	const { tools: _tools, ...sections } = message.sections;
+	return getSystemMessageText({ ...message, sections });
+}
+
+/** Render only the system-prompt changes carried by `messages`, omitting `sections.tools`. */
+function renderSystemDelta(messages: readonly Message[]): string {
+	const content: string[] = [];
+	const sections = new Map<string, string | null>();
+	for (const message of messages) {
+		if (message.role !== "system") continue;
+		const text = contentText(message.content).trim();
+		if (text) content.push(text);
+		for (const [name, value] of Object.entries(message.sections ?? {})) {
+			if (name === "tools") continue;
+			sections.set(name, value);
+		}
+	}
+	const parts = [...content];
+	for (const [name, value] of sections) {
+		parts.push(value === null ? `Removed system prompt section "${name}".` : value);
+	}
+	return parts.join("\n\n");
+}
+
 /** The whole transcript for a fresh ACP session. Stable and append-only, so
  *  consecutive fresh turns still share a prompt prefix. Past
  *  MAX_TRANSCRIPT_BYTES it is delivered in parts. */
 export function freshInput(context: TranscriptContext): AcpInput {
-	const system = getCurrentSystemPrompt(context.messages);
+	const system = renderPiSystemPrompt(context.messages);
 	const header = system ? `<pi-system>\n${system}\n</pi-system>` : "";
 	return transcriptInput("pi://transcript", FRESH_PROMPT, header, context.messages);
 }
@@ -803,7 +830,7 @@ class TranscriptIndex {
 	}
 
 	systemPrompt(): string {
-		this.#systemPrompt ??= getCurrentSystemPrompt(this.messages);
+		this.#systemPrompt ??= renderPiSystemPrompt(this.messages);
 		return this.#systemPrompt;
 	}
 }
@@ -822,7 +849,7 @@ export type TurnPlan =
 		hidden: number;
 	};
 
-type WarmMatch = { warm: WarmSession; delta: Message[]; hidden: number } | { reason: string };
+type WarmMatch = { warm: WarmSession; end: number; delta: Message[]; hidden: number } | { reason: string };
 
 /** Bytes `warm` holds beyond pi's view of the messages it matched (negative
  *  when pi's view grew), or undefined for checkpoints without `bytes`. */
@@ -830,8 +857,8 @@ function hiddenBytes(index: TranscriptIndex, warm: WarmSession, end: number): nu
 	return warm.bytes === undefined ? undefined : warm.bytes - index.bytesBefore(end);
 }
 
-/** Whether `warm` can continue this transcript, and with which delta. */
-function matchWarm(index: TranscriptIndex, cwd: string, warm: WarmSession | undefined, policy: Readonly<ReclaimPolicy> | null): WarmMatch {
+/** Whether `warm` matches a prefix of this transcript, before reclaim policy. */
+function matchWarmPrefix(index: TranscriptIndex, cwd: string, warm: WarmSession | undefined): WarmMatch {
 	if (!warm) return { reason: "no-session" };
 	if (warm.cwd !== cwd) return { reason: "cwd" };
 	// A changed active tool set (pi's `<tools>` system messages after an
@@ -843,19 +870,26 @@ function matchWarm(index: TranscriptIndex, cwd: string, warm: WarmSession | unde
 	}
 	if (split.delta.length === 0) return { reason: "history-shrank" };
 	if (!split.delta.some((message) => message.role === "user" || message.role === "toolResult")) return { reason: "no-user-message" };
+	const hidden = hiddenBytes(index, warm, split.end) ?? 0;
+	return { warm, end: split.end, delta: split.delta, hidden };
+}
+
+function applyReclaim(index: TranscriptIndex, match: WarmMatch, policy: Readonly<ReclaimPolicy> | null): WarmMatch {
+	if ("reason" in match) return match;
 	// Matching tolerates context managers rewriting what the session already
 	// holds, but the session keeps the original: once enough was dropped or
 	// summarized, only a fresh session actually releases that context.
-	const hidden = hiddenBytes(index, warm, split.end) ?? 0;
-	if (warm.bytes !== undefined && policy && shouldReclaim(hidden, warm.bytes, index.cold(policy.coldMs), policy)) return { reason: "context-reclaimed" };
-	return { warm, delta: split.delta, hidden };
+	if (match.warm.bytes !== undefined && policy && shouldReclaim(match.hidden, match.warm.bytes, index.cold(policy.coldMs), policy)) {
+		return { reason: "context-reclaimed" };
+	}
+	return match;
 }
 
 function planFromMatch(index: TranscriptIndex, match: WarmMatch): TurnPlan {
 	if ("reason" in match) return { kind: "fresh", input: index.fresh(), reason: match.reason };
-	const { warm, delta, hidden } = match;
+	const { warm, end, delta, hidden } = match;
 	const systemPrompt = index.systemPrompt();
-	const systemChanged = systemPrompt !== warm.systemPrompt;
+	const systemChanged = systemPrompt !== warm.systemPrompt && getCurrentSystemPrompt(index.messages) !== warm.systemPrompt;
 	const tools = index.tools();
 	const toolsChanged = tools !== warm.tools;
 	const visible = delta.filter((message) => message.role !== "system");
@@ -874,7 +908,14 @@ function planFromMatch(index: TranscriptIndex, match: WarmMatch): TurnPlan {
 		input = { prompt: texts.join("\n\n") || "See the attached images.", images };
 	} else {
 		const headers: string[] = [];
-		if (systemChanged && systemPrompt) headers.push(`<pi-system-update>\n${systemPrompt}\n</pi-system-update>`);
+		if (systemChanged) {
+			const prefix = index.messages.slice(0, end);
+			const prefixMatches =
+				renderPiSystemPrompt(prefix) === warm.systemPrompt ||
+				getCurrentSystemPrompt(prefix) === warm.systemPrompt;
+			const systemUpdate = prefixMatches ? (renderSystemDelta(delta) || systemPrompt) : systemPrompt;
+			if (systemUpdate) headers.push(`<pi-system-update>\n${systemUpdate}\n</pi-system-update>`);
+		}
 		if (toolsChanged) headers.push(toolsUpdate(tools));
 		input = transcriptInput("pi://transcript-delta", DELTA_PROMPT, headers.join("\n\n"), visible);
 	}
@@ -925,12 +966,15 @@ export function planTurn(
 	policy: Readonly<ReclaimPolicy> | null = DEFAULT_RECLAIM_POLICY,
 ): TurnPlan {
 	const index = new TranscriptIndex(context);
-	return planFromMatch(index, matchWarm(index, cwd, warm, policy));
+	return planFromMatch(index, applyReclaim(index, matchWarmPrefix(index, cwd, warm), policy));
 }
 
 /** Plan against several remembered sessions (most preferred first): the one
- *  with the smallest delta wins; with none usable, the first one's fresh
- *  reason is reported. Inputs are built only for the winner. */
+ *  with the smallest delta wins, and reclaim policy runs on that winner rather
+ *  than falling back to an older checkpoint on the same branch (which would
+ *  fork the conversation DB, invalidate prompt cache, and replay intervening
+ *  turns as deltas). With none usable, the first candidate's fresh reason is
+ *  reported. Inputs are built only for the winner. */
 export function planTurnFrom(
 	context: TranscriptContext,
 	cwd: string,
@@ -939,15 +983,22 @@ export function planTurnFrom(
 ): TurnPlan {
 	const index = new TranscriptIndex(context);
 	let best: Extract<WarmMatch, { warm: WarmSession }> | undefined;
+	let firstFailure: { reason: string } | undefined;
 	for (const candidate of candidates) {
-		const match = matchWarm(index, cwd, candidate, policy);
-		if ("reason" in match) continue;
+		const match = matchWarmPrefix(index, cwd, candidate);
+		if ("reason" in match) {
+			firstFailure ??= match;
+			continue;
+		}
 		if (!best || match.delta.length < best.delta.length) {
 			best = match;
 			if (best.delta.length === 1) break;
 		}
 	}
-	return planFromMatch(index, best ?? matchWarm(index, cwd, candidates[0], policy));
+	const chosen = best
+		? applyReclaim(index, best, policy)
+		: (firstFailure ?? matchWarmPrefix(index, cwd, candidates[0]));
+	return planFromMatch(index, chosen);
 }
 
 /** State after a completed turn: the session holds pi's persistent messages
@@ -971,7 +1022,7 @@ export function warmAfterTurn(
 		hash: fingerprint(messages),
 		keys: nonHistoryKeys(messages),
 		items: warmItemsForMessages(messages),
-		systemPrompt: getCurrentSystemPrompt(context.messages),
+		systemPrompt: renderPiSystemPrompt(context.messages),
 		tools: toolsKey(context),
 	};
 	if (maxStepIdx !== undefined && maxStepIdx >= 0) warm.maxStepIdx = maxStepIdx;

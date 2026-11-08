@@ -122,7 +122,7 @@ The bypass does not increase real server-side model limits; when a conversation 
 | `maxOutputTokensOverrides` | *(none)* | Optional map of exact Pi model IDs to positive-integer output limits; each match takes precedence over `maxOutputTokens` |
 | `reclaimContext` | `true` | Start a fresh agy session once pi extensions such as realctx dropped or summarized enough of what the current one holds (agy otherwise keeps the full text, so their savings never reach the model); `false` keeps warm sessions |
 | `reclaimMinTokens` | `8000` | Least dropped context, in tokens, worth re-sending the smaller transcript to a fresh session |
-| `reclaimMinPercent` | `10` | ...that is also at least this percentage (0-100) of the session's context while the prompt cache is warm |
+| `reclaimMinPercent` | `50` | ...that is also at least this percentage (0-100) of the session's context while the prompt cache is warm |
 | `reclaimColdMinutes` | `5` | After this many minutes without a reply the prompt cache is cold, so `reclaimMinTokens` alone decides; `0` turns this off |
 
 | Environment | Effect |
