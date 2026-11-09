@@ -18,7 +18,7 @@ import { test, vi } from "vitest";
 import { AcpDriver } from "../src/acp/driver.js";
 import { createStreamSimple, failParkedCalls, ToolRoundTrips, type AcpSessions } from "../src/provider.js";
 import { FALLBACK_MODELS, toPiModel } from "../src/models.js";
-import { MAX_TRANSCRIPT_BYTES, restoreWarmSessions, WARM_SESSION_ENTRY, type WarmSession } from "../src/transcript.js";
+import { MAX_TRANSCRIPT_BYTES, type WarmSession } from "../src/transcript.js";
 
 type WireRequest = { id?: number; method: string; params: Record<string, any> };
 
@@ -44,13 +44,12 @@ function harness() {
 		bin: process.execPath,
 		binArgs: [path.join(process.cwd(), "tests/helpers/fake-acp-server.mjs"), capture],
 		extraEnv: { FAKE_ACP_DB_DIR: dbDir, FAKE_ACP_RESUME: "1" },
-		conversationsDir: () => dbDir,
 	});
 	const roundTrips = new ToolRoundTrips(driver);
 	driver.onTurnEnd = (outcome) => failParkedCalls(roundTrips, outcome);
 	const persisted: WarmSession[] = [];
-	const sessions: AcpSessions = { conversationsDir: () => dbDir, onWarm: (warm) => persisted.push(warm) };
-	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+	const sessions: AcpSessions = { onWarm: (warm) => persisted.push(warm) };
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions, replayBudgetBytes: () => MAX_TRANSCRIPT_BYTES });
 	const model = toPiModel(FALLBACK_MODELS.find((entry) => entry.id === "gemini-3-8-flash")!);
 	const wire = () => fs.readFileSync(capture, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as WireRequest);
 	const prompts = () => wire().filter((request) => request.method === "session/prompt").map((request) => ({
@@ -112,8 +111,7 @@ test("01a1ab97: Esc while pi runs bash, then `continue`, delivers the aborted re
 		const toolUse = await first;
 		assert.equal(toolUse.reason, "toolUse");
 		// The tool boundary is a checkpoint already (memory only).
-		assert.equal(h.sessions.step?.sessionId, "session-1");
-		assert.equal(h.sessions.warm, h.sessions.step);
+		assert.equal(h.sessions.warm?.sessionId, "session-1");
 		assert.equal(h.persisted.length, 0);
 
 		// Esc while bash runs: the ACP turn is cancelled and its parked call failed.
@@ -130,7 +128,6 @@ test("01a1ab97: Esc while pi runs bash, then `continue`, delivers the aborted re
 		// The settled turn persisted its checkpoint at the toolUse message.
 		assert.equal(h.persisted.length, 1);
 		assert.equal(h.persisted[0].count, 3);
-		assert.equal(h.persisted[0].maxStepIdx, 0);
 
 		const next = await h.turn([system(), u1, toolUse.message, r1, aborted.message, user("continue")]);
 		assert.equal(next.reason, "stop");
@@ -164,7 +161,6 @@ test("parallel tool results aggregate and continue on the same ACP session", asy
 			toolUse.message.content.filter((block) => block.type === "toolCall").map((block) => block.type === "toolCall" && block.id),
 			["batch:1", "batch:2"],
 		);
-		assert.equal(h.sessions.step?.sessionId, "session-1");
 
 		const r1 = toolResult("batch:1", "read", "alpha");
 		const r2 = toolResult("batch:2", "read", "beta");
@@ -240,7 +236,7 @@ test("a mid-turn pi_lens_activate_tools keeps the session and the next turn's pl
 	}
 });
 
-test("01a1afbb: /tree rewind with pi's restored pi-lens tools declared in a <tools> message stays warm", async () => {
+test("01a1afbb: /tree rewind rebuilds with pi's restored pi-lens tools declared in a <tools> message", async () => {
 	const h = harness();
 	try {
 		const u1 = user("Explain the module");
@@ -249,81 +245,48 @@ test("01a1afbb: /tree rewind with pi's restored pi-lens tools declared in a <too
 		const t2 = await h.turn([system(), u1, t1.message, u2]);
 		assert.equal(h.persisted.length, 2);
 
-		// Reload, then rewind to turn 1 with a new prompt. pi's restore
-		// activated pi-lens's situational tools, so its request declares them.
-		const restored = restoreWarmSessions(
-			h.persisted.map((data) => ({ type: "custom", customType: WARM_SESSION_ENTRY, data })).slice(0, 1),
-			h.persisted.map((data) => ({ type: "custom", customType: WARM_SESSION_ENTRY, data })),
-		);
-		h.sessions.warm = restored.warm;
-		h.sessions.checkpoints = restored.checkpoints;
+		// /tree invalidates the native cache unconditionally. No checkpoint or
+		// SQLite fork is consulted for the alternate branch.
+		h.sessions.warm = undefined;
 		const rewound = await h.turn([system(), u1, t1.message, toolsDeclared(LENS_TOOLS), user("Document it instead")]);
 		assert.equal(rewound.reason, "stop");
 		const sent = h.prompts().at(-1)!;
-		// session-1 advanced past turn 1, so the rewind forks it at that step.
 		assert.notEqual(sent.sessionId, "session-1");
-		assert.ok(fs.existsSync(path.join(h.dbDir, `${sent.sessionId}.db`)), "a forked store, not a fresh session");
-		assert.equal(h.sessionNews(), 1);
-		assert.equal(sent.resource?.uri, "pi://transcript-delta");
-		assert.match(sent.resource!.text, /<pi-tools-update>\nThe active pi tools are now: [^\n]*lens_symbols/);
-		assert.match(sent.resource!.text, /<user>\nDocument it instead\n<\/user>/);
-		assert.ok(!sent.resource!.text.includes("Add tests"));
+		assert.equal(h.sessionNews(), 2);
+		assert.equal(sent.resource, undefined);
+		assert.match(sent.text, /<pi_history>[\s\S]*Explain the module[\s\S]*<\/pi_history>/);
+		assert.ok(sent.text.endsWith("Document it instead"));
+		assert.ok(!sent.text.includes("Add tests"));
 		void t2;
 	} finally {
 		await h.driver.close();
 	}
 });
 
-test("switching to agy mid-session delivers a transcript too large for one prompt in parts, then stays warm", async () => {
+test("switching to agy mid-session sends one bounded replay, then stays warm", async () => {
 	const h = harness();
 	try {
-		// Another provider's long run before switching to an agy model.
-		const other: AssistantMessage = {
-			role: "assistant", content: [{ type: "text", text: `${"FIRST-MARK ".repeat(4)}\n${"long output line\n".repeat(20_000)}` }],
-			api: "anthropic-messages", provider: "anthropic", model: "claude", stopReason: "stop", timestamp: 2,
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		const other = {
+			role: "assistant", api: "openai-responses", provider: "openai", model: "gpt-5",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			stopReason: "stop", timestamp: 1,
+			content: [{ type: "text", text: `FIRST-MARK\n${"long output line\n".repeat(20_000)}` }],
 		};
 		const history = [system(), user("Audit the repo"), other as Message, user("Now continue with agy")];
 		const events: AssistantMessageEvent[] = [];
 		const done = await h.turn(history, { onEvent: (event) => events.push(event) });
 		assert.equal(done.reason, "stop");
 		const sent = h.prompts();
-		assert.equal(sent.length, 3, "two earlier parts, then the prompt");
-		assert.ok(sent.every((prompt) => prompt.sessionId === "session-1"));
-		assert.match(sent[0].text, /^Part 1 of 3 of the pi transcript/);
-		assert.match(sent[0].resource!.text, /^<pi-system>[\s\S]*FIRST-MARK/);
-		assert.match(sent[2].text, /part 3 of 3 of the pi transcript/);
-		assert.match(sent[2].resource!.text, /<user>\nNow continue with agy\n<\/user>$/);
-		for (const prompt of sent) assert.ok(Buffer.byteLength(prompt.resource!.text, "utf8") <= MAX_TRANSCRIPT_BYTES);
-		assert.ok(!sent.some((prompt) => prompt.resource!.text.includes("<pi-transcript-omitted")), "nothing was dropped");
-		assert.equal(sent.map((prompt) => prompt.resource!.text).join("").split("long output line").length - 1, 20_000);
-		// The parts' acknowledgements are not pi's reply.
+		assert.equal(sent.length, 1, "one fresh replay, no priming turns");
+		assert.ok(Buffer.byteLength(sent[0].text, "utf8") <= MAX_TRANSCRIPT_BYTES);
+		assert.match(sent[0].text, /^<pi-system>/);
+		assert.match(sent[0].text, /<pi_history>/);
+		assert.match(sent[0].text, /omitted/i);
+		assert.ok(sent[0].text.endsWith("Now continue with agy"));
 		assert.deepEqual(events.filter((event) => event.type === "text_delta").map((event) => event.type === "text_delta" && event.delta), ["OK"]);
 
 		await h.turn([...history, done.message, user("next")]);
 		assert.deepEqual(h.prompts().at(-1), { sessionId: "session-1", text: "next", resource: undefined });
-	} finally {
-		await h.driver.close();
-	}
-});
-
-test("Esc while transcript parts are delivered refuses pi tools and records no checkpoint", async () => {
-	const h = harness();
-	try {
-		const esc = new AbortController();
-		const history = [system(), user(`Old task [hang] ${"x".repeat(MAX_TRANSCRIPT_BYTES)}`), user("new task")];
-		const pending = h.turn(history, { signal: esc.signal });
-		await h.waitForPrompts(1);
-		assert.equal(h.driver.priming, true);
-		const refused = await h.roundTrips.onToolCall("c1", "bash", {}, new AbortController().signal);
-		assert.equal(refused.isError, true);
-		assert.match(refused.content[0].type === "text" ? refused.content[0].text : "", /delivered in parts/);
-		esc.abort();
-		const aborted = await pending;
-		assert.equal(aborted.reason, "aborted");
-		assert.equal(h.prompts().length, 1, "the real prompt was never sent");
-		assert.equal(h.sessions.warm, undefined, "the session holds only part of the transcript");
-		assert.equal(h.persisted.length, 0);
 	} finally {
 		await h.driver.close();
 	}

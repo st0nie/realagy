@@ -3,7 +3,7 @@ import { createAssistantMessageEventStream, type AssistantMessage, type Assistan
 import { calculateContextTokens } from "@earendil-works/pi-coding-agent";
 import { test } from "vitest";
 import { createStreamSimple, ToolRoundTrips, type AcpSessions } from "../src/provider.js";
-import { DELTA_PROMPT, FRESH_PROMPT, MAX_TRANSCRIPT_BYTES, planTurn, planTurnFrom, splitUtf8, warmAfterTurn } from "../src/transcript.js";
+import { DELTA_PROMPT, EMPTY_INPUT_CONTINUATION, LOCKED_REPLAY_BUDGET_BYTES, MAX_TRANSCRIPT_BYTES, planTurn, splitUtf8, UNLOCKED_REPLAY_BUDGET_BYTES, warmAfterTurn } from "../src/transcript.js";
 import { treeRestoreExtras } from "../src/tool-loadout.js";
 import { UsageMeter } from "../src/quota.js";
 import { FALLBACK_MODELS, toPiModel } from "../src/models.js";
@@ -25,8 +25,8 @@ test("planTurn reuses a warm session for plain user turns and falls back on dive
 	const turn1 = [system(), user("hello")];
 	const fresh = planTurn(ctx(turn1), "/w", undefined);
 	assert.equal(fresh.kind, "fresh");
-	assert.equal(fresh.input.prompt, FRESH_PROMPT);
-	assert.match(fresh.input.contextBlock!.text, /<pi-system>\nTest system/);
+	assert.match(fresh.input.prompt, /hello$/);
+	assert.match(fresh.input.prompt, /<pi-system>\nTest system/);
 
 	const warm = warmAfterTurn(ctx(turn1), assistant("hi"), "s1", "/w");
 	const turn2 = [...turn1, assistant("hi"), user("next")];
@@ -35,8 +35,7 @@ test("planTurn reuses a warm session for plain user turns and falls back on dive
 	if (plan.kind !== "warm") return;
 	assert.equal(plan.sessionId, "s1");
 	assert.deepEqual(plan.input, { prompt: "next", images: [] });
-	assert.equal(plan.fallback.prompt, FRESH_PROMPT);
-	assert.match(plan.fallback.contextBlock!.text, /next/);
+	assert.match(plan.fallback.prompt, /<pi_history>[\s\S]*hello[\s\S]*hi[\s\S]*next/);
 
 	assert.equal(planTurn(ctx(turn2), "/other", warm).kind, "fresh");
 	assert.deepEqual(planTurn(ctx([system(), user("edited"), assistant("hi"), user("next")]), "/w", warm), { ...planTurn(ctx([system(), user("edited"), assistant("hi"), user("next")]), "/w", undefined), reason: "history-diverged" });
@@ -86,7 +85,6 @@ class ScriptDriver implements TurnDriver {
 	}
 	reentry(): TurnHandle | null { return null; }
 	kickIdle(): void {}
-	async awaitBridgeResults(): Promise<void> {}
 	async cancelActive(): Promise<void> {}
 	async close(): Promise<void> {}
 }
@@ -121,7 +119,7 @@ test("provider reports exact step usage, reuses the ACP session, and feeds the m
 	assert.equal(driver.requests[1].conversationId, "acp-1");
 	assert.equal(driver.requests[1].prompt, "again");
 	assert.equal(driver.requests[1].contextBlock, undefined);
-	assert.equal(driver.requests[1].fallback?.prompt, FRESH_PROMPT);
+	assert.match(driver.requests[1].fallback?.prompt ?? "", /<pi_history>[\s\S]*hello[\s\S]*hi[\s\S]*again$/);
 });
 
 test("provider leaves unmeasured messages to pi and turns quota notices into errors", async () => {
@@ -141,39 +139,28 @@ test("provider leaves unmeasured messages to pi and turns quota notices into err
 	assert.equal(sessions.warm, undefined);
 });
 
-test("planTurnFrom picks the candidate with the smallest delta and matches planTurn", () => {
+test("planTurn reuses only the current exact prefix and rebuilds stale or changed history", () => {
 	const turn1 = [system(), user("hello")];
 	const warm1 = warmAfterTurn(ctx(turn1), assistant("hi"), "s1", "/w");
 	const turn2 = [...turn1, assistant("hi"), user("q2")];
 	const warm2 = warmAfterTurn(ctx(turn2), assistant("a2"), "s2", "/w");
-	const now = ctx([...turn2, assistant("a2"), user("q3")]);
+	const nowMessages = [...turn2, assistant("a2"), user("q3")];
+	const now = ctx(nowMessages);
 
-	const best = planTurnFrom(now, "/w", [warm1, warm2]);
+	const best = planTurn(now, "/w", warm2);
 	assert.equal(best.kind === "warm" && best.sessionId, "s2");
 	assert.equal(best.kind === "warm" && best.deltaMessages, 1);
-	assert.deepEqual(best, planTurn(now, "/w", warm2));
-	assert.deepEqual(planTurnFrom(now, "/w", [warm1]), planTurn(now, "/w", warm1));
-	assert.equal(planTurnFrom(now, "/other", [warm1, warm2]).kind === "fresh" && (planTurnFrom(now, "/other", [warm1, warm2]) as { reason: string }).reason, "cwd");
-	assert.deepEqual(planTurnFrom(now, "/w", []), planTurn(now, "/w", undefined));
-});
+	assert.equal(planTurn(now, "/w", warm1).kind, "warm", "an exact prefix can be reused; no alternate checkpoint list is consulted");
+	assert.equal(planTurn(now, "/other", warm2).kind, "fresh");
+	assert.equal(planTurn(now, "/w", undefined).kind, "fresh");
 
-test("an exact match on the newest checkpoint beats a context sync against an older one", () => {
-	// Checkpoint `before` predates a realctx drop; the sync that applied the
-	// drop rewrote native history and recorded `after`, which pi still matches.
-	const head = [system("Test system", ["read"]), user("inspect"), toolUse("c1", "read"), result("c1", "read", "HUGE")];
-	const before = warmAfterTurn(ctx(head), assistant("found it"), "s1", "/w", 3);
-	const dropped = [head[0]!, head[1]!, head[2]!, result("c1", "read", "[#1 dropped]"), assistant("found it"), user("q2")];
-	const after = warmAfterTurn(ctx(dropped), assistant("a2"), "s1", "/w", 5);
-	// Mid-turn: several messages past `after`, so the planner keeps looking.
-	const now = ctx([...dropped, assistant("a2"), user("q3"), toolUse("c2", "read"), result("c2", "read", "R2")]);
-	// Provider order: the latest checkpoint is the most preferred.
-	const plan = planTurnFrom(now, "/w", [after, before]);
-	assert.equal(plan.kind, "warm");
-	assert.deepEqual(plan.kind === "warm" && [plan.maxStepIdx, plan.deltaMessages], [5, 3]);
-	// Only the stale checkpoint left: the rewrite must be synchronized.
-	assert.equal(planTurnFrom(now, "/w", [before]).kind, "context-sync");
+	const rewritten = [...nowMessages];
+	rewritten[1] = user("hello edited");
+	const replay = planTurn(ctx(rewritten), "/w", warm2);
+	assert.equal(replay.kind, "fresh");
+	assert.match(replay.input.prompt, /<pi_history>[\s\S]*hello edited[\s\S]*<\/pi_history>/);
+	assert.ok(replay.input.prompt.endsWith("q3"), "the newest input stays outside the replay and verbatim");
 });
-
 const LENS_TOOLS = ["lens_symbols", "lens_references", "lens_diagnostics", "lens_rename", "lens_outline"];
 const toolsDeclared = (names: string[]): Message =>
 	({ role: "system", content: "", toolsAdded: names.map(tool), timestamp: 5 }) as unknown as Message;
@@ -184,27 +171,18 @@ const abortedReply = (text = ""): AssistantMessage => ({ ...assistant(text), con
 const result = (id: string, name: string, text: string, isError = false): Message =>
 	({ role: "toolResult", toolCallId: id, toolName: name, content: [{ type: "text", text }], isError, timestamp: 3 });
 
-test("01a1afbb: a /tree rewind whose request declares pi's restored pi-lens tools stays warm", () => {
+test("a /tree rewind rebuilds instead of reusing the later native session", () => {
 	const turn1 = [system("Test system", ["read", "bash"]), user("explain")];
-	const warm = warmAfterTurn(ctx(turn1), assistant("it parses"), "s1", "/w");
-	// Rewound to turn 1: pi's restore activated the situational tools, and
-	// its next request declared them in a `<tools>` system message.
-	const rewound = [...turn1, assistant("it parses"), toolsDeclared(LENS_TOOLS), user("document it")];
+	const reply1 = assistant("it parses");
+	const turn2 = [...turn1, reply1, user("add tests")];
+	const warm = warmAfterTurn(ctx(turn2), assistant("added"), "s1", "/w");
+	const rewound = [...turn1, reply1, toolsDeclared(LENS_TOOLS), user("document it")];
 	const plan = planTurn(ctx(rewound), "/w", warm);
-	assert.equal(plan.kind, "warm");
-	if (plan.kind !== "warm") return;
-	assert.equal(plan.sessionId, "s1");
-	assert.equal(plan.deltaMessages, 2);
-	assert.match(plan.input.contextBlock!.text, new RegExp(`<pi-tools-update>\\nThe active pi tools are now: bash, ${[...LENS_TOOLS].sort().slice(0, 1)}`));
-	assert.match(plan.input.contextBlock!.text, /<user>\ndocument it\n<\/user>$/);
-	assert.ok(!plan.input.contextBlock!.text.includes("explain"));
-
-	// Once realagy restored the branch's tool set, nothing is declared and
-	// the turn is a plain prompt.
-	const restored = planTurn(ctx([...turn1, assistant("it parses"), user("document it")]), "/w", warm);
-	assert.deepEqual(restored.kind === "warm" && restored.input, { prompt: "document it", images: [] });
+	assert.equal(plan.kind, "fresh");
+	assert.match(plan.input.prompt, /<pi_history>[\s\S]*explain[\s\S]*it parses[\s\S]*<\/pi_history>/);
+	assert.ok(!plan.input.prompt.includes("add tests"), "the abandoned branch is not replayed");
+	assert.ok(plan.input.prompt.endsWith("document it"));
 });
-
 test("treeRestoreExtras undoes only what the restore activated beyond the branch's declarations", () => {
 	const branch = [
 		{ type: "message", message: { role: "system", toolsAdded: [{ name: "bash" }, { name: "read" }, { name: "lens_old" }] } },
@@ -227,22 +205,21 @@ test("01a1ab97: after Esc during a pi tool, `continue` matches the tool-boundary
 	const now = ctx([...head, a1, r1, a2, user("continue")]);
 
 	// Checkpoint at the toolUse message (the turn settled while bash ran).
-	const atTool = warmAfterTurn(ctx(head), a1, "s1", "/w", 3);
+	const atTool = warmAfterTurn(ctx(head), a1, "s1", "/w");
 	const fromTool = planTurn(now, "/w", atTool);
 	assert.equal(fromTool.kind, "warm");
 	if (fromTool.kind !== "warm") return;
-	assert.equal(fromTool.maxStepIdx, 3);
 	assert.equal(fromTool.input.contextBlock!.uri, "pi://transcript-delta");
 	assert.equal(fromTool.input.contextBlock!.text, '<pi-tool-result name="bash" id="call-1" error=true>\nCommand aborted\n</pi-tool-result>\n\n<user>\ncontinue\n</user>');
 
 	// Checkpoint at the aborted reply (the result reached the running turn).
-	const atAbort = warmAfterTurn(ctx([...head, a1, r1]), a2, "s1", "/w", 5);
-	const fromAbort = planTurnFrom(now, "/w", [atAbort, atTool]);
+	const atAbort = warmAfterTurn(ctx([...head, a1, r1]), a2, "s1", "/w");
+	const fromAbort = planTurn(now, "/w", atAbort);
 	assert.deepEqual(fromAbort.kind === "warm" && fromAbort.input, { prompt: "continue", images: [] });
 
 	// First turn, Esc mid-reply: the partial reply is part of the checkpoint.
 	const partial = abortedReply("Here is the pl");
-	const first = warmAfterTurn(ctx(head), partial, "s2", "/w", 1);
+	const first = warmAfterTurn(ctx(head), partial, "s2", "/w");
 	const resumed = planTurn(ctx([...head, partial, user("continue")]), "/w", first);
 	assert.deepEqual(resumed.kind === "warm" && [resumed.sessionId, resumed.input], ["s2", { prompt: "continue", images: [] }]);
 });
@@ -266,24 +243,66 @@ test("fresh and delta transcripts retain every message across bounded UTF-8 part
 	if (plan.kind !== "warm") return;
 	const parts = plan.input.parts ?? [];
 	assert.equal(parts.length, 2);
+	assert.ok(parts.every((part) => Buffer.byteLength(part.contextBlock.text, "utf8") <= MAX_TRANSCRIPT_BYTES));
 	assert.ok(parts.every((part, index) => part.contextBlock.uri === "pi://transcript-delta" && part.prompt.startsWith(`Part ${index + 1} of 3`)));
 	assert.match(plan.input.prompt, /^Continue the task\.[\s\S]*part 3 of 3 of the pi transcript/);
 	const whole = [...parts.map((part) => part.contextBlock.text), plan.input.contextBlock!.text].join("");
 	assert.equal(whole.split("line of output").length - 1, 25_000);
 	assert.match(whole, /^<user>\naudit\n<\/user>/);
 	assert.match(whole, /<user>\ncontinue with agy\n<\/user>$/);
-	assert.ok((plan.fallback.parts?.length ?? 0) >= 2);
+	assert.match(plan.fallback.prompt, /<pi_history>[\s\S]*line of output[\s\S]*continue with agy$/);
 
-	// There is no aggregate replay budget: only the safe per-request byte cap remains.
-	const runs = Array.from({ length: 20 }, (_, index) => [user(`step ${index}`), big(6_700)]).flat();
+	// A fresh replay is one bounded prompt, not priming parts. It keeps the
+	// newest history and newest input, omitting oldest history when necessary.
+	const runs = Array.from({ length: 30 }, (_, index) => [user(`step ${index}`), big(6_700)]).flat();
 	const huge = planTurn(ctx([system(), ...runs, user("tail")]), "/w", undefined);
-	const hugeParts = huge.input.parts ?? [];
-	assert.ok(hugeParts.length + 1 > 8);
-	for (const part of [...hugeParts, huge.input]) assert.ok(Buffer.byteLength(part.contextBlock!.text, "utf8") <= MAX_TRANSCRIPT_BYTES);
-	assert.match(hugeParts[0].contextBlock.text, /^<pi-system>/);
-	assert.ok(hugeParts.some((part) => part.contextBlock.text.includes("<user>\nstep 0\n</user>")));
-	assert.doesNotMatch([...hugeParts, huge.input].map((part) => part.contextBlock!.text).join(""), /pi-transcript-omitted/);
-	assert.match(huge.input.contextBlock!.text, /<user>\ntail\n<\/user>$/);
+	assert.equal(huge.kind, "fresh");
+	assert.equal(huge.input.parts, undefined);
+	assert.equal(huge.input.contextBlock, undefined);
+	assert.ok(Buffer.byteLength(huge.input.prompt, "utf8") <= UNLOCKED_REPLAY_BUDGET_BYTES);
+	assert.match(huge.input.prompt, /^<pi-system>/);
+	assert.match(huge.input.prompt, /\[Earlier \d+ history messages omitted to fit the context replay budget\]/);
+	assert.ok(!huge.input.prompt.includes("<user>\nstep 0\n</user>"));
+	assert.ok(huge.input.prompt.endsWith("tail"));
+});
+
+test("locked replay keeps the newest input complete while omitting old history", () => {
+	const history = Array.from({ length: 100 }, (_, index) => user(`old-${index}-${"x".repeat(4_000)}`));
+	const newest = `newest-${"你好".repeat(100)}`;
+	const plan = planTurn(ctx([system(), ...history, user(newest)]), "/w", undefined, LOCKED_REPLAY_BUDGET_BYTES);
+	assert.equal(plan.kind, "fresh");
+	assert.ok(Buffer.byteLength(plan.input.prompt, "utf8") <= LOCKED_REPLAY_BUDGET_BYTES);
+	assert.match(plan.input.prompt, /\[Earlier \d+ history messages omitted to fit the context replay budget\]/);
+	assert.ok(plan.input.prompt.endsWith(newest));
+	assert.ok(!plan.input.prompt.includes("old-0-"));
+});
+
+test("fresh replay preserves every newest-input block once and keeps earlier users in history", () => {
+	const latest = user("implement the fix");
+	latest.content = [
+		{ type: "text", text: "implement the fix" },
+		{ type: "text", text: "[pi-lens automated context — not a user request]\nRun the focused tests." },
+		{ type: "text", text: "<project-skill>Use the repository convention.</project-skill>" },
+	];
+	const plan = planTurn(ctx([system(), user("earlier request"), latest]), "/w", undefined);
+	assert.equal(plan.kind, "fresh");
+	const historyEnd = plan.input.prompt.indexOf("</pi_history>");
+	const history = plan.input.prompt.slice(0, historyEnd);
+	const live = plan.input.prompt.slice(historyEnd);
+	assert.match(history, /earlier request/);
+	assert.ok(!history.includes("implement the fix"));
+	assert.match(live, /implement the fix/);
+	assert.match(live, /Run the focused tests\./);
+	assert.match(live, /<project-skill>Use the repository convention\.<\/project-skill>/);
+	assert.equal(plan.input.prompt.split("implement the fix").length - 1, 1);
+});
+
+test("fresh replay uses a fixed continuation when history ends in tool results", () => {
+	const messages = [system(), user("run"), toolUse("c1", "bash"), result("c1", "bash", "ok")];
+	const plan = planTurn(ctx(messages), "/w", undefined);
+	assert.equal(plan.kind, "fresh");
+	assert.ok(plan.input.prompt.endsWith(EMPTY_INPUT_CONTINUATION));
+	assert.match(plan.input.prompt, /<pi_history>[\s\S]*<pi-tool-result name="bash" id="c1" error=false>/);
 });
 
 test("prefix fingerprints skip transient messages exactly like the stored fingerprint", () => {
@@ -317,7 +336,7 @@ test("structured system prompts omit duplicate sections.tools and send increment
 	const head = [structuredSystem(), user("hello")];
 	const fresh = planTurn(ctx(head), "/w", undefined);
 	assert.equal(fresh.kind, "fresh");
-	const freshText = fresh.input.contextBlock!.text;
+	const freshText = fresh.input.prompt;
 	assert.match(freshText, /You are a coding assistant running inside pi\./);
 	assert.match(freshText, /<rules>\n- Be concise\n<\/rules>/);
 	assert.match(freshText, /<docs>\nPi docs\n<\/docs>/);

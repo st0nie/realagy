@@ -13,7 +13,6 @@ import {
 	type TranscriptContext,
 	type Usage,
 } from "@earendil-works/pi-ai";
-import { resolveSessionAtStep } from "./acp/step-usage.js";
 import type { AgyStepUsage, AgyUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "./driver-types.js";
 import { toAgyEffort, type AgyModelEntry } from "./models.js";
 import { nativeToolLine } from "./native-tools.js";
@@ -21,7 +20,8 @@ import { agyCapacityNotice } from "./acp/events.js";
 import type { BridgeResult } from "./mcp-server.js";
 import {
 	formatToolResult,
-	planTurnFrom,
+	planTurn,
+	UNLOCKED_REPLAY_BUDGET_BYTES,
 	warmAfterTurn,
 	type TurnPlan,
 	type WarmSession,
@@ -566,55 +566,23 @@ async function consumeTurn(
 	finish(stream, blocks, "stop");
 }
 
-/** Per-extension ACP session continuity. `warm` is the latest checkpoint:
- *  cleared when a turn starts, set at each pi tool boundary of the turn and
- *  when it completes or is aborted after agy recorded its prompt. */
+/** Per-extension ACP session continuity. Only the latest exact-prefix session
+ *  is reusable; tree navigation and compaction clear it before the next turn. */
 export interface AcpSessions {
 	warm?: WarmSession;
-	/** Historical warm checkpoints in chronological order, enabling `/tree`
-	 *  branch switching and rewind to any earlier turn, and `continue` after
-	 *  an aborted one. */
-	checkpoints?: WarmSession[];
-	/** The in-flight turn's latest tool-boundary checkpoint (memory only):
-	 *  replaced by the turn's next checkpoint, kept if the turn fails. */
-	step?: WarmSession;
-	/** Directory holding `<sessionId>.db` stores for step-boundary forking on rewind. */
-	conversationsDir?: () => string;
-	/** Invoked when a turn settles (completed or aborted) and records a
-	 *  `WarmSession` worth persisting. */
+	/** Invoked when a turn settles and records a WarmSession worth persisting. */
 	onWarm?: (warm: WarmSession) => void;
 	/** cwd of the in-flight turn, for continuations that complete it. */
 	turnCwd?: string;
-	/** In-flight toolUse turn: if agy ends its prompt while an escalated pi tool
-	 *  is still running, its outcome records a warm checkpoint at `assistant`. */
+	/** In-flight toolUse turn whose escalated pi tool is still running. */
 	parked?: { handle: TurnHandle };
 }
 
-/** The ACP session a pi request continues, and how many bytes it holds
- *  beyond pi's view of its prefix (`TurnPlan.hidden`). */
-interface TurnBase {
-	sessionId: string;
-	hidden: number;
-}
 
-/** Bytes a checkpoint of `sessionId` holds beyond pi's view: the turn's
- *  `hidden` when it ran on that session, 0 when it ran on a new one (a fresh
- *  plan, or the fallback after a lost session). */
-function heldBeyondView(base: TurnBase | undefined, sessionId: string): number {
-	return base && base.sessionId === sessionId ? base.hidden : 0;
-}
-
-function selectTurnPlan(context: TranscriptContext, cwd: string, sessions: AcpSessions): TurnPlan {
-	const candidates: WarmSession[] = [];
-	if (sessions.warm) candidates.push(sessions.warm);
-	const history = sessions.checkpoints ?? [];
-	for (let i = history.length - 1; i >= 0; i--) {
-		const item = history[i];
-		if (item && item !== sessions.warm) candidates.push(item);
-	}
-	const plan = planTurnFrom(context, cwd, candidates);
-	if (plan.kind !== "warm") return plan;
-	return { ...plan, sessionId: resolveSessionAtStep(sessions.conversationsDir?.(), plan.sessionId, plan.maxStepIdx) };
+function selectTurnPlan(context: TranscriptContext, cwd: string, sessions: AcpSessions, replayBudgetBytes: number): TurnPlan {
+	// Only the current session is a cache candidate. Tree navigation clears it;
+	// older native snapshots are never forked or treated as authoritative.
+	return planTurn(context, cwd, sessions.warm, replayBudgetBytes);
 }
 
 export interface StreamSimpleDeps {
@@ -623,52 +591,43 @@ export interface StreamSimpleDeps {
 	roundTrips: ToolRoundTrips;
 	sessions?: AcpSessions;
 	meter?: UsageMeter;
+	/** Live replay budget: 2.2 MB unlocked, 160 KB with native context gates. */
+	replayBudgetBytes?: () => number;
 }
 
 export function createStreamSimple(deps: StreamSimpleDeps) {
 	const sessions = deps.sessions ?? {};
-	/** Make `warm` the preferred checkpoint. A turn's tool-boundary checkpoint
-	 *  is replaced by its next one, so the list grows by one per turn. */
 	const remember = (warm: WarmSession, settled: boolean): void => {
-		const step = sessions.step;
-		const kept = (sessions.checkpoints ?? []).filter((checkpoint) => checkpoint !== step);
-		sessions.checkpoints = [...kept, warm];
 		sessions.warm = warm;
-		sessions.step = settled ? undefined : warm;
 		if (settled) sessions.onWarm?.(warm);
 	};
-	/** A settled turn's checkpoint: after it completed, or after an abort once
-	 *  agy recorded its prompt (the session keeps everything up to the cancel). */
-	const recordWarm = (targetContext: TranscriptContext, outcome: TurnOutcome, final: AssistantMessage, base?: TurnBase): void => {
+	/** Record a settled turn after completion, or after an abort once agy
+	 *  recorded its prompt. A failed turn leaves no reusable native cache. */
+	const recordWarm = (targetContext: TranscriptContext, outcome: TurnOutcome, final: AssistantMessage): void => {
 		if (outcome.status !== "OK" || !outcome.conversationId || sessions.turnCwd === undefined) return;
 		if (outcome.aborted && outcome.promptDelivered !== true) return;
-		const hidden = heldBeyondView(base, outcome.conversationId);
-		remember(warmAfterTurn(targetContext, final, outcome.conversationId, sessions.turnCwd, outcome.maxStepIdx, hidden), true);
+		remember(warmAfterTurn(targetContext, final, outcome.conversationId, sessions.turnCwd), true);
 	};
-	/** At a pi tool call the session holds the transcript up to its toolUse
-	 *  message: an Esc during the tool still leaves a matching checkpoint. */
-	const recordStep = (targetContext: TranscriptContext, call: Extract<DriverActivity, { type: "bridge_call" }>, assistant: AssistantMessage, base?: TurnBase): void => {
+	/** At a pi tool call the native session holds the transcript through toolUse;
+	 *  retain that exact prefix in memory if Esc interrupts the running tool. */
+	const recordStep = (targetContext: TranscriptContext, call: Extract<DriverActivity, { type: "bridge_call" }>, assistant: AssistantMessage): void => {
 		if (!call.sessionId || sessions.turnCwd === undefined) return;
-		const hidden = heldBeyondView(base, call.sessionId);
-		remember(warmAfterTurn(targetContext, assistant, call.sessionId, sessions.turnCwd, call.maxStepIdx, hidden), false);
+		remember(warmAfterTurn(targetContext, assistant, call.sessionId, sessions.turnCwd), false);
 	};
 	return (model: Model<Api>, context: TranscriptContext, options?: SimpleStreamOptions): AssistantMessageEventStream => {
 		const stream = createAssistantMessageEventStream();
 		const blocks: BlockState = { partial: newAssistant(model), textIdx: null, thinkingIdx: null, started: false, usage: {} };
-		/** The session this call continues and the bytes it holds beyond pi's
-		 *  view of its prefix; set below, before any checkpoint is recorded. */
-		let base: TurnBase | undefined;
 		const onCompleted = (outcome: TurnOutcome, final: AssistantMessage): void => {
-			recordWarm(context, outcome, final, base);
+			recordWarm(context, outcome, final);
 		};
 		const onToolCall = (handle: TurnHandle, assistant: AssistantMessage, call: Extract<DriverActivity, { type: "bridge_call" }>): void => {
-			recordStep(context, call, assistant, base);
+			recordStep(context, call, assistant);
 			const parked = { handle };
 			sessions.parked = parked;
 			void handle.outcome.then((outcome) => {
 				if (sessions.parked !== parked) return;
 				sessions.parked = undefined;
-				recordWarm(context, outcome, assistant, base);
+				recordWarm(context, outcome, assistant);
 			});
 		};
 		void (async () => {
@@ -677,32 +636,20 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					message.role === "toolResult" && deps.roundTrips.isPending(message.toolCallId),
 				);
 				const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-				const plan = selectTurnPlan(context, cwd, sessions);
-				const syncing = plan.kind === "context-sync";
-				let cancelledForSync = false;
+				const plan = selectTurnPlan(context, cwd, sessions, deps.replayBudgetBytes?.() ?? UNLOCKED_REPLAY_BUDGET_BYTES);
 				// Settle completed Pi calls before cancelling the old model turn.
 				// Otherwise its generic abort handler can reject an already-completed
 				// MCP request before the native continuation consumes its result.
 				for (const result of results) {
-					const trailing = !syncing && result === results.at(-1)
+					const trailing = plan.kind === "warm" && result === results.at(-1)
 						? context.messages.slice(context.messages.lastIndexOf(result) + 1)
 						: [];
 					const payload = formatToolResult(result, trailing);
 					deps.roundTrips.resolve(result.toolCallId, payload.text, result.isError, payload.images);
 				}
-				// A changed prefix must be synchronized before continuing. Cancel
-				// only the parked model turn; native tool results are already stored.
-				if (results.length > 0 && sessions.step && !options?.signal?.aborted && deps.driver.reentry()) {
-					if (syncing) {
-						sessions.parked = undefined;
-						await deps.driver.awaitBridgeResults();
-						await deps.driver.cancelActive("pi context changed; synchronizing native trajectory");
-						cancelledForSync = true;
-					} else if (plan.kind === "warm") {
-						base = { sessionId: plan.sessionId, hidden: plan.hidden };
-					}
-				}
-				const active = !syncing && results.length > 0 && !deps.roundTrips.hasPendingBatchCalls() ? deps.driver.reentry() : null;
+				// Exact-prefix reuse can continue the parked native turn. A fresh
+				// replay already contains these tool results, so the old turn is cancelled below.
+			const active = results.length > 0 && plan.kind === "warm" && !options?.signal?.aborted && !deps.roundTrips.hasPendingBatchCalls() ? deps.driver.reentry() : null;
 				if (active) {
 					sessions.parked = undefined;
 					await consumeTurn(stream, blocks, active, model, options, onCompleted, onToolCall, deps.meter);
@@ -712,7 +659,7 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					// Esc: pi hands back its aborted tool results with the run's
 					// signal already aborted. The turn they belonged to was cancelled
 					// by that signal (or is orphaned and is cancelled here) and
-					// records its checkpoint as it settles; nothing new starts.
+					// records its warm snapshot as it settles; nothing new starts.
 					void deps.driver.cancelActive("aborted in pi");
 					finish(stream, blocks, "aborted", "Operation aborted");
 					return;
@@ -732,20 +679,15 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 				// A turn still parked on pi tool calls that this context does not
 				// answer is orphaned (pi's loop ended after its toolUse message):
 				// end it now instead of queueing behind it until its timeout. Its
-				// parked handler records the checkpoint its session reached.
+				// parked handler records the warm snapshot its session reached.
 				await deps.driver.cancelActive("superseded by a new pi turn");
 				sessions.parked = undefined;
 
 				const entry = deps.entries.find((candidate) => candidate.id === model.id);
-				base = plan.kind === "warm" || plan.kind === "context-sync" ? { sessionId: plan.sessionId, hidden: plan.kind === "warm" ? plan.hidden : 0 } : undefined;
 				traceUsage("plan", plan.kind === "warm"
-					? { kind: plan.kind, sessionId: plan.sessionId, deltaMessages: plan.deltaMessages, delta: plan.input.contextBlock ? "transcript" : "user", parts: plan.input.parts?.length ?? 0, hidden: plan.hidden }
-					: plan.kind === "context-sync"
-						? { kind: plan.kind, sessionId: plan.sessionId, deltaMessages: plan.deltaMessages, hasNewUser: plan.hasNewUser }
-						: { kind: plan.kind, reason: plan.reason, messages: context.messages.length, parts: plan.input.parts?.length ?? 0 });
-				// Unknown until this turn reaches a tool boundary or settles.
+					? { kind: plan.kind, sessionId: plan.sessionId, deltaMessages: plan.deltaMessages, delta: plan.input.contextBlock ? "transcript" : "user", parts: plan.input.parts?.length ?? 0 }
+					: { kind: plan.kind, reason: plan.reason, messages: context.messages.length, replayBytes: Buffer.byteLength(plan.input.prompt, "utf8") });
 				sessions.warm = undefined;
-				sessions.step = undefined;
 				sessions.turnCwd = cwd;
 				const request: DriverTurnRequest = {
 					cwd,
@@ -756,18 +698,12 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					// approved; the tool policy steers the model to pi's tools,
 					// which run under pi's permission policy.
 					skipPermissions: true,
-					conversationId: plan.kind === "warm" || plan.kind === "context-sync" ? plan.sessionId : null,
+					conversationId: plan.kind === "warm" ? plan.sessionId : null,
 					prompt: plan.input.prompt,
 					images: plan.input.images,
 					...(plan.input.contextBlock ? { contextBlock: plan.input.contextBlock } : {}),
 					...(plan.input.parts ? { parts: plan.input.parts } : {}),
 					...(plan.kind === "warm" ? { fallback: plan.fallback } : {}),
-					...(plan.kind === "context-sync" ? { contextSync: {
-						messages: plan.messages,
-						previousItems: plan.previousItems,
-						hasNewUser: plan.hasNewUser,
-						...(cancelledForSync ? { discardCancelledTail: true } : {}),
-					} } : {}),
 					signal: options?.signal,
 					inactivityMin: 5,
 				};

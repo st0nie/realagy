@@ -290,7 +290,7 @@ function menuUi(selections: number[], inputs: string[]): SettingsMenuUI & { mess
 	};
 }
 
-test("legacy reclaim keys are ignored rather than disabling native context synchronization", () => {
+test("legacy reclaim keys are ignored", () => {
 	assert.deepEqual(normalizeRealagyConfig({
 		...DEFAULT_REALAGY_CONFIG,
 		reclaimContext: false,

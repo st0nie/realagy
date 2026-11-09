@@ -59,7 +59,7 @@ REALAGY_TRACE_USAGE=/tmp/trace.jsonl pi      # turn plans, usage_update, step to
 
 - An aborted `npm install` leaves a corrupt `node_modules`, and `tsc`/`vitest` then die with "Bus error". Delete `node_modules` and run `bun install`.
 - `node:sqlite` prints an ExperimentalWarning on Node 22. `src/acp/step-usage.ts` silences it for that one `require`, because it would corrupt pi's TUI.
-- The conversation store is agy's internal format. Every read degrades to "no measurement" rather than failing a turn. The stores are in WAL mode: never copy a `.db` file by itself (use `VACUUM INTO`).
+- The conversation store is agy's internal format and is read only for usage and prompt-delivery evidence. Every read degrades to "no measurement" rather than failing a turn. Never fork, prune, or rewrite it for session reuse: Pi's effective transcript is authoritative, and `/tree` or compaction triggers a fresh `<pi_history>` replay.
 - ACP `session/cancel` is a notification. Sent as a request, agy cancels the prompt but never answers the request.
 - `session/load` of an unknown session id succeeds with an empty session. Check that `<sessionId>.db` exists before trusting a load.
 - `agy --print /usage` takes about 10 s. Run it only from `/realagy usage`, never on a turn's path or in the background.

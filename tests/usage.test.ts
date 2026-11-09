@@ -6,7 +6,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test } from "vitest";
 import { AcpDriver } from "../src/acp/driver.js";
-import { forkConversationAtStep, lastStepIdx, readStepState, siblingUsage, summarizeSteps, tokensFromMetadata } from "../src/acp/step-usage.js";
+import { lastStepIdx, readStepState, siblingUsage, summarizeSteps, tokensFromMetadata } from "../src/acp/step-usage.js";
 import { fetchCliUsage, findAcpHttpPort, parseCliUsage, quotaExhaustion, UsageMeter } from "../src/quota.js";
 import type { DriverActivity, TurnHandle } from "../src/driver-types.js";
 
@@ -61,26 +61,6 @@ test("step usage reads agent-step token stats after a cursor", () => {
 	assert.equal(readStepState(path.join(tmp(), "missing.db")), undefined);
 });
 
-test("forking a WAL-mode conversation store keeps steps that are still in the -wal file", () => {
-	const dir = tmp();
-	const writer = new DatabaseSync(path.join(dir, "src.db"));
-	try {
-		writer.exec("PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;");
-		writer.exec("CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, metadata BLOB)");
-		const insert = writer.prepare("INSERT INTO steps VALUES (?, ?, ?)");
-		for (let idx = 0; idx < 6; idx++) insert.run(idx, idx % 2 ? 15 : 14, idx % 2 ? metadata(10, 1, 0) : null);
-		// The writer stays open: every step is still only in src.db-wal.
-		assert.equal(forkConversationAtStep(dir, "src", 3, "fork"), "fork");
-		assert.equal(lastStepIdx(path.join(dir, "fork.db")), 3);
-		assert.equal(readStepState(path.join(dir, "fork.db"))!.steps.length, 2);
-		assert.equal(lastStepIdx(path.join(dir, "src.db")), 5, "the source branch is untouched");
-		assert.equal(forkConversationAtStep(dir, "src", 3, "fork"), undefined, "never overwrites an existing store");
-		assert.equal(forkConversationAtStep(dir, "absent", 3, "other"), undefined);
-		assert.equal(fs.existsSync(path.join(dir, "other.db")), false);
-	} finally {
-		writer.close();
-	}
-});
 
 async function drain(handle: TurnHandle): Promise<DriverActivity[]> {
 	const activities: DriverActivity[] = [];

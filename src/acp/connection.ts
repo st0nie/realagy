@@ -410,8 +410,7 @@ export class AcpConnection {
 			if (!this.#exited) this.#signalGroup("SIGKILL");
 		}, KILL_GRACE_MS).unref?.();
 	}
-	/** Stop the process and wait until its exit/close handlers have run. Native
-	 *  trajectory edits must happen only after agy can no longer rewrite them. */
+	/** Stop the process and wait until its exit/close handlers have run. */
 	async stop(): Promise<void> {
 		this.kill();
 		if (this.#child) await this.#exitPromise;

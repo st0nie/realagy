@@ -21,7 +21,7 @@ export interface LoadoutEntry {
 /** Tools active after a `/tree` navigation that were inactive before it and
  *  that the target branch never declared: pi activated them only because the
  *  branch does not mention them. Deactivating them restores the branch's
- *  recorded tool set (what its warm checkpoints hold as `tools`), while tools
+ *  recorded tool set (what its warm snapshot holds as `tools`), while tools
  *  that were already active, such as a newly installed extension's, stay. */
 export function treeRestoreExtras(branch: readonly LoadoutEntry[], before: ReadonlySet<string>, active: readonly string[]): string[] {
 	const declared = new Set<string>();

@@ -1,30 +1,25 @@
-// Derive realagy's single private agy executable.
-//
-// agy's bytes are read once and every applicable patch is applied in memory:
-// the full-MCP-output patch (`fullMcpOutput`, src/acp/output-patch.ts) and the
-// empty-prompt continuation patch that native trajectory sync needs
-// (src/acp/continuation-patch.ts). The result is written to exactly one cached
-// file in `derived-bin/`, signed once on macOS, and launched by absolute path.
-// A patch that does not apply fails the spawn with its error; there is no
-// partially patched fallback. The installed agy is never opened for writing. Derivation runs whenever
-// `agy acp` is spawned, so the binary exists from the first Pi start; an agy
-// upgrade or settings change replaces the cached file and prunes the old one.
-
+// Derive realagy's private agy executable when context unlocking or full MCP
+// output is enabled. The source is read once, all enabled patches are applied
+// to the same in-memory copy, then the result is signed once, verified by
+// SHA-256, and cached in derived-bin/. A patch failure aborts startup; the
+// installed agy is never opened for writing. With both patches disabled the
+// source path is returned.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { inspectExecutable, signMacOSBinary } from "./binary-image.js";
-import { patchAgyNativeContinuation } from "./continuation-patch.js";
+import { patchAgyContextUnlock } from "./context-unlock.js";
 import { patchAgyOutputTruncation } from "./output-patch.js";
 
 const CACHE_DIR = path.join(getAgentDir(), "realagy", "derived-bin");
+const CONTEXT_PATCH = "context-unlock";
 const OUTPUT_PATCH = "full-mcp-output";
-const CONTINUATION_PATCH = "native-continuation";
-
 export interface DeriveAgyOptions {
 	/** Apply the full-MCP-output patch; failure to apply it is an error. */
 	fullMcpOutput: boolean;
+	/** Apply the context-window and USER_INPUT unlock patch. Default false. */
+	contextUnlock?: boolean;
 	cacheDir?: string;
 	log?: (msg: string, data?: unknown) => void;
 }
@@ -95,24 +90,26 @@ async function write(output: string, data: Buffer, macho: boolean): Promise<stri
 }
 
 async function derive(sourcePath: string, options: DeriveAgyOptions, cacheDir: string): Promise<string> {
-	const { fullMcpOutput, log } = options;
+	const { fullMcpOutput, contextUnlock = false, log } = options;
 	const source = await fs.promises.readFile(sourcePath);
 	const sourceHash = sha256(source);
 	const image = inspectExecutable(source);
-	const patches = [...(fullMcpOutput ? [OUTPUT_PATCH] : []), CONTINUATION_PATCH];
+	const patches = [...(contextUnlock ? [CONTEXT_PATCH] : []), ...(fullMcpOutput ? [OUTPUT_PATCH] : [])];
 	const output = path.join(cacheDir, `agy-${sourceHash}-${patches.join("+")}${image.format === "pe" ? ".exe" : ""}`);
 	if (!(await validCache(output))) {
 		// Any patch that does not apply aborts derivation; nothing is written.
 		let data: Buffer = source;
 		const details: Record<string, unknown> = {};
+		if (contextUnlock) {
+			const patched = patchAgyContextUnlock(data);
+			data = patched.data;
+			details.context = patched.gates;
+		}
 		if (fullMcpOutput) {
 			const patched = patchAgyOutputTruncation(data);
 			data = patched.data;
 			details.output = { offset: patched.offset, target: patched.target };
 		}
-		const continuation = patchAgyNativeContinuation(data);
-		data = continuation.data;
-		details.continuation = { offsets: continuation.offsets };
 		await fs.promises.mkdir(cacheDir, { recursive: true, mode: 0o700 });
 		const outputSha256 = await write(output, data, image.format === "macho");
 		log?.("agy-derived", { source: sourcePath, sourceSha256: sourceHash, output, outputSha256, format: image.format, arch: image.arch, patches, ...details });
@@ -127,8 +124,9 @@ const inFlight = new Map<string, Promise<string>>();
  *  when agy's bytes or the requested patches changed. */
 export function deriveAgy(sourcePath: string, options: DeriveAgyOptions): Promise<string> {
 	const source = path.resolve(sourcePath);
+	if (!options.fullMcpOutput && !options.contextUnlock) return Promise.resolve(source);
 	const cacheDir = options.cacheDir ?? CACHE_DIR;
-	const key = `${source}\0${cacheDir}\0${options.fullMcpOutput}`;
+	const key = `${source}\0${cacheDir}\0${options.fullMcpOutput}\0${options.contextUnlock === true}`;
 	let pending = inFlight.get(key);
 	if (!pending) {
 		pending = derive(source, options, cacheDir).finally(() => {

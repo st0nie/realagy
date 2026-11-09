@@ -1,30 +1,17 @@
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import { createRequire } from "node:module";
-import os from "node:os";
-import path from "node:path";
 import { createAssistantMessageEventStream, type AssistantMessageEvent, type Message, type TranscriptContext } from "@earendil-works/pi-ai";
 import { calculateContextTokens, AgentSession, SessionManager } from "@earendil-works/pi-coding-agent";
 import { test, vi } from "vitest";
 import { runAgentLoop, type AgentTool } from "@earendil-works/pi-agent-core";
-import { conversationDbPath, lastStepIdx } from "../src/acp/step-usage.js";
 import { createStreamSimple, ESCALATE_AFTER_MS, failParkedCalls, POLL_TOOL_NAME, ToolRoundTrips, type AcpSessions } from "../src/provider.js";
 import type { DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../src/driver-types.js";
 import { FALLBACK_MODELS, toPiModel } from "../src/models.js";
 import { PARALLEL_TOOL_NAME } from "../src/parallel.js";
-import {
-	freshInput,
-	MAX_TRANSCRIPT_BYTES,
-	planTurn,
-	planTurnFrom,
-	restoreWarmSessions,
-	WARM_SESSION_ENTRY,
-	warmAfterTurn,
-	type SessionEntryLike,
-} from "../src/transcript.js";
+import { freshInput, planTurn, warmAfterTurn } from "../src/transcript.js";
 class FakeHandle implements TurnHandle {
 	id = "turn-1";
 	outcome: Promise<TurnOutcome>;
+	sessionId: string | undefined;
 	#activities: DriverActivity[] = [];
 	#wake: Array<() => void> = [];
 	#closed = false;
@@ -46,7 +33,8 @@ class FakeHandle implements TurnHandle {
 	}
 
 	pushExternal(activity: DriverActivity): void {
-		this.#activities.push(activity);
+		// AcpDriver annotates bridge calls from either ACP or the MCP bridge.
+		this.#activities.push(activity.type === "bridge_call" ? { ...activity, sessionId: this.sessionId } : activity);
 		this.#wake.shift()?.();
 	}
 
@@ -68,16 +56,15 @@ class FakeDriver implements TurnDriver {
 		this.requests.push(request);
 		const handle = new FakeHandle();
 		this.activeHandle = handle;
+		handle.sessionId = request.conversationId ?? `acp-fake-${this.requests.length}`;
 		for (const activity of this.script) handle.pushExternal(activity);
-		if (this.autoFinish) handle.complete();
+		if (this.autoFinish) handle.complete({ status: "OK", response: "", aborted: false, conversationId: handle.sessionId });
 		return handle;
 	}
 
 	reentry(): TurnHandle | null { return this.activeHandle; }
 	kickIdle(): void {}
 	cancels: string[] = [];
-	bridgeWaits = 0;
-	async awaitBridgeResults(): Promise<void> { this.bridgeWaits++; }
 	async cancelActive(reason: string): Promise<void> {
 		const active = this.activeHandle;
 		if (!(active instanceof FakeHandle) || active.closed) return;
@@ -103,7 +90,7 @@ async function collect(stream: ReturnType<typeof createAssistantMessageEventStre
 	return events;
 }
 
-test("fresh turns preserve transcript prefix, avoid duplicate prompts, and carry historical images", async () => {
+test("fresh replay keeps live images and renders historical images as text placeholders", async () => {
 	const driver = new FakeDriver();
 	const entry = FALLBACK_MODELS[0];
 	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
@@ -113,13 +100,12 @@ test("fresh turns preserve transcript prefix, avoid duplicate prompts, and carry
 	await collect(stream(toPiModel(entry), context([system(), first])));
 	await collect(stream(toPiModel(entry), context([system(), first, result, user("what is in it?")])));
 	const [a, b] = driver.requests;
-	assert.equal(a.prompt, b.prompt);
-	assert.ok(!a.prompt.includes("look at this"));
-	assert.ok(b.contextBlock!.text.startsWith(a.contextBlock!.text));
-	assert.equal((b.contextBlock!.text.match(/what is in it\?/g) ?? []).length, 1);
-	assert.match(b.contextBlock!.text, /\[Attached image 1\]/);
-	assert.match(b.contextBlock!.text, /\[Attached image 2\]/);
-	assert.deepEqual(b.images, [{ data: image.data, mimeType: image.mimeType }, { data: image.data, mimeType: image.mimeType }]);
+	assert.match(a.prompt, /look at this$/);
+	assert.deepEqual(a.images, [{ data: image.data, mimeType: image.mimeType }]);
+	assert.match(b.prompt, /<pi_history>[\s\S]*look at this[\s\S]*\[Image in original transcript\][\s\S]*<\/pi_history>/);
+	assert.ok(b.prompt.endsWith("what is in it?"));
+	assert.equal(b.contextBlock, undefined);
+	assert.deepEqual(b.images, [], "historical image bytes are not replayed");
 });
 test("provider streams native thinking/text and maps GPT to its medium ACP slug", async () => {
 	const driver = new FakeDriver();
@@ -202,6 +188,7 @@ test("MCP call becomes a genuine pi toolUse and its toolResult resumes ACP", asy
 	const firstEvents = await first;
 	const done = firstEvents.find((event) => event.type === "done");
 	assert.equal(done?.type === "done" && done.reason, "toolUse");
+	if (done?.type !== "done") return;
 	const toolCall = firstEvents.find((event) => event.type === "toolcall_end");
 	assert.equal(toolCall?.type === "toolcall_end" && toolCall.toolCall.name, "bash");
 	assert.deepEqual(toolCall?.type === "toolcall_end" && toolCall.toolCall.arguments, { command: "printf ok" });
@@ -212,7 +199,7 @@ test("MCP call becomes a genuine pi toolUse and its toolResult resumes ACP", asy
 	handle.pushExternal({ type: "text", delta: "finished" });
 	handle.complete();
 	const toolResult: Message = { role: "toolResult", toolCallId: "call-1", toolName: "bash", content: [{ type: "text", text: "ok" }], isError: false, timestamp: Date.now() };
-	const second = collect(streamSimple(model, context([system(), user("Run bash"), toolResult])));
+	const second = collect(streamSimple(model, context([system(), user("Run bash"), done.message, toolResult])));
 	assert.deepEqual(await parked, { content: [{ type: "text", text: "ok" }], isError: false });
 	const secondEvents = await second;
 	assert.ok(secondEvents.some((event) => event.type === "text_delta" && event.delta === "finished"));
@@ -513,12 +500,13 @@ test("image tool results go back as MCP image blocks on the existing ACP handle"
 		const first = collect(stream(model, context([system(), user("Read the image")])));
 		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
 		const parked = roundTrips.onToolCall("image-call", "read", { path: "/tmp/arbitrary.png" }, new AbortController().signal);
-		await first;
+		const firstDone = (await first).find((event) => event.type === "done");
+		if (firstDone?.type !== "done") return;
 		const handle = driver.activeHandle as FakeHandle;
 		handle.pushExternal({ type: "text", delta: "seen" });
 		handle.complete();
 		const result: Message = { role: "toolResult", toolCallId: "image-call", toolName: "read", content: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }], isError: false, timestamp: 2 };
-		await collect(stream(model, context([system(), user("Read the image"), result])));
+		await collect(stream(model, context([system(), user("Read the image"), firstDone.message, result])));
 		const reply = await parked;
 		assert.deepEqual(reply.content, [{ type: "text", text: "(image result)" }, { type: "image", data: "aW1hZ2U=", mimeType: "image/png" }]);
 		assert.equal(driver.requests.length, 1);
@@ -531,7 +519,7 @@ test("steering messages queued during a tool call ride the MCP tool result and p
 	driver.autoFinish = false;
 	const roundTrips = new ToolRoundTrips(driver);
 	const model = toPiModel(FALLBACK_MODELS[0]);
-	const sessions = {};
+	const sessions: AcpSessions = {};
 	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
 	const image = { type: "image" as const, data: "c3RlZXI=", mimeType: "image/png" };
 	try {
@@ -542,8 +530,8 @@ test("steering messages queued during a tool call ride the MCP tool result and p
 		const step1Done = (await step1).find((event) => event.type === "done");
 		assert.equal(step1Done?.type, "done");
 		if (step1Done?.type !== "done") return;
-
-		// User sends two steering messages (second with an image) while call-1 runs.
+		// FakeHandle annotates every bridge activity with its native session id,
+		// so the exact prefix is available before the final outcome settles.
 		const result1: Message = { role: "toolResult", toolCallId: "call-1", toolName: "read", content: [{ type: "text", text: "# Old README" }], isError: false, timestamp: 2 };
 		const steer1 = user("put docs in docs/xxx");
 		const steer2: Message = { role: "user", content: [{ type: "text", text: "not a huge README.md" }, image], timestamp: 3 };
@@ -598,24 +586,22 @@ test("steering messages queued during a tool call ride the MCP tool result and p
 	}
 });
 
-test("large transcript transport retains every message and image without an omission budget", () => {
+test("large fresh replay is one bounded prompt and keeps the newest input and image", () => {
 	const hist = user('<realctx-history part="h1">Earlier summary</realctx-history>');
-	const big = user("中🙂".repeat(300_000));
+	const big = user("中🙂".repeat(400_000));
 	const image = { type: "image" as const, data: "aW1hZ2U=", mimeType: "image/png" };
 	const latest: Message = { role: "user", content: [{ type: "text", text: "latest user question" }, image], timestamp: 4 };
 	const input = freshInput(context([system(), hist, big, latest]));
-	const blocks = [...(input.parts ?? []).map((part) => part.contextBlock), input.contextBlock!];
-	assert.ok(blocks.length > 8);
-	for (const block of blocks) assert.ok(Buffer.byteLength(block.text) <= MAX_TRANSCRIPT_BYTES);
-	const all = blocks.map((block) => block.text).join("");
-	assert.ok(all.includes("中🙂".repeat(300_000)));
-	assert.match(all, /<realctx-history part="h1">/);
-	assert.match(all, /latest user question/);
-	assert.doesNotMatch(all, /pi-transcript-omitted|older content clipped/);
+	assert.equal(input.parts, undefined);
+	assert.equal(input.contextBlock, undefined);
+	assert.ok(Buffer.byteLength(input.prompt, "utf8") <= 2_200_000);
+	assert.match(input.prompt, /<pi_history>/);
+	assert.match(input.prompt, /omitted/i);
+	assert.ok(input.prompt.endsWith("latest user question"));
 	assert.deepEqual(input.images, [{ data: image.data, mimeType: image.mimeType }]);
 });
 
-test("applied realctx drops and summaries synchronize while retaining the native session", () => {
+test("applied realctx drops and summaries force a fresh authoritative replay", () => {
 	const model = toPiModel(FALLBACK_MODELS[0]);
 	const img = { type: "image" as const, data: "dXNlckltZw==", mimeType: "image/png" };
 	const turn1User: Message = { role: "user", content: [{ type: "text", text: "inspect this screenshot" }, img], timestamp: 1 };
@@ -687,11 +673,9 @@ test("applied realctx drops and summaries synchronize while retaining the native
 		"/repo",
 		warm,
 	);
-	assert.equal(planAfterDrops.kind, "context-sync");
-	if (planAfterDrops.kind !== "context-sync") return;
-	assert.equal(planAfterDrops.sessionId, "acp-session-1");
-	assert.equal(planAfterDrops.input.prompt, "great, let's adapt it");
-
+	assert.equal(planAfterDrops.kind, "fresh");
+	assert.match(planAfterDrops.input.prompt, /<pi_history>[\s\S]*#1 dropped[\s\S]*#2 dropped[\s\S]*<\/pi_history>/);
+	assert.ok(planAfterDrops.input.prompt.endsWith("great, let's adapt it"));
 	// 2. Next turn after realctx historian also folds turn 1 into a <realctx-history> summary chunk:
 	const historyChunk = user('<realctx-history part="h1" turns="1-1" replaced="4.3k tok">\nTurn 1 summary\n</realctx-history>');
 	const planAfterHistorian = planTurn(
@@ -699,13 +683,12 @@ test("applied realctx drops and summaries synchronize while retaining the native
 		"/repo",
 		warm,
 	);
-	assert.equal(planAfterHistorian.kind, "context-sync");
-	if (planAfterHistorian.kind !== "context-sync") return;
-	assert.equal(planAfterHistorian.sessionId, "acp-session-1");
-	assert.equal(planAfterHistorian.input.prompt, "still warm after historian?");
+	assert.equal(planAfterHistorian.kind, "fresh");
+	assert.match(planAfterHistorian.input.prompt, /<pi_history>[\s\S]*Turn 1 summary[\s\S]*<\/pi_history>/);
+	assert.ok(planAfterHistorian.input.prompt.endsWith("still warm after historian?"));
 });
 
-test("small mid-turn realctx history compression during tool reentry preserves warm reuse for the next turn", async () => {
+test("mid-turn history compression rebuilds once, then reuses the rebuilt session", async () => {
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
 	const roundTrips = new ToolRoundTrips(driver);
@@ -753,153 +736,71 @@ test("small mid-turn realctx history compression during tool reentry preserves w
 		handle.pushExternal({ type: "text", delta: "checks passed" });
 		handle.complete({ status: "OK", response: "checks passed", aborted: false, conversationId: "acp-warm-midturn" });
 
+		driver.autoFinish = true;
+		driver.script = [{ type: "text", delta: "checks passed" }];
 		const step2Done = (await collect(stream(model, context(compactedMidTurn)))).find((event) => event.type === "done");
 		await parked;
 		assert.equal(step2Done?.type, "done");
 		if (step2Done?.type !== "done") return;
 
-		// Because currentUser remained intact after the <realctx-history> summary, the next turn stays warm!
+		assert.equal(driver.requests.length, 2);
+		assert.equal(driver.requests[1].conversationId, null);
+		assert.match(driver.requests[1].prompt, /<pi_history>[\s\S]*Summarized old turn[\s\S]*ok[\s\S]*<\/pi_history>/);
+		assert.ok(driver.requests[1].prompt.endsWith("Continue the task from the latest tool results above."));
+		// The rebuilt session is warm for the next unchanged-prefix turn.
 		driver.autoFinish = true;
 		driver.script = [{ type: "text", delta: "warm reply" }];
 		await collect(stream(model, context([...compactedMidTurn, step2Done.message, user("next request")])));
-		assert.equal(driver.requests.length, 2);
-		assert.equal(driver.requests[1].conversationId, "acp-warm-midturn");
-		assert.equal(driver.requests[1].prompt, "next request");
-		assert.equal(driver.requests[1].contextBlock, undefined);
+		assert.equal(driver.requests.length, 3);
+		assert.equal(driver.requests[2].conversationId, "acp-fake-2");
+		assert.equal(driver.requests[2].prompt, "next request");
+		assert.equal(driver.requests[2].contextBlock, undefined);
 	} finally {
 		roundTrips.failAll("test done");
 	}
 });
 
-test("persisted warm checkpoints survive reload and fork the SQLite store on /tree branch rewind", async () => {
-	const require = createRequire(import.meta.url);
-	const { DatabaseSync } = require("node:sqlite") as typeof import("node:sqlite");
-	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-rewind-"));
-	const baseSessionId = "11111111-2222-3333-4444-555555555555";
-	const baseTid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-	const dbPath = conversationDbPath(tmpDir, baseSessionId)!;
-
-	const seedSteps = (maxIdx: number) => {
-		const db = new DatabaseSync(dbPath);
-		db.exec(`
-			CREATE TABLE IF NOT EXISTS trajectory_meta (trajectory_id text, cascade_id text, trajectory_type integer, source integer, PRIMARY KEY (trajectory_id));
-			CREATE TABLE IF NOT EXISTS steps (idx integer PRIMARY KEY, step_type integer NOT NULL DEFAULT 0, status integer NOT NULL DEFAULT 0, metadata blob, step_payload blob);
-			CREATE TABLE IF NOT EXISTS gen_metadata (idx integer PRIMARY KEY, data blob, size integer NOT NULL DEFAULT 0);
-			CREATE TABLE IF NOT EXISTS executor_metadata (idx integer PRIMARY KEY, data blob);
-			CREATE TABLE IF NOT EXISTS trajectory_metadata_blob (id text DEFAULT 'main' PRIMARY KEY, data blob);
-		`);
-		db.prepare("INSERT OR REPLACE INTO trajectory_meta VALUES (?, ?, 4, 17)").run(baseTid, baseSessionId);
-		db.prepare("INSERT OR REPLACE INTO trajectory_metadata_blob VALUES ('main', ?)").run(
-			Buffer.from(`meta:${baseSessionId}:tid:${baseTid}`, "utf8"),
-		);
-		for (let i = 0; i <= maxIdx; i++) {
-			db.prepare("INSERT OR REPLACE INTO steps (idx, step_type, status) VALUES (?, ?, 3)").run(i, i === 0 || i === 4 ? 14 : 15);
-		}
-		// gen_metadata[0] -> steps [1, 2], gen_metadata[1] -> steps [5, 6]
-		db.prepare("INSERT OR REPLACE INTO gen_metadata (idx, data, size) VALUES (0, ?, 4)").run(Uint8Array.from([0x12, 0x02, 0x01, 0x02]));
-		if (maxIdx >= 5) {
-			db.prepare("INSERT OR REPLACE INTO gen_metadata (idx, data, size) VALUES (1, ?, 4)").run(Uint8Array.from([0x12, 0x02, 0x05, 0x06]));
-		}
-		// executor_metadata[0] -> end step 3, executor_metadata[1] -> end step 8
-		db.prepare("INSERT OR REPLACE INTO executor_metadata (idx, data) VALUES (0, ?)").run(Uint8Array.from([0x08, 0x04, 0x10, 0x02, 0x18, 0x03]));
-		if (maxIdx >= 8) {
-			db.prepare("INSERT OR REPLACE INTO executor_metadata (idx, data) VALUES (1, ?)").run(Uint8Array.from([0x08, 0x04, 0x10, 0x0c, 0x18, 0x08]));
-		}
-		db.close();
-	};
-
+test("/tree rewind invalidates the native cache and replays only the selected Pi branch", async () => {
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
 	const roundTrips = new ToolRoundTrips(driver);
 	const model = toPiModel(FALLBACK_MODELS[0]);
-	const sessionEntries: SessionEntryLike[] = [];
-	const sessions: AcpSessions = {
-		conversationsDir: () => tmpDir,
-		onWarm: (warm) => {
-			sessionEntries.push({ type: "custom", customType: WARM_SESSION_ENTRY, data: warm });
-		},
-	};
+	const sessions: AcpSessions = {};
 	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+	const run = async (messages: Message[], sessionId: string) => {
+		driver.script = [{ type: "text", delta: "answer" }];
+		const previousRequests = driver.requests.length;
+		const pending = collect(stream(model, context(messages)));
+		await vi.waitFor(() => assert.equal(driver.requests.length, previousRequests + 1));
+		const handle = driver.activeHandle as FakeHandle;
+		handle.complete({ status: "OK", response: "answer", aborted: false, conversationId: sessionId });
+		const done = (await pending).find((event) => event.type === "done");
+		assert.equal(done?.type, "done");
+		if (done?.type !== "done") throw new Error("missing done message");
+		return done.message;
+	};
+	const u1 = user("Turn 1 question");
+	const a1 = await run([system(), u1], "session-1");
+	const u2 = user("Turn 2 question");
+	const a2 = await run([system(), u1, a1, u2], "session-1");
+	assert.equal(driver.requests[1].prompt, "Turn 2 question");
 
-	try {
-		// Turn 1 completes at maxStepIdx = 3.
-		seedSteps(3);
-		const t1Messages = [system(), user("Turn 1 question")];
-		const t1Promise = collect(stream(model, context(t1Messages)));
-		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
-		(driver.activeHandle as FakeHandle).pushExternal({ type: "text", delta: "Turn 1 answer" });
-		(driver.activeHandle as FakeHandle).complete({
-			status: "OK",
-			response: "Turn 1 answer",
-			aborted: false,
-			conversationId: baseSessionId,
-			maxStepIdx: 3,
-		});
-		const t1Done = (await t1Promise).find((e) => e.type === "done");
-		assert.equal(t1Done?.type, "done");
-		if (t1Done?.type !== "done") return;
+	sessions.warm = undefined;
+	const alternate = user("Turn 2B alternate question");
+	await run([system(), u1, a1, alternate], "session-2");
+	assert.equal(driver.requests[2].conversationId, null);
+	assert.match(driver.requests[2].prompt, /<pi_history>[\s\S]*Turn 1 question[\s\S]*answer[\s\S]*<\/pi_history>/);
+	assert.ok(driver.requests[2].prompt.endsWith("Turn 2B alternate question"));
+	assert.ok(!driver.requests[2].prompt.includes("Turn 2 question"));
+	assert.equal(driver.requests[2].contextBlock, undefined);
 
-		// Turn 2 (Branch A) reuses baseSessionId (DB is still at step 3 when Turn 2A starts)
-		// and advances DB to maxStepIdx = 8 while Turn 2A executes.
-		const t2AMessages = [...t1Messages, t1Done.message, user("Turn 2A question")];
-		const t2APromise = collect(stream(model, context(t2AMessages)));
-		await vi.waitFor(() => assert.equal(driver.requests.length, 2));
-		assert.equal(driver.requests[1].conversationId, baseSessionId);
-		assert.equal(driver.requests[1].prompt, "Turn 2A question");
-		seedSteps(8);
-		(driver.activeHandle as FakeHandle).pushExternal({ type: "text", delta: "Turn 2A answer" });
-		(driver.activeHandle as FakeHandle).complete({
-			status: "OK",
-			response: "Turn 2A answer",
-			aborted: false,
-			conversationId: baseSessionId,
-			maxStepIdx: 8,
-		});
-		const t2ADone = (await t2APromise).find((e) => e.type === "done");
-		assert.equal(t2ADone?.type, "done");
-		if (t2ADone?.type !== "done") return;
-
-		// Simulate /reload + /tree rewind back to Turn 1 (where branch only has Turn 1, or even stops at Turn 1 assistant before its custom entry).
-		const reloaded = restoreWarmSessions([sessionEntries[0]!], sessionEntries);
-		sessions.warm = reloaded.warm;
-		sessions.checkpoints = reloaded.checkpoints;
-
-		driver.autoFinish = true;
-		driver.script = [{ type: "text", delta: "Turn 2B answer" }];
-		const t2BMessages = [...t1Messages, t1Done.message, user("Turn 2B alternate question")];
-		await collect(stream(model, context(t2BMessages)));
-
-		assert.equal(driver.requests.length, 3);
-		const forkedSessionId = driver.requests[2].conversationId;
-		assert.ok(forkedSessionId && forkedSessionId !== baseSessionId, "expected a forked sessionId on rewind");
-		assert.equal(driver.requests[2].prompt, "Turn 2B alternate question");
-		assert.equal(driver.requests[2].contextBlock, undefined);
-
-		// Verify the forked SQLite DB was truncated to step <= 3 while the original DB stayed at step 8.
-		assert.equal(lastStepIdx(dbPath), 8);
-		const forkedDbPath = conversationDbPath(tmpDir, forkedSessionId!)!;
-		assert.equal(lastStepIdx(forkedDbPath), 3);
-		const checkDb = new DatabaseSync(forkedDbPath, { readOnly: true });
-		const genCount = (checkDb.prepare("SELECT count(*) AS cnt FROM gen_metadata").get() as { cnt: number }).cnt;
-		const execCount = (checkDb.prepare("SELECT count(*) AS cnt FROM executor_metadata").get() as { cnt: number }).cnt;
-		const metaCascade = (checkDb.prepare("SELECT cascade_id FROM trajectory_meta LIMIT 1").get() as { cascade_id: string }).cascade_id;
-		const blobText = Buffer.from((checkDb.prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'").get() as { data: Uint8Array }).data).toString("utf8");
-		checkDb.close();
-		assert.equal(genCount, 1);
-		assert.equal(execCount, 1);
-		assert.equal(metaCascade, forkedSessionId);
-		assert.ok(blobText.includes(forkedSessionId!));
-		assert.ok(!blobText.includes(baseSessionId));
-
-		// Switching back to Branch A (Turn 2A) in /tree still reuses the intact baseSessionId at step 8!
-		await collect(stream(model, context([...t2AMessages, t2ADone.message, user("Turn 3A question on original branch")])));
-		assert.equal(driver.requests.length, 4);
-		assert.equal(driver.requests[3].conversationId, baseSessionId);
-		assert.equal(driver.requests[3].prompt, "Turn 3A question on original branch");
-	} finally {
-		roundTrips.failAll("test done");
-		fs.rmSync(tmpDir, { recursive: true, force: true });
-	}
+	sessions.warm = undefined;
+	const back = user("Back on the original branch");
+	await run([system(), u1, a1, u2, a2, back], "session-3");
+	assert.equal(driver.requests[3].conversationId, null);
+	assert.match(driver.requests[3].prompt, /Turn 2 question/);
+	assert.ok(!driver.requests[3].prompt.includes("Turn 2B alternate question"));
+	assert.ok(driver.requests[3].prompt.endsWith("Back on the original branch"));
 });
 
 test("effective history changes synchronize while genuine user identity edits diverge", async () => {
@@ -939,10 +840,9 @@ test("effective history changes synchronize while genuine user identity edits di
 		timestamp: Date.now(),
 	};
 	const plan2 = planTurn(context([system(), t1UserClean, t1Asst, t2UserDecorated]), "/repo", warm1);
-	assert.equal(plan2.kind, "context-sync");
-	if (plan2.kind !== "context-sync") return;
-	assert.equal(plan2.sessionId, "acp-universal-1");
-	assert.match(plan2.input.prompt, /^what about logout\?\n<custom-skill-context>/);
+	assert.equal(plan2.kind, "fresh");
+	assert.match(plan2.input.prompt, /<pi_history>[\s\S]*how does login work\?/);
+	assert.match(plan2.input.prompt, /what about logout\?\n<custom-skill-context>/);
 
 	const t2Asst = makeAsst("Logout clears the session cookie.");
 	const warm2 = warmAfterTurn(
@@ -960,10 +860,9 @@ test("effective history changes synchronize while genuine user identity edits di
 		"/repo",
 		warm2,
 	);
-	assert.equal(plan3Summary.kind, "context-sync");
-	if (plan3Summary.kind === "context-sync") {
-		assert.equal(plan3Summary.input.prompt, "and refresh tokens?");
-	}
+	assert.equal(plan3Summary.kind, "fresh");
+	assert.match(plan3Summary.input.prompt, /<custom-extension-summary>/);
+	assert.ok(plan3Summary.input.prompt.endsWith("and refresh tokens?"));
 
 	// Turn 3B: Sliding-window extension drops Turn 1 completely without inserting a summary message.
 	const plan3Sliding = planTurn(
@@ -971,10 +870,9 @@ test("effective history changes synchronize while genuine user identity edits di
 		"/repo",
 		warm2,
 	);
-	assert.equal(plan3Sliding.kind, "context-sync");
-	if (plan3Sliding.kind === "context-sync") {
-		assert.equal(plan3Sliding.input.prompt, "and refresh tokens?");
-	}
+	assert.equal(plan3Sliding.kind, "fresh");
+	assert.ok(!plan3Sliding.input.prompt.includes("how does login work?"));
+	assert.ok(plan3Sliding.input.prompt.endsWith("and refresh tokens?"));
 
 	// Turn 3C: In-place edit of Turn 1's user message still triggers history-diverged!
 	const plan3Edited = planTurn(
@@ -996,7 +894,8 @@ test("effective history changes synchronize while genuine user identity edits di
 		"/repo",
 		warm2,
 	);
-	assert.equal(plan3Compacted.kind, "context-sync");
+	assert.equal(plan3Compacted.kind, "fresh");
+	assert.match(plan3Compacted.input.prompt, /Compacted summary/);
 });
 
 test("agy's native tool calls become thinking lines without duplicating the reply text", async () => {
@@ -1049,7 +948,7 @@ test("a reply split by native-tool thinking lines is one assistant reply in the 
 			{ type: "text", text: "after" },
 		],
 	} as unknown as Message;
-	const text = freshInput(context([reply])).contextBlock!.text;
+	const text = freshInput(context([reply])).prompt;
 	assert.ok(text.includes("<assistant>\nHello world\n</assistant>"), text);
 	assert.ok(text.indexOf("Hello world") < text.indexOf("assistant-tool-call") && text.indexOf("assistant-tool-call") < text.indexOf("<assistant>\nafter"));
 	assert.ok(!text.includes("agy →"));
@@ -1076,17 +975,12 @@ test("agy's high-traffic notice fails the turn as a retryable overload instead o
 	assert.match(error.error.errorMessage ?? "", /overloaded/);
 });
 
-function reclaimAssistant(content: Extract<Message, { role: "assistant" }>["content"], timestamp = Date.now()): Extract<Message, { role: "assistant" }> {
+function assistantMessage(content: Extract<Message, { role: "assistant" }>["content"], timestamp = Date.now()): Extract<Message, { role: "assistant" }> {
 	const model = toPiModel(FALLBACK_MODELS[0]);
 	return {
-		role: "assistant",
-		content,
-		api: model.api,
-		provider: model.provider,
-		model: model.id,
+		role: "assistant", content, api: model.api, provider: model.provider, model: model.id,
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-		stopReason: content.some((block) => block.type === "toolCall") ? "toolUse" : "stop",
-		timestamp,
+		stopReason: content.some((block) => block.type === "toolCall") ? "toolUse" : "stop", timestamp,
 	};
 }
 
@@ -1094,68 +988,7 @@ function toolResult(id: string, text: string): Message {
 	return { role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text }], isError: false, timestamp: Date.now() };
 }
 
-const readCall = (id: string) => reclaimAssistant([{ type: "toolCall", id, name: "read", arguments: { path: id } }]);
-
-test("every applied drop synchronizes the same session regardless of size, share, or cache age", () => {
-	for (const bytes of [1, 5_000, 50_000, 200_000]) {
-		for (const age of [0, 10 * 60_000]) {
-			const u1 = user("inspect the logs");
-			const a1 = readCall("c1");
-			const result = toolResult("c1", "x".repeat(bytes));
-			const final = reclaimAssistant([{ type: "text", text: "done" }], Date.now() - age);
-			const history = [system(), u1, a1, result];
-			const warm = warmAfterTurn(context(history), final, "acp-drop", "/repo");
-			assert.equal(planTurn(context([...history, final, user("next")]), "/repo", warm).kind, "warm");
-			const dropped = toolResult("c1", "[#1 dropped · read c1]");
-			const plan = planTurn(context([system(), u1, a1, dropped, final, user("next")]), "/repo", warm);
-			assert.equal(plan.kind, "context-sync");
-			if (plan.kind !== "context-sync") throw new Error("expected sync");
-			assert.equal(plan.sessionId, "acp-drop");
-			assert.equal(plan.input.prompt, "next");
-			assert.equal(plan.input.contextBlock, undefined);
-			assert.equal(plan.input.parts, undefined);
-			assert.equal(plan.hasNewUser, true);
-			assert.deepEqual(plan.messages[3], dropped);
-		}
-	}
-});
-
-test("consecutive rewrites synchronize immediately and unchanged checkpoints stay incremental", () => {
-	const u1 = user("read both files");
-	const a1 = readCall("c1");
-	const r1 = toolResult("c1", "a".repeat(5_000));
-	const a2 = readCall("c2");
-	const r2 = toolResult("c2", "b".repeat(5_000));
-	const final1 = reclaimAssistant([{ type: "text", text: "Both read." }]);
-	const before = [system(), u1, a1, r1, a2, r2];
-	const warm1 = warmAfterTurn(context(before), final1, "acp-repeat", "/repo");
-	const after = [system(), u1, a1, toolResult("c1", "[#1 dropped]"), a2, r2, final1, user("summarize")];
-	assert.equal(planTurn(context(after), "/repo", warm1).kind, "context-sync");
-	const final2 = reclaimAssistant([{ type: "text", text: "Summary." }]);
-	const warm2 = warmAfterTurn(context(after), final2, "acp-repeat", "/repo");
-	assert.equal(planTurn(context([...after, final2, user("next")]), "/repo", warm2).kind, "warm");
-	const repeated = [...after];
-	repeated[5] = toolResult("c2", "[#2 dropped]");
-	const plan = planTurn(context([...repeated, final2, user("next")]), "/repo", warm2);
-	assert.equal(plan.kind, "context-sync");
-	if (plan.kind === "context-sync") assert.equal(plan.sessionId, "acp-repeat");
-});
-
-test("restored checkpoints retain exact sync metadata; legacy checkpoints request verification", () => {
-	const final = reclaimAssistant([{ type: "text", text: "hello" }]);
-	const warm = warmAfterTurn(context([system(), user("hi")]), final, "acp-restored", "/repo");
-	const { checkpoints } = restoreWarmSessions([
-		{ type: "custom", customType: WARM_SESSION_ENTRY, data: { ...warm, contentHash: undefined } },
-		{ type: "custom", customType: WARM_SESSION_ENTRY, data: warm },
-	]);
-	assert.deepEqual(checkpoints.at(-1)?.syncItems, warm.syncItems);
-	assert.equal(checkpoints.at(-1)?.contentHash, warm.contentHash);
-	const next = context([system(), user("hi"), final, user("again")]);
-	assert.equal(planTurn(next, "/repo", checkpoints[0]).kind, "context-sync");
-	assert.equal(planTurn(next, "/repo", checkpoints[1]).kind, "warm");
-});
-
-test("mid-turn drops settle completed tools before cancel and keep the session without replay", async () => {
+test("mid-turn history drops cancel the parked turn and rebuild from current Pi messages", async () => {
 	for (const bytes of [10, 10_000, 200_000]) {
 		const driver = new FakeDriver();
 		driver.autoFinish = false;
@@ -1164,66 +997,47 @@ test("mid-turn drops settle completed tools before cancel and keep the session w
 		const model = toPiModel(FALLBACK_MODELS[0]);
 		const sessions: AcpSessions = {};
 		const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
-		try {
-			const u1 = user("scan the repo");
-			const first = collect(stream(model, context([system(), u1])));
-			await vi.waitFor(() => assert.equal(driver.requests.length, 1));
-			const handle = driver.activeHandle as FakeHandle;
-			const push = handle.pushExternal.bind(handle);
-			handle.pushExternal = (activity) => push(activity.type === "bridge_call" ? { ...activity, sessionId: "acp-running" } : activity);
-			const call1 = roundTrips.onToolCall("c1", "read", {}, new AbortController().signal);
-			const d1 = (await first).find((event) => event.type === "done");
-			if (d1?.type !== "done") throw new Error("no toolUse 1");
-			const r1 = toolResult("c1", "x".repeat(bytes));
-			const second = collect(stream(model, context([system(), u1, d1.message, r1])));
-			await call1;
-			const call2 = roundTrips.onToolCall("c2", "read", {}, new AbortController().signal);
-			const d2 = (await second).find((event) => event.type === "done");
-			if (d2?.type !== "done") throw new Error("no toolUse 2");
-			driver.autoFinish = true;
-			driver.script = [{ type: "text", delta: "continued" }];
-			const rewritten = [system(), u1, d1.message, toolResult("c1", "[#1 dropped]"), d2.message, toolResult("c2", "small")];
-			const third = await collect(stream(model, context(rewritten)));
-			assert.equal(third.at(-1)?.type, "done");
-			assert.match(JSON.stringify(await call2), /small/);
-			assert.equal(roundTrips.isPending("c2"), false);
-			assert.equal(driver.cancels.length, 1);
-			assert.equal(driver.requests.length, 2);
-			const request = driver.requests[1];
-			assert.equal(request.conversationId, "acp-running");
-			assert.equal(request.prompt, "");
-			assert.equal(request.contextBlock, undefined);
-			assert.equal(request.parts, undefined);
-			assert.equal(request.fallback, undefined);
-			assert.equal(request.contextSync?.hasNewUser, false);
-			assert.deepEqual(request.contextSync?.messages, rewritten);
-			assert.equal(request.contextSync?.discardCancelledTail, true);
-		} finally {
-			roundTrips.failAll("test cleanup");
-		}
+		const u1 = user(`read ${"x".repeat(bytes)}`);
+		driver.script = [{ type: "bridge_call", callId: "c1", name: "read", args: {} }];
+		const first = collect(stream(model, context([system(), u1])));
+		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+		const d1 = (await first).find((event) => event.type === "done");
+		if (d1?.type !== "done") throw new Error("no toolUse 1");
+
+		driver.script = [{ type: "bridge_call", callId: "c2", name: "read", args: {} }];
+		const second = collect(stream(model, context([system(), u1, d1.message, toolResult("c1", "one")])));
+		await vi.waitFor(() => assert.equal(driver.requests.length, 2));
+		const d2 = (await second).find((event) => event.type === "done");
+		if (d2?.type !== "done") throw new Error("no toolUse 2");
+
+		driver.autoFinish = true;
+		driver.script = [{ type: "text", delta: "continued" }];
+		const rewritten = [system(), u1, d1.message, toolResult("c1", "[#1 dropped]"), d2.message, toolResult("c2", "small")];
+		const third = await collect(stream(model, context(rewritten)));
+		assert.equal(third.at(-1)?.type, "done");
+		assert.equal(driver.requests.length, 3);
+		assert.equal(driver.requests[2].conversationId, null);
+		assert.match(driver.requests[2].prompt, /<pi_history>[\s\S]*#1 dropped[\s\S]*small[\s\S]*<\/pi_history>/);
+		assert.ok(driver.requests[2].prompt.endsWith("Continue the task from the latest tool results above."));
+		assert.deepEqual(driver.cancels, ["superseded by a new pi turn", "superseded by a new pi turn"]);
+		roundTrips.failAll("test done");
 	}
 });
 
-test("rewritten history never falls back to an older checkpoint or forks its DB", async () => {
-	const u1 = user("check status");
-	const a1 = reclaimAssistant([{ type: "text", text: "Clean." }]);
-	const cp1 = warmAfterTurn(context([system(), u1]), a1, "acp-branch", "/repo", 2);
-	const u2 = user("inspect huge log");
-	const a2 = readCall("c-big");
-	const r2 = toolResult("c-big", "x".repeat(200_000));
-	const a3 = reclaimAssistant([{ type: "text", text: "Found error." }]);
-	const cp2 = warmAfterTurn(context([system(), u1, a1, u2, a2, r2]), a3, "acp-branch", "/repo", 6);
-	const afterDrop = [system(), u1, a1, u2, a2, toolResult("c-big", "[#1 dropped]"), a3, user("fix it")];
-	for (const candidates of [[cp2, cp1], [cp1, cp2]]) {
-		const plan = planTurnFrom(context(afterDrop), "/repo", candidates);
-		assert.equal(plan.kind, "context-sync");
-		if (plan.kind === "context-sync") assert.equal(plan.maxStepIdx, 6);
-	}
+test("an edited aborted assistant cannot reuse its old native session", async () => {
 	const driver = new FakeDriver();
-	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver), sessions: { warm: cp2, checkpoints: [cp1, cp2] } });
-	await collect(stream(toPiModel(FALLBACK_MODELS[0]), context(afterDrop), { cwd: "/repo" } as never));
-	assert.equal(driver.requests[0].conversationId, "acp-branch");
-	assert.equal(driver.requests[0].contextBlock, undefined);
-	assert.ok(driver.requests[0].contextSync);
-	assert.equal(driver.requests[0].contextSync?.discardCancelledTail, undefined, "between-turn sync never discards native steps");
+	const roundTrips = new ToolRoundTrips(driver);
+	const sessions: AcpSessions = {};
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const u1 = user("original question");
+	const aborted = assistantMessage([{ type: "text", text: "partial answer" }]);
+	(aborted as { stopReason: string }).stopReason = "aborted";
+	sessions.warm = warmAfterTurn(context([system(), u1]), aborted, "acp-aborted", process.cwd());
+	const edited = assistantMessage([{ type: "text", text: "edited answer" }]);
+	await collect(stream(model, context([system(), u1, edited, user("continue")])));
+	assert.equal(driver.requests[0].conversationId, null);
+	assert.match(driver.requests[0].prompt, /<pi_history>[\s\S]*edited answer[\s\S]*<\/pi_history>/);
+	assert.ok(driver.requests[0].prompt.endsWith("continue"));
+	assert.ok(!driver.requests[0].prompt.includes("partial answer"));
 });

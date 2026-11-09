@@ -5,12 +5,11 @@
 // it produced natively. The next user turn reuses that session and sends only
 // the messages pi added since, so the server's native history stays a stable
 // prompt prefix (provider prompt caching) instead of being re-serialized.
-// Any divergence (compaction, edits, a cwd change, a failed turn with no
-// matching checkpoint) falls back to a fresh session that receives the whole
-// transcript, keeping pi the source of truth. A changed active tool set is
-// announced in the delta instead: the pi-bridge lists every tool an extension
+// Any divergence (compaction, edits, a cwd change, or a failed turn) falls back
+// to a fresh session that receives one bounded <pi_history> replay plus the
+// newest input, keeping pi the sole source of truth. A changed active tool set
+// is announced in the delta instead: the pi-bridge lists every tool an extension
 // can activate, so the session can already call it.
-
 import { createHash } from "node:crypto";
 import { getCurrentSystemMessage, getCurrentSystemPrompt, getCurrentTools, getSystemMessageText, type AssistantMessage, type Message, type TranscriptContext } from "@earendil-works/pi-ai";
 import type { TurnPart } from "./driver-types.js";
@@ -32,14 +31,6 @@ export interface WarmItem {
 	/** Normalized text of a `user` message, used for line-bounded prefix/suffix
 	 *  matching when an extension decorates only the active turn's prompt. */
 	userText?: string;
-	/** Original model-visible text used to identify a native step before a sync. */
-	syncText?: string;
-	/** Stable tool name and native media digest; never derived from dropped text. */
-	syncName?: string;
-	syncMediaHash?: string;
-	summary?: boolean;
-	/** An empty failed/aborted assistant turn (`isEmptyFailedAssistant`). */
-	failed?: boolean;
 }
 
 /** What a reusable ACP session is known to hold. */
@@ -57,22 +48,11 @@ export interface WarmSession {
 	keys?: string[];
 	/** Structured non-system message descriptors for extension-invariant matching. */
 	items?: WarmItem[];
-	/** Full persistent history (including summaries) for native trajectory sync. */
-	syncItems?: WarmItem[];
-	/** Highest `steps.idx` in `~/.gemini/antigravity-cli/conversations/<sessionId>.db`
-	 *  when this turn completed. Used to fork a truncated store on `/tree` rewind. */
-	maxStepIdx?: number;
-	/** Estimated bytes of conversation the ACP session holds (`messageBytes`
-	 *  units). It can exceed pi's current view of the same messages after a
-	 *  context manager (realctx drops, history summaries, sliding windows)
-	 *  shrank them; that excess is what a fresh session would reclaim.
-	 *  Absent on checkpoints recorded before this was tracked. */
-	bytes?: number;
 	systemPrompt: string;
 	tools: string;
 }
 
-export const FRESH_PROMPT = "Continue the task from the pi transcript, including any tool results or discarded previous attempt. Attached images are numbered in transcript order.";
+export const EMPTY_INPUT_CONTINUATION = "Continue the task from the latest tool results above.";
 
 export const DELTA_PROMPT = "Continue the task. The pi transcript delta lists, in order, the messages pi recorded after your last reply (other models' replies, tool results, user messages, or updated pi system instructions). Attached images are numbered in delta order. The same tool rules as before apply.";
 
@@ -157,7 +137,10 @@ function serializeRange(messages: Message[], imageBase = 0): { text: string; ima
 /** Maximum UTF-8 byte size of a `pi://transcript` or `pi://transcript-delta`
  *  resource block. `agy acp` truncates a single `session/prompt` past 192 KB
  *  from the end, which would cut off recent messages and the user's prompt. */
-export const MAX_TRANSCRIPT_BYTES = 160_000;
+export const LOCKED_REPLAY_BUDGET_BYTES = 160_000;
+export const UNLOCKED_REPLAY_BUDGET_BYTES = 2_200_000;
+/** Kept for warm transcript deltas, which still use agy's priming-part path. */
+export const MAX_TRANSCRIPT_BYTES = LOCKED_REPLAY_BUDGET_BYTES;
 
 
 /** Prompt of an earlier part: the model only acknowledges it. */
@@ -227,26 +210,6 @@ export function isHistorySummary(message: Message): boolean {
 }
 
 
-/** Byte weight of one attached image (about 1.5k tokens). */
-const IMAGE_BYTES = 6_000;
-/** Size of one message as the ACP session sees it: serialized text plus a
- *  fixed weight per image. System messages are not part of the conversation. */
-export function messageBytes(message: Message): number {
-	if (message.role === "system") return 0;
-	const serialized = serializeMessage(message, 0);
-	return utf8Bytes(serialized.text) + serialized.images.length * IMAGE_BYTES;
-}
-
-/** Total `messageBytes` of `messages`. */
-export function transcriptBytes(messages: readonly Message[]): number {
-	let total = 0;
-	for (const message of messages) total += messageBytes(message);
-	return total;
-}
-
-function utf8Bytes(text: string): number {
-	return Buffer.byteLength(text, "utf8");
-}
 
 
 /** Format a pi toolResult for the MCP bridge response, attaching any user
@@ -305,13 +268,79 @@ function renderSystemDelta(messages: readonly Message[]): string {
 	return parts.join("\n\n");
 }
 
-/** The whole transcript for a fresh ACP session. Stable and append-only, so
- *  consecutive fresh turns still share a prompt prefix. Past
- *  MAX_TRANSCRIPT_BYTES it is delivered in parts. */
-export function freshInput(context: TranscriptContext): AcpInput {
-	const system = renderPiSystemPrompt(context.messages);
-	const header = system ? `<pi-system>\n${system}\n</pi-system>` : "";
-	return transcriptInput("pi://transcript", FRESH_PROMPT, header, context.messages);
+/** Render a historical image as a placeholder; only live-input images are
+ *  attached to the rebuilt ACP prompt. */
+function serializeReplayMessage(message: Message): string {
+	return serializeMessage(message, 0).text.replace(/\[Attached image \d+\]/g, "[Image in original transcript]");
+}
+
+/** Keep a valid UTF-8 suffix of at most `maxBytes`, with an explicit marker. */
+function headWithinBytes(text: string, maxBytes: number): string {
+	const marker = "...[Earlier content omitted]...\n";
+	const available = maxBytes - Buffer.byteLength(marker, "utf8");
+	if (available <= 0) return "";
+	const buffer = Buffer.from(text, "utf8");
+	let start = Math.max(0, buffer.length - available);
+	while (start < buffer.length && ((buffer[start] ?? 0) & 0xc0) === 0x80) start++;
+	return marker + buffer.subarray(start).toString("utf8");
+}
+
+/** DSH-style bounded replay: whole messages newest-first, one omission note,
+ *  and only an oversized newest historical tool result may be truncated. */
+export function serializeHistoryReplay(messages: readonly Message[], maxBytes: number): string {
+	const rendered = messages.map(serializeReplayMessage).filter(Boolean);
+	if (Buffer.byteLength(rendered.join("\n\n"), "utf8") <= maxBytes) {
+		return rendered.length > 0 ? `<pi_history>\n${rendered.join("\n\n")}\n</pi_history>` : "";
+	}
+	const kept: string[] = [];
+	let used = 0;
+	let omitted = 0;
+	for (let index = rendered.length - 1; index >= 0; index--) {
+		const text = rendered[index]!;
+		const separator = kept.length > 0 ? 2 : 0;
+		const size = Buffer.byteLength(text, "utf8") + separator;
+		if (used + size <= maxBytes) {
+			kept.unshift(text);
+			used += size;
+			continue;
+		}
+		if (kept.length === 0 && maxBytes > 1024 && messages[index]?.role === "toolResult") {
+			const truncated = headWithinBytes(text, maxBytes);
+			if (truncated) kept.unshift(truncated);
+		}
+		omitted = index + 1;
+		break;
+	}
+	if (omitted > 0) kept.unshift(`[Earlier ${omitted} history messages omitted to fit the context replay budget]`);
+	return kept.length > 0 ? `<pi_history>\n${kept.join("\n\n")}\n</pi_history>` : "";
+}
+
+/** One fresh ACP prompt: Pi system instructions, bounded `<pi_history>`, then
+ *  the newest input verbatim. No native snapshot or SQLite rewrite is involved. */
+export function freshInput(context: TranscriptContext, maxBytes = UNLOCKED_REPLAY_BUDGET_BYTES): AcpInput {
+	// Fresh requests must include transient current-turn injections exactly once;
+	// only warm-prefix bookkeeping excludes them.
+	const visible = context.messages.filter((message) => message.role !== "system");
+	const last = visible.at(-1);
+	const inputStart = last?.role === "user" && !isHistorySummary(last) ? visible.length - 1 : visible.length;
+	const history = visible.slice(0, inputStart);
+	const trailing = visible.slice(inputStart);
+	const texts: string[] = [];
+	const images: AcpImage[] = [];
+	for (const message of trailing) {
+		const text = contentText(message.content);
+		if (text) texts.push(text);
+		for (const block of Array.isArray(message.content) ? message.content : []) {
+			if (block.type === "image") images.push({ data: block.data, mimeType: block.mimeType });
+		}
+	}
+	const live = texts.join("\n\n") || (trailing.length > 0 && images.length > 0 ? IMAGE_ONLY_PROMPT : EMPTY_INPUT_CONTINUATION);
+	const systemText = renderPiSystemPrompt(context.messages);
+	const system = systemText ? `<pi-system>\n${systemText}\n</pi-system>` : "";
+	const fixedBytes = Buffer.byteLength([system, live].filter(Boolean).join("\n\n"), "utf8");
+	const historyBytes = Math.max(0, maxBytes - fixedBytes - Buffer.byteLength("<pi_history>\n\n</pi_history>\n\n", "utf8") - 128);
+	const replay = serializeHistoryReplay(history, historyBytes);
+	return { prompt: [system, replay, live].filter(Boolean).join("\n\n"), images };
 }
 
 /** Content fingerprint: role, visible text, tool identities, and image bytes.
@@ -333,16 +362,6 @@ export function persistentMessages(messages: Message[]): Message[] {
 	return messages.filter((message) => !isEphemeralMessage(message));
 }
 
-/** A failed or aborted assistant turn that produced nothing. agy may hold no
- *  native step for it (a failed sync or spawn never reached the model) or a
- *  planner step (the prompt was delivered), so native trajectory sync maps it
- *  optionally. */
-export function isEmptyFailedAssistant(message: Message): boolean {
-	if (message.role !== "assistant" || (message.stopReason !== "error" && message.stopReason !== "aborted")) return false;
-	return message.content.every((block) =>
-		(block.type === "text" && !block.text.trim()) || (block.type === "thinking" && !block.thinking.trim()),
-	);
-}
 
 
 /** realctx placeholder for dropped user images: `· user image` or `· 2 user images`. */
@@ -406,26 +425,8 @@ function shortHash(key: string): string {
 }
 
 function toWarmItem(message: Exclude<Message, { role: "system" }>, key = messageKey(message)): WarmItem {
-	const item: WarmItem = {
-		role: message.role,
-		key: shortHash(key),
-	};
-	if (message.role === "user") {
-		item.userText = fullUserText(message.content);
-		item.syncText = contentText(message.content);
-		item.summary = isHistorySummary(message);
-	}
-	if (message.role === "toolResult") {
-		item.syncText = contentText(message.content);
-		item.syncName = message.toolName;
-	}
-	if (isEmptyFailedAssistant(message)) item.failed = true;
-	const media = (Array.isArray(message.content) ? message.content : []).filter((block) => block.type === "image");
-	if (media.length > 0) {
-		const hash = createHash("sha256");
-		for (const block of media) hash.update(block.mimeType).update("\0").update(block.data).update("\0");
-		item.syncMediaHash = hash.digest("hex");
-	}
+	const item: WarmItem = { role: message.role, key: shortHash(key) };
+	if (message.role === "user") item.userText = fullUserText(message.content);
 	return item;
 }
 
@@ -447,11 +448,6 @@ export function warmItemsForMessages(messages: Message[]): WarmItem[] {
 	return out;
 }
 
-export function syncItemsForMessages(messages: Message[]): WarmItem[] {
-	return persistentMessages(messages)
-		.filter((message): message is Exclude<Message, { role: "system" }> => message.role !== "system")
-		.map((message) => toWarmItem(message));
-}
 
 export function fingerprint(messages: Message[]): string {
 	const hash = createHash("sha256");
@@ -657,13 +653,12 @@ interface PersistentEntry {
 	message: Message;
 	key?: string;
 }
-/** Per-turn memo of everything planning derives from the transcript, shared
- *  by every warm-session candidate: message keys, prefix fingerprints, the
- *  match body, the tool/system keys, and the full fresh input. Planning stays
- *  linear in transcript size however many checkpoints are compared. */
+/** Per-turn memo of everything planning derives from the transcript: message
+ *  keys, prefix fingerprints, the match body, tool/system keys, and fresh input. */
 class TranscriptIndex {
 	readonly context: TranscriptContext;
 	readonly messages: Message[];
+	readonly replayBudgetBytes: number;
 	#persistent: PersistentEntry[] | undefined;
 	/** prefixHashes[k] = fingerprint of the first k persistent messages. */
 	#prefixHashes: string[] | undefined;
@@ -671,12 +666,11 @@ class TranscriptIndex {
 	#fresh: AcpInput | undefined;
 	#tools: string | undefined;
 	#systemPrompt: string | undefined;
-	/** bytesUpTo[i] = `messageBytes` of the persistent messages before persistent entry i. */
-	#bytesUpTo: number[] | undefined;
 
-	constructor(context: TranscriptContext) {
+	constructor(context: TranscriptContext, replayBudgetBytes = UNLOCKED_REPLAY_BUDGET_BYTES) {
 		this.context = context;
 		this.messages = context.messages;
+		this.replayBudgetBytes = replayBudgetBytes;
 	}
 
 	/** Persistent (non-ephemeral) messages with their transcript index; the
@@ -732,36 +726,9 @@ class TranscriptIndex {
 		return this.#body;
 	}
 
-	/** `messageBytes` of the persistent messages before transcript index `end`. */
-	bytesBefore(end: number): number {
-		const persistent = this.persistent();
-		if (!this.#bytesUpTo) {
-			const sums = [0];
-			let total = 0;
-			for (const entry of persistent) {
-				total += messageBytes(entry.message);
-				sums.push(total);
-			}
-			this.#bytesUpTo = sums;
-		}
-		let count = 0;
-		while (count < persistent.length && (persistent[count]?.index ?? Infinity) < end) count++;
-		return this.#bytesUpTo[count] ?? 0;
-	}
-
-	/** Whether the provider's prompt cache has gone cold since the latest reply. */
-	cold(coldMs: number, now = Date.now()): boolean {
-		for (let i = this.messages.length - 1; i >= 0; i--) {
-			const message = this.messages[i];
-			if (message?.role !== "assistant") continue;
-			const at = message.timestamp;
-			return coldMs > 0 && typeof at === "number" && at > 0 && now - at >= coldMs;
-		}
-		return false;
-	}
 
 	fresh(): AcpInput {
-		this.#fresh ??= freshInput(this.context);
+		this.#fresh ??= freshInput(this.context, this.replayBudgetBytes);
 		return this.#fresh;
 	}
 
@@ -781,39 +748,13 @@ export type TurnPlan =
 	| {
 		kind: "warm";
 		sessionId: string;
-		maxStepIdx?: number;
 		input: AcpInput;
 		fallback: AcpInput;
 		deltaMessages: number;
-		/** Bytes the session holds beyond pi's current view of its prefix
-		 *  (see `WarmSession.bytes`); carried into the next checkpoint. */
-		hidden: number;
-	}
-	| {
-		kind: "context-sync";
-		sessionId: string;
-		maxStepIdx?: number;
-		/** Current effective pi context, used for native trajectory edits. */
-		messages: Message[];
-		/** Native-prefix identities from the matched checkpoint. */
-		previousItems: WarmItem[];
-		/** Whether input is a genuinely new user message rather than continuation. */
-		hasNewUser: boolean;
-		/** A genuinely new user input, or an empty native continuation. */
-		input: AcpInput;
-		deltaMessages: number;
 	};
-type WarmMatch =
-	| { warm: WarmSession; end: number; delta: Message[]; hidden: number }
-	| { reason: string; warm?: WarmSession; end?: number; delta?: Message[] };
+type WarmMatch = { warm: WarmSession; end: number; delta: Message[] } | { reason: string };
 
-/** Bytes `warm` holds beyond pi's view of the messages it matched (negative
- *  when pi's view grew), or undefined for checkpoints without `bytes`. */
-function hiddenBytes(index: TranscriptIndex, warm: WarmSession, end: number): number | undefined {
-	return warm.bytes === undefined ? undefined : warm.bytes - index.bytesBefore(end);
-}
-
-/** Whether `warm` matches a prefix of this transcript, before reclaim policy. */
+/** Whether `warm` exactly matches a prefix of this transcript. */
 function matchWarmPrefix(index: TranscriptIndex, cwd: string, warm: WarmSession | undefined): WarmMatch {
 	if (!warm) return { reason: "no-session" };
 	if (warm.cwd !== cwd) return { reason: "cwd" };
@@ -827,41 +768,14 @@ function matchWarmPrefix(index: TranscriptIndex, cwd: string, warm: WarmSession 
 	if (split.delta.length === 0) return { reason: "history-shrank" };
 	if (!split.delta.some((message) => message.role === "user" || message.role === "toolResult")) return { reason: "no-user-message" };
 	const prefix = persistentMessages(index.messages.slice(0, split.end));
-	if (warm.contentHash !== contentFingerprint(prefix)) {
-		return { reason: "context-sync", warm, end: split.end, delta: split.delta };
-	}
-	const hidden = hiddenBytes(index, warm, split.end) ?? 0;
-	return { warm, end: split.end, delta: split.delta, hidden };
+	if (warm.contentHash !== contentFingerprint(prefix)) return { reason: "history-changed" };
+	return { warm, end: split.end, delta: split.delta };
 }
 
 
 function planFromMatch(index: TranscriptIndex, match: WarmMatch): TurnPlan {
-	if ("reason" in match) {
-		if (match.reason === "context-sync" && match.warm && match.end !== undefined && match.delta) {
-			const texts: string[] = [];
-			const images: AcpImage[] = [];
-			for (const message of match.delta) {
-				if (message.role !== "user" || isHistorySummary(message)) continue;
-				const text = contentText(message.content);
-				if (text) texts.push(text);
-				for (const block of Array.isArray(message.content) ? message.content : []) {
-					if (block.type === "image") images.push({ data: block.data, mimeType: block.mimeType });
-				}
-			}
-			return {
-				kind: "context-sync",
-				sessionId: match.warm.sessionId,
-				maxStepIdx: match.warm.maxStepIdx,
-				messages: persistentMessages(index.messages),
-				previousItems: match.warm.syncItems ?? match.warm.items ?? [],
-				hasNewUser: texts.length > 0 || images.length > 0,
-				input: { prompt: texts.join("\n\n") || (images.length > 0 ? IMAGE_ONLY_PROMPT : ""), images },
-				deltaMessages: match.delta.length,
-			};
-		}
-		return { kind: "fresh", input: index.fresh(), reason: match.reason };
-	}
-	const { warm, end, delta, hidden } = match;
+	if ("reason" in match) return { kind: "fresh", input: index.fresh(), reason: match.reason };
+	const { warm, end, delta } = match;
 	const systemPrompt = index.systemPrompt();
 	const systemChanged = systemPrompt !== warm.systemPrompt && getCurrentSystemPrompt(index.messages) !== warm.systemPrompt;
 	const tools = index.tools();
@@ -896,15 +810,13 @@ function planFromMatch(index: TranscriptIndex, match: WarmMatch): TurnPlan {
 	return {
 		kind: "warm",
 		sessionId: warm.sessionId,
-		maxStepIdx: warm.maxStepIdx,
 		input,
 		fallback: index.fresh(),
 		deltaMessages: delta.length,
-		hidden,
 	};
 }
 
-/** The active pi tool set after it changed since the session's checkpoint. */
+/** The active pi tool set after it changed since the session's warm snapshot. */
 function toolsUpdate(tools: string): string {
 	const names = tools.split(",").filter(Boolean);
 	const text = names.length > 0
@@ -914,37 +826,11 @@ function toolsUpdate(tools: string): string {
 }
 
 
-export function planTurn(context: TranscriptContext, cwd: string, warm: WarmSession | undefined): TurnPlan {
-	const index = new TranscriptIndex(context);
+export function planTurn(context: TranscriptContext, cwd: string, warm: WarmSession | undefined, replayBudgetBytes?: number): TurnPlan {
+	const index = new TranscriptIndex(context, replayBudgetBytes);
 	return planFromMatch(index, matchWarmPrefix(index, cwd, warm));
 }
 
-/** Plan against remembered sessions, most preferred first. A rewritten prefix
- * belongs to its exact native branch and is never bypassed via an older warm
- * checkpoint; but an exact match on a more preferred checkpoint that reaches
- * at least as far wins over a rewrite against an older one, whose native
- * history may since have been rewritten or extended. With none usable, report
- * the first candidate's fresh reason. */
-export function planTurnFrom(context: TranscriptContext, cwd: string, candidates: readonly WarmSession[]): TurnPlan {
-	const index = new TranscriptIndex(context);
-	let best: Extract<WarmMatch, { warm: WarmSession }> | undefined;
-	let firstFailure: { reason: string } | undefined;
-	for (const candidate of candidates) {
-		const match = matchWarmPrefix(index, cwd, candidate);
-		if ("reason" in match) {
-			if (match.reason === "context-sync" && match.delta && (!best || match.delta.length < best.delta.length)) {
-				return planFromMatch(index, match);
-			}
-			if (match.reason !== "context-sync") firstFailure ??= match;
-			continue;
-		}
-		if (!best || match.delta.length < best.delta.length) {
-			best = match;
-			if (best.delta.length === 1) break;
-		}
-	}
-	return planFromMatch(index, best ?? (firstFailure ?? matchWarmPrefix(index, cwd, candidates[0])));
-}
 
 /** State after a completed turn: the session holds pi's persistent messages
  *  plus the final assistant message pi is about to record. */
@@ -953,26 +839,19 @@ export function warmAfterTurn(
 	final: AssistantMessage,
 	sessionId: string,
 	cwd: string,
-	maxStepIdx?: number,
-	/** Bytes the session held beyond pi's view of the turn's prefix
-	 *  (`TurnPlan.hidden`; 0 for a fresh session). */
-	hidden = 0,
 ): WarmSession {
 	const messages = [...persistentMessages(context.messages), final];
 	const warm: WarmSession = {
 		sessionId,
 		cwd,
 		count: messages.length,
-		bytes: Math.max(0, transcriptBytes(messages) + hidden),
 		hash: fingerprint(messages),
 		contentHash: contentFingerprint(messages),
 		keys: nonHistoryKeys(messages),
 		items: warmItemsForMessages(messages),
-		syncItems: syncItemsForMessages(messages),
 		systemPrompt: renderPiSystemPrompt(context.messages),
 		tools: toolsKey(context),
 	};
-	if (maxStepIdx !== undefined && maxStepIdx >= 0) warm.maxStepIdx = maxStepIdx;
 	return warm;
 }
 
@@ -986,16 +865,11 @@ export interface SessionEntryLike {
 
 function toWarmItemEntry(raw: unknown): WarmItem | null {
 	if (!raw || typeof raw !== "object") return null;
-	const candidate = raw as { role?: unknown; key?: unknown; userText?: unknown; syncText?: unknown; syncName?: unknown; syncMediaHash?: unknown; summary?: unknown; failed?: unknown };
+	const candidate = raw as { role?: unknown; key?: unknown; userText?: unknown };
 	if (candidate.role !== "user" && candidate.role !== "assistant" && candidate.role !== "toolResult") return null;
 	if (typeof candidate.key !== "string" || !candidate.key) return null;
 	const item: WarmItem = { role: candidate.role, key: candidate.key };
 	if (typeof candidate.userText === "string") item.userText = candidate.userText;
-	if (typeof candidate.syncText === "string") item.syncText = candidate.syncText;
-	if (typeof candidate.syncName === "string") item.syncName = candidate.syncName;
-	if (typeof candidate.syncMediaHash === "string") item.syncMediaHash = candidate.syncMediaHash;
-	if (typeof candidate.summary === "boolean") item.summary = candidate.summary;
-	if (candidate.failed === true) item.failed = true;
 	return item;
 }
 
@@ -1017,51 +891,17 @@ function toWarmSession(data: Partial<WarmSession> | null | undefined): WarmSessi
 		const items = data.items.map(toWarmItemEntry).filter((item): item is WarmItem => item !== null);
 		if (items.length > 0) warm.items = items;
 	}
-	if (Array.isArray(data.syncItems)) {
-		const items = data.syncItems.map(toWarmItemEntry).filter((item): item is WarmItem => item !== null);
-		if (items.length > 0) warm.syncItems = items;
-	}
-	if (data.maxStepIdx !== undefined && Number.isFinite(data.maxStepIdx)) {
-		warm.maxStepIdx = Number(data.maxStepIdx);
-	}
-	if (data.bytes !== undefined && Number.isFinite(data.bytes)) {
-		warm.bytes = Number(data.bytes);
-	}
 	return warm;
 }
 
-/** Reconstruct `warm` and chronological `checkpoints` from pi's session entries.
- *  Branch entries take priority at the tail; off-branch entries (such as a
- *  custom entry immediately following an assistant message selected in `/tree`
- *  or checkpoints on sibling branches) are included earlier in `checkpoints`
- *  so `selectTurnPlan` can match any turn across `/reload`, `/resume`, or `/tree`. */
-export function restoreWarmSessions(
-	branchEntries: readonly SessionEntryLike[],
-	allEntries: readonly SessionEntryLike[] = branchEntries,
-): { warm: WarmSession | undefined; checkpoints: WarmSession[] } {
-	const extract = (entries: readonly SessionEntryLike[]): WarmSession[] => {
-		const out: WarmSession[] = [];
-		for (const entry of entries) {
-			if (entry.type !== "custom" || entry.customType !== WARM_SESSION_ENTRY) continue;
-			const warm = toWarmSession(entry.data);
-			if (warm) out.push(warm);
-		}
-		return out;
-	};
-	const onBranch = extract(branchEntries);
-	const fromAll = extract(allEntries);
-	const seen = new Set<string>();
-	const keyOf = (w: WarmSession) => `${w.sessionId}:${w.count}:${w.hash}:${w.maxStepIdx ?? -1}`;
-	for (const w of onBranch) seen.add(keyOf(w));
-	const offBranch = fromAll.filter((w) => {
-		const k = keyOf(w);
-		if (seen.has(k)) return false;
-		seen.add(k);
-		return true;
-	});
-	const checkpoints = [...offBranch, ...onBranch];
-	return {
-		warm: onBranch.at(-1) ?? checkpoints.at(-1),
-		checkpoints,
-	};
+/** Restore only the latest warm entry on Pi's current branch. Off-branch entries
+ *  are deliberately ignored: rewinds and edits rebuild instead of guessing agy state. */
+export function restoreWarmSessions(branchEntries: readonly SessionEntryLike[]): { warm: WarmSession | undefined } {
+	for (let index = branchEntries.length - 1; index >= 0; index--) {
+		const entry = branchEntries[index]!;
+		if (entry.type !== "custom" || entry.customType !== WARM_SESSION_ENTRY) continue;
+		const warm = toWarmSession(entry.data);
+		if (warm) return { warm };
+	}
+	return { warm: undefined };
 }

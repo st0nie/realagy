@@ -3,7 +3,6 @@
 // store, and the extension wiring depend on this interface only, so tests can
 // substitute a scripted driver.
 
-import type { Message } from "@earendil-works/pi-ai";
 import type { NativeToolResult } from "./native-tools.js";
 export interface DriverTurnRequest {
 	cwd: string;
@@ -30,16 +29,6 @@ export interface DriverTurnRequest {
 	 *  continued and a fresh session is created. Without it a delta prompt
 	 *  would reach a session that never saw the earlier turns. */
 	fallback?: { prompt: string; images?: Array<{ data: string; mimeType: string }>; contextBlock?: { uri: string; text: string }; parts?: TurnPart[] };
-	/** Synchronize already-sent pi history into agy's native trajectory before
-	 *  this prompt. Empty prompts are native continuations, not user messages. */
-	contextSync?: {
-		messages: Message[];
-		previousItems: Array<{ role: "user" | "assistant" | "toolResult"; key: string; userText?: string; syncText?: string; syncName?: string; syncMediaHash?: string; summary?: boolean }>;
-		hasNewUser: boolean;
-		/** The parked native turn was cancelled for this sync; its unmapped
-		 *  trailing planner/tool steps are discarded. */
-		discardCancelledTail?: boolean;
-	};
 	signal?: AbortSignal;
 	/** Inactivity cap in minutes (default 5; parked tool calls pause it).
 	 *  Fractional values are valid. 0 disables the cap. */
@@ -110,11 +99,9 @@ export type DriverActivity =
 			/** Explicit parallel request: emit these genuine Pi calls in one message.
 			 * The outer callId remains the single MCP/poll handle. */
 			calls?: Array<{ callId: string; name: string; args: Record<string, unknown> }>;
-			/** Set by the driver: the session the call came from, and the
-			 *  store's highest step index when it arrived. The session then holds
-			 *  the transcript up to this call's toolUse message. */
+			/** Set by the driver: the session the call came from. The session then
+			 *  holds the transcript up to this call's toolUse message. */
 			sessionId?: string;
-			maxStepIdx?: number;
 	  };
 
 export interface TurnOutcome {
@@ -125,8 +112,6 @@ export interface TurnOutcome {
 	usage?: AgyUsage;
 	contextUsage?: AgyContextUsage;
 	aborted: boolean;
-	/** Highest `steps.idx` in `<conversationId>.db` when this turn settled. */
-	maxStepIdx?: number;
 	/** Whether the session recorded this turn's (final) prompt: always for a
 	 *  completed turn; for an aborted one, when the conversation store holds
 	 *  its user-input step (without a store: when the prompt was sent). */
@@ -154,9 +139,6 @@ export interface TurnDriver {
 	reentry(): TurnHandle | null;
 	/** Resume the inactivity guard after a parked pi tool call settles. */
 	kickIdle(): void;
-	/** Resolve once the active turn's pending pi-bridge calls have completed
-	 *  natively; rejects when agy does not confirm them in time. */
-	awaitBridgeResults(timeoutMs?: number): Promise<void>;
 	/** Abort the active turn (if any) and resolve once it has settled. */
 	cancelActive(reason: string): Promise<void>;
 	set onTurnEnd(fn: ((outcome: TurnOutcome) => void) | undefined);

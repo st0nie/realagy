@@ -1,6 +1,5 @@
-// Conversation-store evidence behind warm checkpoints of aborted turns and
-// tool boundaries: user-input steps, the store step a turn reached, and
-// forking at an aborted turn's checkpoint.
+// Read-only conversation-store evidence for prompt delivery and exact usage.
+// Session reuse never depends on a store step or a native checkpoint.
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -8,7 +7,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { test, vi } from "vitest";
 import { AcpDriver } from "../src/acp/driver.js";
-import { conversationDbPath, lastStepIdx, resolveSessionAtStep, userInputSince } from "../src/acp/step-usage.js";
+import { conversationDbPath, lastStepIdx, userInputSince } from "../src/acp/step-usage.js";
 import type { DriverActivity, DriverTurnRequest, TurnHandle } from "../src/driver-types.js";
 
 type WireRequest = { id?: number; method: string; params: Record<string, unknown> };
@@ -95,7 +94,6 @@ test("an Esc during a streaming prompt reports the delivered prompt and the stor
 		assert.equal(outcome.aborted, true);
 		assert.equal(outcome.conversationId, "session-1");
 		assert.equal(outcome.promptDelivered, true, "agy stored the prompt's user-input step");
-		assert.equal(outcome.maxStepIdx, 0);
 		assert.equal(lastStepIdx(conversationDbPath(dbDir, "session-1")!), 0);
 
 		// An abort before the prompt was sent leaves the session untouched.
@@ -111,7 +109,6 @@ test("an Esc during a streaming prompt reports the delivered prompt and the stor
 		await drain(third);
 		const done = await third.outcome;
 		assert.equal(done.promptDelivered, true);
-		assert.equal(done.maxStepIdx, 2, "user input 1 (cancelled), user input 2 + agent step");
 	} finally {
 		await driver.close();
 	}
@@ -131,30 +128,15 @@ test("bridge calls carry their session and store step, and siblings of one model
 		controller.abort();
 		const activities = await drain(handle);
 		const calls = activities.filter((activity): activity is Extract<DriverActivity, { type: "bridge_call" }> => activity.type === "bridge_call");
-		assert.deepEqual(calls.map(({ callId, sessionId, maxStepIdx }) => ({ callId, sessionId, maxStepIdx })), [
-			{ callId: "c1", sessionId: "session-1", maxStepIdx: 1 },
-			{ callId: "c2", sessionId: "session-1", maxStepIdx: 1 },
+		assert.deepEqual(calls.map(({ callId, sessionId }) => ({ callId, sessionId })), [
+			{ callId: "c1", sessionId: "session-1" },
+			{ callId: "c2", sessionId: "session-1" },
 		]);
 		const usage = activities.filter((activity) => activity.type === "step_usage").map((activity) => activity.type === "step_usage" && activity.usage);
 		assert.equal(usage.length, 2);
 		assert.deepEqual(usage[0], { input: 2000, output: 40, cacheRead: 8000, cacheWrite: 0, contextTokens: 10_040, steps: 1 });
 		assert.deepEqual(usage[1], { input: 20, output: 0, cacheRead: 80, cacheWrite: 0, contextTokens: 10_040, steps: 0 }, "sibling placeholder, same cache ratio");
-		assert.equal((await handle.outcome).maxStepIdx, 1);
 	} finally {
 		await driver.close();
 	}
-});
-
-test("an aborted turn's checkpoint resumes its store as is and forks it once later turns advanced it", () => {
-	const dir = tmp();
-	// Turn 1 completed (steps 0-1); turn 2 was cancelled after its prompt (step 2).
-	store(path.join(dir, "s1.db"), [[0, 14, null], [1, 15, metadata(10, 1, 0)], [2, 14, null]]);
-	assert.equal(resolveSessionAtStep(dir, "s1", 2), "s1", "continue after Esc: no fork");
-	// `continue` advanced the store; a /tree rewind to the aborted turn forks it.
-	store(path.join(dir, "s1.db"), [[3, 14, null], [4, 15, metadata(10, 1, 0)]]);
-	const forked = resolveSessionAtStep(dir, "s1", 2);
-	assert.notEqual(forked, "s1");
-	assert.equal(lastStepIdx(path.join(dir, `${forked}.db`)), 2);
-	assert.equal(userInputSince(path.join(dir, `${forked}.db`), 1), true, "the fork keeps the aborted turn's prompt");
-	assert.equal(lastStepIdx(path.join(dir, "s1.db")), 4, "the other branch's store is untouched");
 });

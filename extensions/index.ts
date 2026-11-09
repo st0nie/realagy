@@ -36,7 +36,7 @@ import {
 	parallelErrorResult,
 	parseParallelCalls,
 } from "../src/parallel.js";
-import { restoreWarmSessions, WARM_SESSION_ENTRY, type SessionEntryLike, type WarmSession } from "../src/transcript.js";
+import { LOCKED_REPLAY_BUDGET_BYTES, restoreWarmSessions, UNLOCKED_REPLAY_BUDGET_BYTES, WARM_SESSION_ENTRY, type SessionEntryLike, type WarmSession } from "../src/transcript.js";
 import { treeRestoreExtras, type LoadoutEntry } from "../src/tool-loadout.js";
 /** Widget key of the live panel of running agy work. */
 const AGY_WORK_WIDGET = "agy-work";
@@ -153,14 +153,16 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 
 	let pendingWarmEntry: WarmSession | null = null;
 	const sessions: AcpSessions = {
-		conversationsDir: () => defaultConversationsDir(),
 		onWarm: (warm) => {
 			pendingWarmEntry = warm;
 		},
 	};
 	const meter = new UsageMeter();
 	let ready = false;
-	const streamSimple = createStreamSimple({ entries, driver, roundTrips, sessions, meter });
+	const streamSimple = createStreamSimple({
+		entries, driver, roundTrips, sessions, meter,
+		replayBudgetBytes: () => config.noAutoCompaction ? UNLOCKED_REPLAY_BUDGET_BYTES : LOCKED_REPLAY_BUDGET_BYTES,
+	});
 	const registerModels = () => {
 		// Sign-in belongs to the agy CLI. Ambient-only auth (no `login`) means pi
 		// never prompts for or stores a key; the provider counts as configured
@@ -210,12 +212,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const syncWarmFromSession = (ctx: { sessionManager?: { getBranch?: () => unknown[]; getEntries?: () => unknown[] } }): void => {
 		pendingWarmEntry = null;
 		sessions.parked = undefined;
-		sessions.step = undefined;
 		const branch = (ctx.sessionManager?.getBranch?.() ?? []) as readonly SessionEntryLike[];
-		const all = (ctx.sessionManager?.getEntries?.() ?? branch) as readonly SessionEntryLike[];
-		const restored = restoreWarmSessions(branch, all);
+		const restored = restoreWarmSessions(branch);
 		sessions.warm = restored.warm;
-		sessions.checkpoints = restored.checkpoints;
 	};
 
 	pi.on("session_start", (_event, ctx) => {
@@ -232,7 +231,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		toolsBeforeTree = new Set(pi.getActiveTools());
 	});
 	pi.on("session_tree", (_event, ctx) => {
-		syncWarmFromSession(ctx);
+		// Rewind/edit invalidates the native cache unconditionally. The next turn
+		// rebuilds from Pi's effective <pi_history> instead of forking agy's DB.
+		sessions.warm = undefined;
+		sessions.parked = undefined;
 		const before = toolsBeforeTree;
 		toolsBeforeTree = undefined;
 		if (!before) return;
@@ -244,9 +246,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	pi.on("session_compact", () => {
 		pendingWarmEntry = null;
 		sessions.parked = undefined;
-		sessions.step = undefined;
 		sessions.warm = undefined;
-		sessions.checkpoints = undefined;
 	});
 	pi.on("turn_end", () => {
 		if (!pendingWarmEntry) return;
@@ -266,9 +266,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		shutdownController.abort();
 		pendingWarmEntry = null;
 		sessions.parked = undefined;
-		sessions.step = undefined;
 		sessions.warm = undefined;
-		sessions.checkpoints = undefined;
 		roundTrips.failAll("pi session shut down", { includeEscalated: true });
 		void driver.close();
 		if (bridge) void bridge.close();

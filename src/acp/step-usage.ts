@@ -9,7 +9,6 @@
 //   zero for Gemini's implicit caching).
 // Every failure degrades to `undefined`: this is an internal format.
 
-import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
@@ -134,14 +133,14 @@ export function tokensFromMetadata(metadata: Uint8Array, idx: number): StepToken
 
 type Database = InstanceType<SqliteModule["DatabaseSync"]>;
 
-/** Run `fn` on a short-lived connection; any failure (missing store, lock,
- *  schema drift, no node:sqlite) yields undefined. */
-function withDb<T>(dbPath: string, readOnly: boolean, fn: (db: Database) => T): T | undefined {
+/** Run `fn` on a short-lived read-only connection; any failure (missing store,
+ *  lock, schema drift, no node:sqlite) yields undefined. */
+function withDb<T>(dbPath: string, fn: (db: Database) => T): T | undefined {
 	const mod = loadSqlite();
 	if (!mod || !fs.existsSync(dbPath)) return undefined;
 	let db: Database | undefined;
 	try {
-		db = new mod.DatabaseSync(dbPath, { readOnly, timeout: BUSY_TIMEOUT_MS } as ConstructorParameters<SqliteModule["DatabaseSync"]>[1]);
+		db = new mod.DatabaseSync(dbPath, { readOnly: true, timeout: BUSY_TIMEOUT_MS } as ConstructorParameters<SqliteModule["DatabaseSync"]>[1]);
 		return fn(db);
 	} catch {
 		return undefined;
@@ -158,7 +157,7 @@ function maxIdx(db: Database): number {
 /** Model-call steps with token stats after `afterIdx` (oldest first) and the
  *  store's highest step index, read on one connection. */
 export function readStepState(dbPath: string, afterIdx = -1): { steps: StepTokens[]; maxIdx: number } | undefined {
-	return withDb(dbPath, true, (db) => {
+	return withDb(dbPath, (db) => {
 		const rows = db.prepare(
 			"SELECT idx, metadata FROM steps WHERE step_type = ? AND idx > ? AND metadata IS NOT NULL ORDER BY idx ASC",
 		).all(STEP_TYPE_AGENT, afterIdx) as Array<{ idx: number | bigint; metadata: Uint8Array | null }>;
@@ -175,109 +174,15 @@ export function readStepState(dbPath: string, afterIdx = -1): { steps: StepToken
 /** Whether the store holds a user-input step after `afterIdx`: proof that a
  *  prompt sent since then reached the session. undefined when unreadable. */
 export function userInputSince(dbPath: string, afterIdx: number): boolean | undefined {
-	return withDb(dbPath, true, (db) =>
+	return withDb(dbPath, (db) =>
 		db.prepare("SELECT 1 AS found FROM steps WHERE step_type = ? AND idx > ? LIMIT 1").get(STEP_TYPE_USER_INPUT, afterIdx) !== undefined);
 }
 
 /** Highest step index currently stored (−1 for an empty or missing store). */
 export function lastStepIdx(dbPath: string): number {
-	return withDb(dbPath, true, maxIdx) ?? -1;
+	return withDb(dbPath, maxIdx) ?? -1;
 }
 
-function replaceBufferToken(source: Uint8Array, fromText: string, toText: string): Buffer {
-	const buf = Buffer.from(source);
-	if (!fromText || fromText === toText) return buf;
-	return Buffer.from(buf.toString("latin1").split(fromText).join(toText), "latin1");
-}
-
-function pruneForkedTables(
-	db: Database,
-	sessionId: string,
-	newSessionId: string,
-	maxStepIdx: number,
-): void {
-	db.prepare("DELETE FROM steps WHERE idx > ?").run(maxStepIdx);
-
-	try {
-		const genRows = db.prepare("SELECT idx, data FROM gen_metadata").all() as Array<{ idx: number | bigint; data: Uint8Array | null }>;
-		const delGen = db.prepare("DELETE FROM gen_metadata WHERE idx = ?");
-		for (const row of genRows) {
-			if (!(row.data instanceof Uint8Array)) continue;
-			const packed = parseProtoFields(row.data).get(2);
-			const firstStep = packed?.wire === 2 ? readVarint(packed.bytes, 0) : undefined;
-			if (firstStep && firstStep[0] > maxStepIdx) delGen.run(row.idx);
-		}
-	} catch { /* optional auxiliary table */ }
-
-	try {
-		const execRows = db.prepare("SELECT idx, data FROM executor_metadata").all() as Array<{ idx: number | bigint; data: Uint8Array | null }>;
-		const delExec = db.prepare("DELETE FROM executor_metadata WHERE idx = ?");
-		for (const row of execRows) {
-			if (!(row.data instanceof Uint8Array)) continue;
-			const endStep = parseProtoFields(row.data).get(3);
-			if (endStep?.wire === 0 && endStep.value > maxStepIdx) delExec.run(row.idx);
-		}
-	} catch { /* optional auxiliary table */ }
-
-	const newTrajectoryId = randomUUID();
-	let oldTrajectoryId = "";
-	try {
-		const metaRow = db.prepare("SELECT trajectory_id FROM trajectory_meta LIMIT 1").get() as { trajectory_id?: string | null } | undefined;
-		if (metaRow?.trajectory_id) oldTrajectoryId = metaRow.trajectory_id;
-		db.prepare("UPDATE trajectory_meta SET trajectory_id = ?, cascade_id = ?").run(newTrajectoryId, newSessionId);
-	} catch { /* optional metadata table */ }
-
-	try {
-		const blobRow = db.prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'").get() as { data?: Uint8Array | null } | undefined;
-		if (blobRow?.data instanceof Uint8Array) {
-			const withSession = replaceBufferToken(blobRow.data, sessionId, newSessionId);
-			const patched = oldTrajectoryId ? replaceBufferToken(withSession, oldTrajectoryId, newTrajectoryId) : withSession;
-			db.prepare("UPDATE trajectory_metadata_blob SET data = ? WHERE id = 'main'").run(patched);
-		}
-	} catch { /* optional metadata blob */ }
-}
-
-/** Fork `<sessionId>.db` into a new `<forkedSessionId>.db` truncated to `idx <= maxStepIdx`
- *  so a `/tree` rewind to an earlier turn loads the exact ACP state at that turn
- *  without mutating the later branch's store. The stores run in WAL mode, so the
- *  copy is a `VACUUM INTO` snapshot (a file copy would miss steps still in the
- *  `-wal` file). Returns `undefined` if unavailable. */
-export function forkConversationAtStep(
-	dir: string,
-	sessionId: string,
-	maxStepIdx: number,
-	newSessionId: string = randomUUID(),
-): string | undefined {
-	const srcPath = conversationDbPath(dir, sessionId);
-	const dstPath = conversationDbPath(dir, newSessionId);
-	if (!srcPath || !dstPath || maxStepIdx < 0 || fs.existsSync(dstPath)) return undefined;
-	const forked =
-		withDb(srcPath, true, (db) => db.prepare("VACUUM INTO ?").run(dstPath)) !== undefined &&
-		withDb(dstPath, false, (db) => {
-			pruneForkedTables(db, sessionId, newSessionId, maxStepIdx);
-			return true;
-		}) === true;
-	if (forked) return newSessionId;
-	for (const file of [dstPath, `${dstPath}-wal`, `${dstPath}-shm`, `${dstPath}-journal`]) {
-		try { fs.rmSync(file, { force: true }); } catch { /* ignore cleanup failure */ }
-	}
-	return undefined;
-}
-
-/** Return `sessionId` when its SQLite store is still at `maxStepIdx`, or fork a
- *  truncated copy when later turns have advanced `<sessionId>.db` past `maxStepIdx`. */
-export function resolveSessionAtStep(
-	dir: string | undefined,
-	sessionId: string,
-	maxStepIdx: number | undefined,
-): string {
-	if (!dir || maxStepIdx === undefined || maxStepIdx < 0) return sessionId;
-	const dbPath = conversationDbPath(dir, sessionId);
-	if (!dbPath || !fs.existsSync(dbPath)) return sessionId;
-	const currentMax = lastStepIdx(dbPath);
-	if (currentMax <= maxStepIdx) return sessionId;
-	return forkConversationAtStep(dir, sessionId, maxStepIdx) ?? sessionId;
-}
 
 export function summarizeSteps(steps: StepTokens[]): StepUsage | undefined {
 	const last = steps.at(-1);

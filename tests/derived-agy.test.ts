@@ -4,7 +4,6 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, test } from "vitest";
-import { patchAgyNativeContinuation } from "../src/acp/continuation-patch.js";
 import { deriveAgy } from "../src/acp/derived-agy.js";
 import { patchAgyOutputTruncation } from "../src/acp/output-patch.js";
 
@@ -52,18 +51,18 @@ function setup(source: Buffer): { sourcePath: string; cacheDir: string; hash: st
 	return { sourcePath, cacheDir: path.join(root, "derived-bin"), hash: crypto.createHash("sha256").update(source).digest("hex") };
 }
 
-const both = (source: Buffer): Buffer => patchAgyNativeContinuation(patchAgyOutputTruncation(source).data).data;
+const patched = (source: Buffer): Buffer => patchAgyOutputTruncation(source).data;
 
-test("one derivative carries both patches, is cached by source hash, and leaves the source untouched", async () => {
+test("the full-output derivative is cached by source hash and leaves the source untouched", async () => {
 	const source = fixture();
 	const { sourcePath, cacheDir, hash } = setup(source);
 	const logs: string[] = [];
 	const options = { fullMcpOutput: true, cacheDir, log: (msg: string) => logs.push(msg) };
 	const [first, concurrent] = await Promise.all([deriveAgy(sourcePath, options), deriveAgy(sourcePath, options)]);
 	assert.equal(first, concurrent);
-	assert.equal(path.basename(first), `agy-${hash}-full-mcp-output+native-continuation`);
+	assert.equal(path.basename(first), `agy-${hash}-full-mcp-output`);
 	assert.deepEqual(fs.readdirSync(cacheDir).sort(), [path.basename(first), `${path.basename(first)}.sha256`]);
-	assert.deepEqual(fs.readFileSync(first), both(source));
+	assert.deepEqual(fs.readFileSync(first), patched(source));
 	assert.deepEqual(fs.readFileSync(sourcePath), source);
 	assert.ok(fs.statSync(first).mode & 0o111);
 	assert.deepEqual(logs, ["agy-derived"]);
@@ -79,36 +78,25 @@ test("a corrupt derivative is rebuilt", async () => {
 	const output = await deriveAgy(sourcePath, { fullMcpOutput: true, cacheDir });
 	fs.writeFileSync(output, fixture());
 	assert.equal(await deriveAgy(sourcePath, { fullMcpOutput: true, cacheDir }), output);
-	assert.deepEqual(fs.readFileSync(output), both(fixture()));
+	assert.deepEqual(fs.readFileSync(output), patched(fixture()));
 });
 
-test("an agy upgrade or settings change replaces the single derivative", async () => {
+test("an agy upgrade replaces the derivative; disabling patches uses the source", async () => {
 	const source = fixture();
-	const { sourcePath, cacheDir, hash } = setup(source);
+	const { sourcePath, cacheDir } = setup(source);
 	const first = await deriveAgy(sourcePath, { fullMcpOutput: true, cacheDir });
-	fs.writeFileSync(path.join(cacheDir, "agy-legacy-native-continuation"), "old");
-
-	const continuationOnly = await deriveAgy(sourcePath, { fullMcpOutput: false, cacheDir });
-	assert.equal(path.basename(continuationOnly), `agy-${hash}-native-continuation`);
-	assert.deepEqual(fs.readFileSync(continuationOnly), patchAgyNativeContinuation(source).data);
-	assert.deepEqual(fs.readdirSync(cacheDir).sort(), [path.basename(continuationOnly), `${path.basename(continuationOnly)}.sha256`]);
+	assert.equal(await deriveAgy(sourcePath, { fullMcpOutput: false, cacheDir }), sourcePath);
 
 	const upgraded = fixture();
 	upgraded[0x1800] = 0x42;
 	fs.writeFileSync(sourcePath, upgraded);
 	const second = await deriveAgy(sourcePath, { fullMcpOutput: true, cacheDir });
 	assert.notEqual(second, first);
-	assert.deepEqual(fs.readFileSync(second), both(upgraded));
+	assert.deepEqual(fs.readFileSync(second), patched(upgraded));
 	assert.deepEqual(fs.readdirSync(cacheDir).sort(), [path.basename(second), `${path.basename(second)}.sha256`]);
 });
 
 test("a patch that does not apply is an error and writes nothing", async () => {
-	const noContinuation = fixture();
-	noContinuation.fill(0, CONTINUATION, THIRD + 9);
-	const a = setup(noContinuation);
-	await assert.rejects(deriveAgy(a.sourcePath, { fullMcpOutput: true, cacheDir: a.cacheDir }), /native-continuation agy: expected one ACP prompt signature, found 0/);
-	await assert.rejects(deriveAgy(a.sourcePath, { fullMcpOutput: false, cacheDir: a.cacheDir }), /found 0/);
-	assert.equal(fs.existsSync(a.cacheDir), false);
 
 	const noOutput = fixture();
 	noOutput.fill(0, OUTPUT, OUTPUT + 19);
@@ -117,5 +105,6 @@ test("a patch that does not apply is an error and writes nothing", async () => {
 	assert.equal(fs.existsSync(b.cacheDir), false);
 
 	const c = setup(Buffer.from("#!/bin/sh\n"));
-	await assert.rejects(deriveAgy(c.sourcePath, { fullMcpOutput: false, cacheDir: c.cacheDir }), /expected ELF, PE32\+/);
+	assert.equal(await deriveAgy(c.sourcePath, { fullMcpOutput: false, cacheDir: c.cacheDir }), c.sourcePath);
+	assert.equal(fs.existsSync(c.cacheDir), false);
 });
