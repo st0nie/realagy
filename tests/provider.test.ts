@@ -285,6 +285,47 @@ test("parallel emits genuine Pi calls that the native agent loop executes concur
 	if (final?.role === "assistant") assert.equal(final.stopReason, "stop");
 });
 
+test("presentation metadata is stripped for all tools unless explicitly declared", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const handle = await driver.run({ cwd: process.cwd(), model: "gpt-oss-120b", mode: "default", skipPermissions: true, prompt: "test" });
+	const bridge = new ToolRoundTrips(driver, { preserveToolSummary: (name) => name === "custom" });
+	const signal = new AbortController().signal;
+	const input = { remove_from: "abcde", remove_to: "fghij", text: "new", toolSummary: "Edit file", unexpected: true };
+	const direct = bridge.onToolCall("direct", "replace", input, signal);
+	const event = await handle.next();
+	assert.equal(event?.type, "bridge_call");
+	if (event?.type !== "bridge_call") throw new Error("missing bridge call");
+	assert.deepEqual(event.args, { remove_from: "abcde", remove_to: "fghij", text: "new", unexpected: true });
+	assert.equal(input.toolSummary, "Edit file");
+	bridge.resolve("direct", "ok", false);
+	await direct;
+	const generic = bridge.onToolCall("generic", "any_tool", { toolSummary: "summary", nested: { toolSummary: "keep" }, value: 1 }, signal);
+	const genericEvent = await handle.next();
+	assert.equal(genericEvent?.type, "bridge_call");
+	if (genericEvent?.type !== "bridge_call") throw new Error("missing generic call");
+	assert.deepEqual(genericEvent.args, { nested: { toolSummary: "keep" }, value: 1 });
+	bridge.resolve("generic", "ok", false);
+	await generic;
+
+	const batch = bridge.onToolCall("batch", PARALLEL_TOOL_NAME, { calls: [
+		{ name: "replace_match", arguments: { replace_from: "abcde", replace_to: "abcde", match: "old", replacement: "new", toolSummary: "Replace text" } },
+		{ name: "insert", arguments: { anchor: "abcde", direction: "after", text: "new", toolSummary: "Insert text" } },
+		{ name: "custom", arguments: { toolSummary: "legitimate value" } },
+	] }, signal);
+	const parallelEvent = await handle.next();
+	assert.equal(parallelEvent?.type, "bridge_call");
+	if (parallelEvent?.type !== "bridge_call") throw new Error("missing parallel call");
+	assert.deepEqual(parallelEvent.calls?.map((call) => call.args), [
+		{ replace_from: "abcde", replace_to: "abcde", match: "old", replacement: "new" },
+		{ anchor: "abcde", direction: "after", text: "new" },
+		{ toolSummary: "legitimate value" },
+	]);
+	bridge.resolve("batch:1", "ok", false);
+	bridge.resolve("batch:2", "ok", false);
+	bridge.resolve("batch:3", "ok", false);
+	await batch;
+});
 test("parallel keeps one outer poll handle and survives the initial HTTP disconnect", async () => {
 	vi.useFakeTimers();
 	try {

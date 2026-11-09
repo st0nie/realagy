@@ -30,6 +30,19 @@ export function dispatchablePiTool(all: BridgeToolInfo[], active: readonly strin
 	return active.includes(name) && bridgedPiTools(all, active).some((tool) => tool.name === name);
 }
 
+/** Whether a tool explicitly declares a top-level argument in its schema. */
+export function declaresToolArgument(parameters: object | undefined, name: string): boolean {
+	const seen = new Set<object>();
+	const visit = (schema: unknown): boolean => {
+		if (!schema || typeof schema !== "object" || seen.has(schema)) return false;
+		seen.add(schema);
+		const node = schema as Record<string, unknown>;
+		if (node.properties && typeof node.properties === "object" && Object.hasOwn(node.properties, name)) return true;
+		return ["allOf", "anyOf", "oneOf"].some((key) => Array.isArray(node[key]) && node[key].some(visit));
+	};
+	return visit(parameters);
+}
+
 const schemaCache = new WeakMap<object, Record<string, unknown>>();
 
 /** MCP input schema for a pi tool: a JSON copy of its parameters (TypeBox

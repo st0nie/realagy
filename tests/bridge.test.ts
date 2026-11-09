@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
 import http from "node:http";
-import { bridgedPiTools, bridgeInputSchema, dispatchablePiTool } from "../src/bridge-catalog.js";
+import { bridgedPiTools, bridgeInputSchema, declaresToolArgument, dispatchablePiTool } from "../src/bridge-catalog.js";
 import { startMcpServer, TOKEN_HEADER } from "../src/mcp-server.js";
 
 test("bridge lists every model-facing pi tool, active or not, and dispatches only active ones", () => {
@@ -68,6 +68,13 @@ test("bridge input schemas are normalized once per tool definition", () => {
 	assert.deepEqual(parameters.properties.mode, { const: "fast" }, "pi's definition is never mutated");
 	assert.deepEqual(bridgeInputSchema(undefined), { type: "object", properties: {}, additionalProperties: true });
 	assert.deepEqual(bridgeInputSchema({ size: 1n }), { type: "object", properties: {}, additionalProperties: true });
+});
+
+test("detects explicitly declared metadata-named arguments", () => {
+	assert.equal(declaresToolArgument({ properties: { toolSummary: { type: "string" } } }, "toolSummary"), true);
+	assert.equal(declaresToolArgument({ anyOf: [{ properties: { toolSummary: {} } }] }, "toolSummary"), true);
+	assert.equal(declaresToolArgument({ properties: { nested: { properties: { toolSummary: {} } } } }, "toolSummary"), false);
+	assert.equal(declaresToolArgument(undefined, "toolSummary"), false);
 });
 
 test("loopback MCP decodes request bodies whose multi-byte characters span network chunks", async () => {

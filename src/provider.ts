@@ -46,6 +46,8 @@ const ESCALATED_TTL_MS = 30 * 60_000;
 export interface ToolRoundTripsOptions {
 	escalateAfterMs?: number;
 	pollWaitMs?: number;
+	/** True when a Pi tool explicitly declares the metadata-named argument. */
+	preserveToolSummary?: (name: string) => boolean;
 }
 
 interface PendingCall {
@@ -104,13 +106,19 @@ function stillRunningResult(callId: string, initial: boolean): BridgeResult {
 	};
 }
 
+// toolSummary is bridge presentation metadata unless explicitly declared by the tool.
+function bridgeToolArguments(args: Record<string, unknown>, preserve: boolean): Record<string, unknown> {
+	if (preserve || !Object.hasOwn(args, "toolSummary")) return args;
+	const { toolSummary: _toolSummary, ...nativeArgs } = args;
+	return nativeArgs;
+}
 export class ToolRoundTrips {
 	#pending = new Map<string, PendingCall>();
 	#polls = new Map<string, PollResult>();
 	#escalateAfterMs: number;
 	#pollWaitMs: number;
 
-	constructor(private readonly driver: TurnDriver, opts: ToolRoundTripsOptions = {}) {
+	constructor(private readonly driver: TurnDriver, private readonly opts: ToolRoundTripsOptions = {}) {
 		this.#escalateAfterMs = opts.escalateAfterMs ?? ESCALATE_AFTER_MS;
 		this.#pollWaitMs = opts.pollWaitMs ?? this.#escalateAfterMs;
 	}
@@ -132,7 +140,7 @@ export class ToolRoundTrips {
 		this.#prunePolls();
 		if (name === PARALLEL_TOOL_NAME) return this.#parallel(callId, args, signal, handle);
 		const result = this.#park(callId, name, signal, {});
-		handle.pushExternal({ type: "bridge_call", callId, name, args });
+		handle.pushExternal({ type: "bridge_call", callId, name, args: bridgeToolArguments(args, this.opts.preserveToolSummary?.(name) ?? false) });
 		return result;
 	};
 
@@ -212,7 +220,7 @@ export class ToolRoundTrips {
 			callId,
 			name: PARALLEL_TOOL_NAME,
 			args,
-			calls: calls.map((call) => ({ callId: call.callId, name: call.name, args: call.arguments })),
+			calls: calls.map((call) => ({ callId: call.callId, name: call.name, args: bridgeToolArguments(call.arguments, this.opts.preserveToolSummary?.(call.name) ?? false) })),
 		});
 		return outer;
 	}

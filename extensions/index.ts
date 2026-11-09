@@ -15,7 +15,7 @@ import { fetchCliUsage, UsageMeter } from "../src/quota.js";
 import type { AcpSessions } from "../src/provider.js";
 import { defaultConversationsDir } from "../src/acp/step-usage.js";
 import { ensureAgyReady, MANUAL_SETUP, resolveAgyBinary } from "../src/acp/setup.js";
-import { bridgedPiTools, bridgeInputSchema, dispatchablePiTool } from "../src/bridge-catalog.js";
+import { bridgedPiTools, bridgeInputSchema, declaresToolArgument, dispatchablePiTool } from "../src/bridge-catalog.js";
 import { startMcpServer, TOKEN_HEADER, type McpServerHandle } from "../src/mcp-server.js";
 import { entriesFromAcpModels, FALLBACK_MODELS, toPiModel, type AgyModelEntry } from "../src/models.js";
 import {
@@ -108,7 +108,9 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			);
 		},
 	});
-	const roundTrips = new ToolRoundTrips(driver);
+	const roundTrips = new ToolRoundTrips(driver, {
+		preserveToolSummary: (name) => declaresToolArgument(pi.getAllTools().find((tool) => tool.name === name)?.parameters, "toolSummary"),
+	});
 	driver.onTurnEnd = (outcome) => failParkedCalls(roundTrips, outcome);
 	const started = await startMcpServer({
 		listTools: () => [
