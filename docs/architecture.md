@@ -32,6 +32,10 @@ Esc while a pi tool (such as `bash`) runs aborts the same signal the ACP turn wa
 
 An aborted turn keeps its progress. The session holds everything agy recorded before the cancel, so realagy records a warm snapshot for it when agy stored the turn's prompt: the read-only conversation store has a user-input step (`step_type` 14) newer than the turn's starting step. agy writes that step as soon as the prompt arrives, so even a cancel before any output counts; a turn aborted before its prompt was sent records nothing. `continue` (or any next message) after Esc then goes to the same ACP session as a delta when the Pi prefix is unchanged. When a delta is split into bounded parts, the relevant user-input step is the last part's, which carries the real prompt.
 
+### Thinking and answer display
+
+ACP thinking and sanitized answer chunks become Pi `thinking_delta` and `text_delta` events. Some models send small increments, while others send whole paragraphs at once. Realagy smooths large chunks of either kind into short timed display increments without waiting for more upstream output. Pending content is flushed immediately on a switch between thinking and answer text, before native-tool lines or Pi tool calls, and at turn completion, preserving event order and avoiding delays to tool execution. Cancellation also flushes already received content; the animation does not represent earlier access to model output.
+
 ## Tools
 
 With `fullMcpOutput: true`, the derived agy bypasses its common tool-output decorator, so both ordinary MCP results and the JSON aggregate returned by `parallel` reach the model without agy's preview truncation. Model context limits and Pi's own renderer limits still apply.

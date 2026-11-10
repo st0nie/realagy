@@ -480,6 +480,40 @@ function appendThinking(stream: AssistantMessageEventStream, blocks: BlockState,
 	(blocks.partial.content[blocks.thinkingIdx] as { thinking: string }).thinking += delta;
 	stream.push({ type: "thinking_delta", contentIndex: blocks.thinkingIdx, delta, partial: blocks.partial });
 }
+// Agy sometimes emits whole thinking or answer text at once. Display a short first
+// slice immediately, then smooth the remainder without blocking ACP processing.
+const PLAYBACK_SLICE_CHARS = 12;
+const PLAYBACK_SLICE_MS = 30;
+
+class StreamPlayback {
+	#pending = "";
+	#timer: ReturnType<typeof setTimeout> | undefined;
+	constructor(private readonly emit: (delta: string) => void) {}
+
+	push(delta: string): void {
+		this.#pending += delta;
+		if (!this.#timer) this.#tick();
+	}
+
+	#tick(): void {
+		this.#timer = undefined;
+		let end = Math.min(PLAYBACK_SLICE_CHARS, this.#pending.length);
+		// Never split a UTF-16 surrogate pair between Pi events.
+		if (end < this.#pending.length && /[\uD800-\uDBFF]/.test(this.#pending[end - 1])) end++;
+		const slice = this.#pending.slice(0, end);
+		this.#pending = this.#pending.slice(end);
+		if (slice) this.emit(slice);
+		if (this.#pending) this.#timer = setTimeout(() => this.#tick(), PLAYBACK_SLICE_MS);
+	}
+
+	flush(): void {
+		if (this.#timer) clearTimeout(this.#timer);
+		this.#timer = undefined;
+		const pending = this.#pending;
+		this.#pending = "";
+		if (pending) this.emit(pending);
+	}
+}
 
 /** One of agy's own tool calls as its own line in the thinking block. */
 function appendNativeLine(stream: AssistantMessageEventStream, blocks: BlockState, line: string): void {
@@ -529,30 +563,44 @@ async function consumeTurn(
 	meter: UsageMeter | undefined,
 ): Promise<void> {
 	const usage = blocks.usage;
-	for (;;) {
-		const activity = await handle.next();
-		if (!activity) break;
-		await options?.onProviderStreamEvent?.(activity, model);
-		if (activity.type === "text") appendText(stream, blocks, activity.delta);
-		else if (activity.type === "thought" && activity.delta) appendThinking(stream, blocks, activity.delta);
-		else if (activity.type === "native_tool") appendNativeLine(stream, blocks, nativeToolLine(activity));
-		else if (activity.type === "step_usage") {
-			addStepUsage(usage, activity.usage);
-			meter?.addSteps(activity.usage);
-			syncUsage(blocks.partial.usage, usage);
-		} else if (activity.type === "usage") {
-			usage.cumulative = activity.usage;
-			syncUsage(blocks.partial.usage, usage);
-		} else if (activity.type === "context_usage") {
-			usage.occupancy = activity.contextUsage.used;
-			syncUsage(blocks.partial.usage, usage);
-		} else if (activity.type === "bridge_call") {
-			emitToolUse(stream, blocks, activity);
-			onToolCall(handle, blocks.partial, activity);
-			return;
+	const thinking = new StreamPlayback((delta) => appendThinking(stream, blocks, delta));
+	const text = new StreamPlayback((delta) => appendText(stream, blocks, delta));
+	try {
+		for (;;) {
+			const activity = await handle.next();
+			if (!activity) break;
+			if (activity.type === "text") thinking.flush();
+			else if (activity.type === "thought") text.flush();
+			else if (activity.type === "native_tool" || activity.type === "bridge_call") {
+				thinking.flush();
+				text.flush();
+			}
+			await options?.onProviderStreamEvent?.(activity, model);
+			if (activity.type === "text") {
+				if (activity.delta) text.push(activity.delta);
+				else appendText(stream, blocks, "");
+			} else if (activity.type === "thought" && activity.delta) thinking.push(activity.delta);
+			else if (activity.type === "native_tool") appendNativeLine(stream, blocks, nativeToolLine(activity));
+			else if (activity.type === "step_usage") {
+				addStepUsage(usage, activity.usage);
+				meter?.addSteps(activity.usage);
+				syncUsage(blocks.partial.usage, usage);
+			} else if (activity.type === "usage") {
+				usage.cumulative = activity.usage;
+				syncUsage(blocks.partial.usage, usage);
+			} else if (activity.type === "context_usage") {
+				usage.occupancy = activity.contextUsage.used;
+				syncUsage(blocks.partial.usage, usage);
+			} else if (activity.type === "bridge_call") {
+				emitToolUse(stream, blocks, activity);
+				onToolCall(handle, blocks.partial, activity);
+				return;
+			}
+			// Native tool lifecycle events only feed onProviderStreamEvent.
 		}
-		// tool_start/tool_done/tool_error only feed onProviderStreamEvent: agy
-		// runs those tools itself, and native_tool renders the visible line.
+	} finally {
+		thinking.flush();
+		text.flush();
 	}
 	// Occupancy reported during an EARLIER message of this turn is stale here
 	// (tool results were added since), so outcome.contextUsage is not applied.

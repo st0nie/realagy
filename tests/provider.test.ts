@@ -127,6 +127,104 @@ test("provider streams native thinking/text and maps GPT to its medium ACP slug"
 	assert.equal(driver.requests[0].conversationId, null);
 });
 
+test("large thinking chunks play incrementally and flush before answer text", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const simple = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
+	const events: AssistantMessageEvent[] = [];
+	const collecting = (async () => {
+		for await (const event of simple(toPiModel(FALLBACK_MODELS[0]), context([system(), user("Reply")]))) events.push(event);
+	})();
+	await vi.waitFor(() => assert.ok(driver.activeHandle));
+	const handle = driver.activeHandle as FakeHandle;
+	const thought = "abcdefghijk😀lmnopqrstuvwxyz and more reasoning";
+	handle.pushExternal({ type: "thought", delta: thought });
+	await vi.waitFor(() => assert.ok(events.filter((event) => event.type === "thinking_delta").length >= 2));
+	const before = events.filter((event) => event.type === "thinking_delta").map((event) => event.type === "thinking_delta" ? event.delta : "").join("");
+	assert.ok(before.length < thought.length, "thinking should be displayed while the turn is still running");
+	assert.ok(events.every((event) => event.type !== "thinking_delta" || !/[\uD800-\uDBFF]$/.test(event.delta)), "a slice must not end in an unpaired surrogate");
+	handle.pushExternal({ type: "text", delta: "answer" });
+	await vi.waitFor(() => assert.ok(events.some((event) => event.type === "text_delta")));
+	handle.complete();
+	await collecting;
+	const textIndex = events.findIndex((event) => event.type === "text_start");
+	assert.equal(events.slice(0, textIndex).filter((event) => event.type === "thinking_delta").map((event) => event.type === "thinking_delta" ? event.delta : "").join(""), thought);
+	assert.ok(!events.slice(textIndex).some((event) => event.type === "thinking_delta"));
+});
+
+test("pending thinking flushes on abort and before tool dispatch", async () => {
+	for (const boundary of ["abort", "tool"] as const) {
+		const driver = new FakeDriver();
+		driver.autoFinish = false;
+		const simple = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
+		const events: AssistantMessageEvent[] = [];
+		const collecting = (async () => {
+			for await (const event of simple(toPiModel(FALLBACK_MODELS[0]), context([system(), user("Reply")]))) events.push(event);
+		})();
+		await vi.waitFor(() => assert.ok(driver.activeHandle));
+		const handle = driver.activeHandle as FakeHandle;
+		const thought = "A long reasoning paragraph that must survive the boundary.";
+		handle.pushExternal({ type: "thought", delta: thought });
+		await vi.waitFor(() => assert.ok(events.some((event) => event.type === "thinking_delta")));
+		if (boundary === "abort") handle.complete({ status: "OK", response: "", aborted: true });
+		else handle.pushExternal({ type: "bridge_call", callId: "call", name: "read", args: {} });
+		await collecting;
+		assert.equal(events.filter((event) => event.type === "thinking_delta").map((event) => event.type === "thinking_delta" ? event.delta : "").join(""), thought);
+		const end = events.findIndex((event) => event.type === "thinking_end");
+		const boundaryIndex = events.findIndex((event) => event.type === (boundary === "abort" ? "error" : "toolcall_start"));
+		assert.ok(end >= 0 && boundaryIndex > end);
+	}
+});
+
+test("large answer chunks play incrementally and flush before thinking", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const simple = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
+	const events: AssistantMessageEvent[] = [];
+	const collecting = (async () => {
+		for await (const event of simple(toPiModel(FALLBACK_MODELS[0]), context([system(), user("Reply")]))) events.push(event);
+	})();
+	await vi.waitFor(() => assert.ok(driver.activeHandle));
+	const handle = driver.activeHandle as FakeHandle;
+	const answer = "abcdefghijk😀lmnopqrstuvwxyz and a longer answer";
+	handle.pushExternal({ type: "text", delta: answer });
+	await vi.waitFor(() => assert.ok(events.filter((event) => event.type === "text_delta").length >= 2));
+	const before = events.filter((event) => event.type === "text_delta").map((event) => event.type === "text_delta" ? event.delta : "").join("");
+	assert.ok(before.length < answer.length);
+	assert.ok(events.every((event) => event.type !== "text_delta" || !/[\uD800-\uDBFF]$/.test(event.delta)));
+	handle.pushExternal({ type: "thought", delta: "next" });
+	await vi.waitFor(() => assert.ok(events.some((event) => event.type === "thinking_delta")));
+	handle.complete();
+	await collecting;
+	const thoughtIndex = events.findIndex((event) => event.type === "thinking_start");
+	assert.equal(events.slice(0, thoughtIndex).filter((event) => event.type === "text_delta").map((event) => event.type === "text_delta" ? event.delta : "").join(""), answer);
+	assert.ok(!events.slice(thoughtIndex).some((event) => event.type === "text_delta"));
+});
+
+test("pending answer text flushes on completion, abort and tool dispatch", async () => {
+	for (const boundary of ["complete", "abort", "tool"] as const) {
+		const driver = new FakeDriver();
+		driver.autoFinish = false;
+		const simple = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
+		const events: AssistantMessageEvent[] = [];
+		const collecting = (async () => {
+			for await (const event of simple(toPiModel(FALLBACK_MODELS[0]), context([system(), user("Reply")]))) events.push(event);
+		})();
+		await vi.waitFor(() => assert.ok(driver.activeHandle));
+		const handle = driver.activeHandle as FakeHandle;
+		const answer = "A long answer paragraph that must survive the boundary.";
+		handle.pushExternal({ type: "text", delta: answer });
+		await vi.waitFor(() => assert.ok(events.some((event) => event.type === "text_delta")));
+		if (boundary === "tool") handle.pushExternal({ type: "bridge_call", callId: "call", name: "read", args: {} });
+		else handle.complete({ status: "OK", response: answer, aborted: boundary === "abort" });
+		await collecting;
+		assert.equal(events.filter((event) => event.type === "text_delta").map((event) => event.type === "text_delta" ? event.delta : "").join(""), answer);
+		const end = events.findIndex((event) => event.type === "text_end");
+		const boundaryIndex = events.findIndex((event) => event.type === (boundary === "tool" ? "toolcall_start" : boundary === "abort" ? "error" : "done"));
+		assert.ok(end >= 0 && boundaryIndex > end);
+	}
+});
+
 test("provider preserves context occupancy separately from cumulative usage", async () => {
 	const driver = new FakeDriver();
 	driver.script = [
@@ -526,7 +624,7 @@ test("late toolResult after ACP turn ended while escalated tool was running reus
 		timestamp: Date.now(),
 	};
 	const secondEvents = await collect(streamSimple(model, context([system(), userMsg, firstDone.message, toolResult])));
-	assert.ok(secondEvents.some((event) => event.type === "text_delta" && event.delta === "Received the 20m build output!"));
+	assert.equal(secondEvents.filter((event) => event.type === "text_delta").map((event) => event.type === "text_delta" ? event.delta : "").join(""), "Received the 20m build output!");
 	assert.equal(driver.requests.length, 2);
 	assert.equal(driver.requests[1].conversationId, "conv-long-1");
 	assert.match(driver.requests[1].contextBlock?.text ?? "", /<pi-tool-result name="bash" id="long-call-1" error=false>/);
