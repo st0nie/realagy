@@ -406,6 +406,14 @@ function syncUsage(target: Usage, state: UsageState): void {
 		}
 		target.totalTokens = state.occupancy;
 	}
+    // Pi reads input + cacheRead of a "stop" message as one call's prompt
+    // (silent-overflow check). Summed multi-call splits can exceed the context
+    // window, so scale them down to the measured context, keeping the hit ratio.
+    const split = target.input + target.output + target.cacheRead + target.cacheWrite;
+    if (split > target.totalTokens) {
+        const scale = target.totalTokens / split;
+        for (const key of ["input", "output", "cacheRead", "cacheWrite"] as const) target[key] = Math.floor(target[key] * scale);
+    }
 	if (state.occupancy !== undefined) piUsage.agyContextTokens = state.occupancy;
 	if (state.cumulative) {
 		const c = state.cumulative;
