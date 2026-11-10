@@ -5,6 +5,7 @@ A minimal [pi](https://github.com/earendil-works/pi-coding-agent) provider for G
 | Document | For |
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | How turns, tools, images, session reuse, usage, context, and quota work |
+| [docs/configuration.md](docs/configuration.md) | `/realagy settings`, `~/.pi/agent/realagy/config.json`, environment variables, and files on disk |
 | [docs/development.md](docs/development.md) | Building, testing, live smokes, conventions and pitfalls for contributors |
 
 ## Install
@@ -132,6 +133,8 @@ The bypass does not increase real server-side model limits; when a conversation 
 | `AGY_BIN` | Path to the `agy` binary |
 | `GEMINI_HOME` | agy's data root (default `~/.gemini`) |
 | `REALAGY_TRACE_USAGE` | `1` or an absolute path: log turn plans and token counts (no content) to `~/.pi/agent/realagy/usage-trace.jsonl` |
+
+See [docs/configuration.md](docs/configuration.md) for the full configuration reference, precedence and validation rules, proxy variables, and files on disk.
 
 ## Layout
 
