@@ -30,6 +30,7 @@
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { BackgroundMessages, type BackgroundItem, type BackgroundNotice } from "./background.js";
+import { SessionRetention } from "./session-retention.js";
 import { AcpConnection, type AcpExitInfo, type AcpMcpServer } from "./connection.js";
 import { CatalogProxy } from "./catalog-proxy.js";
 import { isAgyRetryNotice, mapStopReason, mapUpdate, TextAccumulator, type AcpEditDiff } from "./events.js";
@@ -71,6 +72,8 @@ export interface AcpDriverOptions {
 	 *  read for exact per-model-call usage and to detect lost sessions.
 	 *  undefined disables both. */
 	conversationsDir?: () => string | undefined;
+	/** Optional shared ownership ledger; omitted by isolated/fake ACP clients. */
+	sessionRetention?: SessionRetention;
 	/** Cancel-to-teardown grace period (tests shrink it). */
 	cancelGraceMs?: number;
 	log?: (msg: string, data?: unknown) => void;
@@ -120,6 +123,8 @@ interface ActiveTurn {
 	promptStarted: boolean;
 	/** True while earlier context parts are delivered; their frames are dropped. */
 	priming: boolean;
+	/** The server created this turn's session (eligible for ownership registration). */
+	createdSession: boolean;
 	/** True once the final prompt RPC was issued. */
 	finalPromptSent: boolean;
 	/** Highest store step before the final prompt was sent. */
@@ -189,10 +194,17 @@ export class AcpDriver implements TurnDriver {
 	async listModels(cwd: string): Promise<Array<{ modelId: string; name?: string; contextWindow?: number; maxTokens?: number }>> {
 		const conn = await this.#ensureConnection(cwd);
 		const session = await conn.newSession(cwd);
+		this.#opts.sessionRetention?.created(session.sessionId, conn.pid);
 		return session.availableModels.map((model) => {
 			const limits = this.#catalogProxy?.modelLimits(model.modelId);
 			return limits ? { ...model, ...limits } : model;
 		});
+	}
+
+	/** Mark an owned native cache obsolete only after its replacement succeeded. */
+	retireSession(sessionId: string): void {
+		this.#opts.sessionRetention?.retire(sessionId);
+		this.#opts.sessionRetention?.sweep();
 	}
 
 	get activeHandle(): TurnHandle | null {
@@ -400,13 +412,16 @@ export class AcpDriver implements TurnDriver {
 	/** Pick the turn's session. undefined = the turn already settled. */
 	async #openSession(turn: ActiveTurn, conn: AcpConnection): Promise<"new" | "reused" | "resumed" | "loaded" | "fallback" | undefined> {
 		const id = turn.request.conversationId;
+		// The shared ledger serializes leases with deletion. Never reopen if a
+		// lease could not be acquired; the full fallback is safer than a race.
+		const canReuse = !id || !this.#opts.sessionRetention || this.#opts.sessionRetention.acquire(id, conn.pid);
 		try {
-			if (id && this.#liveSessions.has(id)) {
+			if (id && canReuse && this.#liveSessions.has(id) && !this.#storeMissing(id)) {
 				turn.sessionId = id;
 				this.#log("session-reuse", { sessionId: id });
 				return "reused";
 			}
-			if (id && this.#storeMissing(id)) {
+			if (id && (!canReuse || this.#storeMissing(id))) {
 				// session/load of an unknown id silently yields an empty session:
 				// never hand it a delta.
 				this.#log("session-lost", { sessionId: id });
@@ -427,6 +442,8 @@ export class AcpDriver implements TurnDriver {
 		if (turn.closed) return undefined;
 		try {
 			const created = await conn.newSession(turn.request.cwd);
+			this.#opts.sessionRetention?.created(created.sessionId, conn.pid);
+			turn.createdSession = true;
 			turn.sessionId = created.sessionId;
 			this.#log("session-new", { sessionId: created.sessionId });
 			return id ? "fallback" : "new";
@@ -849,6 +866,7 @@ export class AcpDriver implements TurnDriver {
 			resolve,
 			outcome,
 			response: new TextAccumulator(request.cwd),
+			createdSession: false,
 			promptStarted: false,
 			priming: false,
 			finalPromptSent: false,
@@ -897,6 +915,7 @@ export class AcpDriver implements TurnDriver {
 			this.#collectStepUsage(turn);
 		}
 		outcome.promptDelivered = this.#promptDelivered(turn, outcome);
+		if (turn.createdSession && turn.sessionId) this.#opts.sessionRetention?.created(turn.sessionId, turn.conn?.pid);
 		if (turn.contextUsage) outcome.contextUsage = turn.contextUsage;
 		turn.closed = true;
 		this.#clearIdle(turn);

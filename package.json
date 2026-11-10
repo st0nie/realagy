@@ -32,7 +32,7 @@
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "check": "npm run build && npm test",
+    "check": "bun run build && bun run test",
     "smoke:pi": "pi -ne -e ./extensions --list-models antigravity",
     "smoke:live": "tsx scripts/smoke-acp.mts"
   },

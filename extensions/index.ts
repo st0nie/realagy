@@ -14,6 +14,7 @@ import { AGY_BACKGROUND_MESSAGE, renderBackgroundCard, type BackgroundCardDetail
 import { fetchCliUsage, UsageMeter } from "../src/quota.js";
 import type { AcpSessions } from "../src/provider.js";
 import { defaultConversationsDir } from "../src/acp/step-usage.js";
+import { SessionRetention } from "../src/acp/session-retention.js";
 import { ensureAgyReady, MANUAL_SETUP, resolveAgyBinary } from "../src/acp/setup.js";
 import { bridgedPiTools, bridgeInputSchema, declaresToolArgument, dispatchablePiTool } from "../src/bridge-catalog.js";
 import { startMcpServer, TOKEN_HEADER, type McpServerHandle } from "../src/mcp-server.js";
@@ -38,6 +39,7 @@ import {
 } from "../src/parallel.js";
 import { LOCKED_REPLAY_BUDGET_BYTES, restoreWarmSessions, UNLOCKED_REPLAY_BUDGET_BYTES, WARM_SESSION_ENTRY, type SessionEntryLike, type WarmSession } from "../src/transcript.js";
 import { treeRestoreExtras, type LoadoutEntry } from "../src/tool-loadout.js";
+import { traceUsage } from "../src/usage-trace.js";
 /** Widget key of the live panel of running agy work. */
 const AGY_WORK_WIDGET = "agy-work";
 
@@ -76,6 +78,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		},
 	});
 
+	const sessionRetention = new SessionRetention({ conversationsDir: defaultConversationsDir(), log: (event, data) => traceUsage(event, { detail: data }) });
 	const driver = new AcpDriver({
 		bin: () => bin,
 		fullMcpOutput: () => config.fullMcpOutput,
@@ -89,6 +92,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		// Exact per-call usage comes from the server's conversation store;
 		// unmeasured messages are left to pi's own transcript estimate.
 		conversationsDir: () => defaultConversationsDir(),
+		sessionRetention,
 		systemPrompt: (agent) => toolPolicyPrompt(bridgedTools().map((tool) => tool.name), { profile: agent !== undefined }),
 		// Every bridged tool (and the poll helper) is marked eager in the
 		// profile; without the bridge, agy's default agent keeps its own tools.
@@ -154,9 +158,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	bridge = started.handle;
 
 	let pendingWarmEntry: WarmSession | null = null;
+	let pendingWarmCanRetire = false;
 	const sessions: AcpSessions = {
-		onWarm: (warm) => {
+		onWarm: (warm, canRetire) => {
 			pendingWarmEntry = warm;
+			pendingWarmCanRetire = canRetire;
 		},
 	};
 	const meter = new UsageMeter();
@@ -211,17 +217,21 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			: `Antigravity model discovery failed: ${result.error}. Run /realagy setup to sign in.`, "warning");
 	};
 
-	const syncWarmFromSession = (ctx: { sessionManager?: { getBranch?: () => unknown[]; getEntries?: () => unknown[] } }): void => {
+	const syncWarmFromSession = (ctx: { sessionManager?: { getBranch?: () => unknown[]; getEntries?: () => unknown[] } }): boolean => {
 		pendingWarmEntry = null;
 		sessions.parked = undefined;
 		const branch = (ctx.sessionManager?.getBranch?.() ?? []) as readonly SessionEntryLike[];
 		const restored = restoreWarmSessions(branch);
 		sessions.warm = restored.warm;
+		// Protect a restored checkpoint as soon as Pi opens its branch, even if
+		// the user does not send the next model request for several days.
+		return !sessions.warm || sessionRetention.acquire(sessions.warm.sessionId);
 	};
 
 	pi.on("session_start", (_event, ctx) => {
 		if (ctx.hasUI) ui = ctx.ui;
-		syncWarmFromSession(ctx);
+		// Do not sweep if we could not protect the restored checkpoint.
+		if (syncWarmFromSession(ctx)) sessionRetention.sweep();
 		refresh ??= refreshCatalog(ctx).catch((error: unknown) => {
 			if (!stopped && ctx.hasUI) ctx.ui.notify(`Antigravity setup failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
 		}).finally(() => { refresh = null; });
@@ -235,6 +245,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	pi.on("session_tree", (_event, ctx) => {
 		// Rewind/edit invalidates the native cache unconditionally. The next turn
 		// rebuilds from Pi's effective <pi_history> instead of forking agy's DB.
+		if (sessions.warm) (sessions.retirementCandidates ??= new Set()).add(sessions.warm.sessionId);
 		sessions.warm = undefined;
 		sessions.parked = undefined;
 		const before = toolsBeforeTree;
@@ -248,14 +259,22 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	pi.on("session_compact", () => {
 		pendingWarmEntry = null;
 		sessions.parked = undefined;
+		if (sessions.warm) (sessions.retirementCandidates ??= new Set()).add(sessions.warm.sessionId);
 		sessions.warm = undefined;
 	});
 	pi.on("turn_end", () => {
 		if (!pendingWarmEntry) return;
 		const entry = pendingWarmEntry;
+		const canRetire = pendingWarmCanRetire;
+		pendingWarmCanRetire = false;
 		pendingWarmEntry = null;
 		try {
 			pi.appendEntry(WARM_SESSION_ENTRY, entry);
+			if (canRetire) for (const id of sessions.retirementCandidates ?? []) {
+				if (id === entry.sessionId) continue;
+				driver.retireSession(id);
+				sessions.retirementCandidates?.delete(id);
+			}
 		} catch { /* ephemeral or read-only session */ }
 	});
 	pi.on("session_shutdown", () => {

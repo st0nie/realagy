@@ -1,13 +1,15 @@
 # Development
 
-TypeScript in strict mode, native ESM with `.js` import specifiers, `noEmit`; Node.js 22+ (pi runs the sources through its loader).
+TypeScript in strict mode, native ESM with `.js` import specifiers, and `noEmit`. Use Bun for dependency installation and development commands; Pi loads the source extension through its own loader.
 
 ## Build and test
 
 ```sh
-bun install            # or npm install
-npm run check          # tsc --noEmit + vitest
-npm run smoke:pi       # load the extension through pi's real loader and list the models
+bun install
+bun run check     # full project typecheck and test suite
+bun run build     # TypeScript typecheck
+bun run test      # run Vitest
+bun run smoke:pi  # load the extension through pi's real loader and list the models
 ```
 
 Protocol tests run against `tests/helpers/fake-acp-server.mjs` instead of agy. It records every request it receives and supports:
@@ -35,10 +37,10 @@ Protocol tests run against `tests/helpers/fake-acp-server.mjs` instead of agy. I
 These need a signed-in `agy` and spend account quota.
 
 ```sh
-npm run smoke:live -- gemini-3-8-flash
-npm run smoke:live -- claude-sonnet-5-5
-npm run smoke:live -- gpt-oss-120b
-REALAGY_TRACE_USAGE=/tmp/trace.jsonl pi      # turn plans, usage_update, step tokens; counts only
+bun run smoke:live gemini-3-8-flash
+bun run smoke:live claude-sonnet-5-5
+bun run smoke:live gpt-oss-120b
+REALAGY_TRACE_USAGE=/tmp/trace.jsonl pi  # turn plans and token counts
 ```
 
 `scripts/probe-context-usage.mts` checks that pi's context count matches agy's occupancy.
@@ -57,9 +59,9 @@ REALAGY_TRACE_USAGE=/tmp/trace.jsonl pi      # turn plans, usage_update, step to
 
 - agy's ACP `_meta.antigravity.systemPrompt` supports only `append`; replacing the prompt needs a custom agent (`--agent`, per process). agy loads only Markdown agents, `mcpServers` only in list form (`- name: pi-bridge`), tool `eager` flags only per name (no wildcard), and `tools:` only accepts agy's registry tool names (an MCP name makes every turn fail). Inspect the real system prompt in the `gen_metadata` blob of `<sessionId>.db`.
 
-- An aborted `npm install` leaves a corrupt `node_modules`, and `tsc`/`vitest` then die with "Bus error". Delete `node_modules` and run `bun install`.
-- `node:sqlite` prints an ExperimentalWarning on Node 22. `src/acp/step-usage.ts` silences it for that one `require`, because it would corrupt pi's TUI.
-- The conversation store is agy's internal format and is read only for usage and prompt-delivery evidence. Every read degrades to "no measurement" rather than failing a turn. Never fork, prune, or rewrite it for session reuse: Pi's effective transcript is authoritative, and `/tree` or compaction triggers a fresh `<pi_history>` replay.
+- An interrupted dependency installation leaves a corrupt `node_modules`, and `tsc`/`vitest` then die with "Bus error". Delete `node_modules` and run `bun install`.
+- Pi may run under Bun or Node. On Node 22, `node:sqlite` prints an ExperimentalWarning; `src/acp/step-usage.ts` silences it for that one `require` to avoid corrupting Pi's TUI.
+- The conversation store is agy's internal format and is read only for usage and prompt-delivery evidence. Every read degrades to "no measurement" rather than failing a turn. Never fork or rewrite it for session reuse; the separate ownership ledger may retire only confirmed realagy-owned stale databases as described in [architecture.md](architecture.md#owned-session-database-retention): Pi's effective transcript is authoritative, and `/tree` or compaction triggers a fresh `<pi_history>` replay.
 - ACP `session/cancel` is a notification. Sent as a request, agy cancels the prompt but never answers the request.
 - `session/load` of an unknown session id succeeds with an empty session. Check that `<sessionId>.db` exists before trusting a load.
 - `agy --print /usage` takes about 10 s. Run it only from `/realagy usage`, never on a turn's path or in the background.

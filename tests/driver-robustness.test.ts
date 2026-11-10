@@ -216,6 +216,42 @@ test("a remembered session whose store is gone gets a fresh session and the full
 	}
 });
 
+
+test("a missing live checkpoint receives a fresh session and the full fallback", async () => {
+	const { driver, wire, dir } = fixture({}, (root) => ({ conversationsDir: () => root }));
+	try {
+		const first = await driver.run({ ...base, prompt: "initial" });
+		await drain(first);
+		assert.equal((await first.outcome).conversationId, "session-1");
+		// The fake server does not create a database unless configured. Its
+		// native session is live but its store is missing, like a cleaned cache.
+		assert.equal(fs.existsSync(path.join(dir, "session-1.db")), false);
+		const next = await driver.run({ ...base, conversationId: "session-1", prompt: "delta", fallback: { prompt: "full history" } });
+		await drain(next);
+		assert.equal((await next.outcome).conversationId, "session-2");
+		const requests = wire().filter((request) => request.method === "session/prompt");
+		assert.deepEqual(requests.at(-1)!.params.prompt, [{ type: "text", text: "full history" }]);
+	} finally { await driver.close(); }
+});
+
+
+test("a checkpoint with an unavailable lease uses a new session and full fallback", async () => {
+	const { driver, wire, dir } = fixture({ FAKE_ACP_RESUME: "1" }, (root) => ({
+		conversationsDir: () => root,
+		sessionRetention: { acquire: () => false, created: () => {} } as never,
+	}));
+	const checkpoint = "00000000-0000-4000-8000-000000000001";
+	fs.writeFileSync(path.join(dir, `${checkpoint}.db`), "protected");
+	try {
+		const handle = await driver.run({ ...base, conversationId: checkpoint, prompt: "delta", fallback: { prompt: "full history" } });
+		await drain(handle);
+		assert.equal((await handle.outcome).conversationId, "session-1");
+		assert.ok(!wire().some((request) => request.method === "session/resume"));
+		assert.deepEqual(wire().find((request) => request.method === "session/prompt")!.params.prompt, [{ type: "text", text: "full history" }]);
+		assert.equal(fs.readFileSync(path.join(dir, `${checkpoint}.db`), "utf8"), "protected");
+	} finally { await driver.close(); }
+});
+
 test("cancelActive ends a turn parked on pi tool calls", async () => {
 	const { driver, wire } = fixture();
 	try {

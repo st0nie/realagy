@@ -51,6 +51,8 @@ class FakeDriver implements TurnDriver {
 	requests: DriverTurnRequest[] = [];
 	script: DriverActivity[] = [];
 	autoFinish = true;
+	retired: string[] = [];
+	retireSession(id: string): void { this.retired.push(id); }
 
 	async run(request: DriverTurnRequest): Promise<TurnHandle> {
 		this.requests.push(request);
@@ -137,9 +139,10 @@ test("provider preserves context occupancy separately from cumulative usage", as
 	if (done?.type !== "done") throw new Error("No done event");
 	assert.equal(done.message.usage.totalTokens, 54357);
 	assert.equal(calculateContextTokens(done.message.usage), 54357);
-	assert.equal(done.message.usage.input, 59547);
-	assert.equal(done.message.usage.cacheWrite, 966);
-	assert.equal(done.message.usage.input + done.message.usage.output + done.message.usage.cacheRead + done.message.usage.cacheWrite, 697244);
+	const scale = 54357 / 697244;
+	assert.equal(done.message.usage.input, Math.floor(59547 * scale));
+	assert.equal(done.message.usage.cacheWrite, Math.floor(966 * scale));
+	assert.ok(done.message.usage.input + done.message.usage.output + done.message.usage.cacheRead + done.message.usage.cacheWrite <= 54357);
 	assert.equal((done.message.usage as typeof done.message.usage & { agyCumulativeTotalTokens?: number }).agyCumulativeTotalTokens, 697244);
 	const sessionManager = SessionManager.inMemory();
 	sessionManager.appendMessage(user("Reply"));
@@ -729,6 +732,34 @@ test("applied realctx drops and summaries force a fresh authoritative replay", (
 	assert.ok(planAfterHistorian.input.prompt.endsWith("still warm after historian?"));
 });
 
+
+
+test("retirement waits for a successful replacement and preserves the current session", async () => {
+	const driver = new FakeDriver();
+	const sessions: AcpSessions = {};
+	const model = toPiModel(FALLBACK_MODELS[0]);
+	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver), sessions });
+	const firstUser = user("original question");
+	driver.script = [{ type: "text", delta: "first" }];
+	const first = (await collect(stream(model, context([system(), firstUser])))).find((event) => event.type === "done");
+	if (first?.type !== "done") throw new Error("missing first reply");
+	const firstSession = sessions.warm!.sessionId;
+	const later = user("continue");
+	await collect(stream(model, context([system(), firstUser, first.message, later])));
+	assert.deepEqual(driver.retired, [], "normal warm reuse never retires its session");
+	// Changing the effective transcript forces a new session. A failed attempt
+	// cannot retire the last good session; a later successful retry can.
+	driver.autoFinish = false;
+	const changed = [system(), user("summarized old question"), user("next")];
+	const failed = collect(stream(model, context(changed)));
+	await vi.waitFor(() => assert.equal(driver.requests.length, 3));
+	(driver.activeHandle as FakeHandle).complete({ status: "ERROR", response: "", aborted: false, conversationId: "failed-session", error: "test failure" });
+	await failed;
+	assert.deepEqual(driver.retired, []);
+	driver.autoFinish = true;
+	await collect(stream(model, context(changed)));
+	assert.ok(sessions.retirementCandidates?.has(firstSession), "the old session awaits a persisted Pi checkpoint");
+});
 test("mid-turn history compression rebuilds once, then reuses the rebuilt session", async () => {
 	const driver = new FakeDriver();
 	driver.autoFinish = false;

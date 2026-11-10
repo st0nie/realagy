@@ -586,8 +586,10 @@ async function consumeTurn(
  *  is reusable; tree navigation and compaction clear it before the next turn. */
 export interface AcpSessions {
 	warm?: WarmSession;
+	/** Former checkpoints awaiting a successful persisted replacement. */
+	retirementCandidates?: Set<string>;
 	/** Invoked when a turn settles and records a WarmSession worth persisting. */
-	onWarm?: (warm: WarmSession) => void;
+	onWarm?: (warm: WarmSession, canRetire: boolean) => void;
 	/** cwd of the in-flight turn, for continuations that complete it. */
 	turnCwd?: string;
 	/** In-flight toolUse turn whose escalated pi tool is still running. */
@@ -613,16 +615,16 @@ export interface StreamSimpleDeps {
 
 export function createStreamSimple(deps: StreamSimpleDeps) {
 	const sessions = deps.sessions ?? {};
-	const remember = (warm: WarmSession, settled: boolean): void => {
+	const remember = (warm: WarmSession, settled: boolean, canRetire = false): void => {
 		sessions.warm = warm;
-		if (settled) sessions.onWarm?.(warm);
+		if (settled) sessions.onWarm?.(warm, canRetire);
 	};
 	/** Record a settled turn after completion, or after an abort once agy
 	 *  recorded its prompt. A failed turn leaves no reusable native cache. */
 	const recordWarm = (targetContext: TranscriptContext, outcome: TurnOutcome, final: AssistantMessage): void => {
 		if (outcome.status !== "OK" || !outcome.conversationId || sessions.turnCwd === undefined) return;
 		if (outcome.aborted && outcome.promptDelivered !== true) return;
-		remember(warmAfterTurn(targetContext, final, outcome.conversationId, sessions.turnCwd), true);
+		remember(warmAfterTurn(targetContext, final, outcome.conversationId, sessions.turnCwd), true, !outcome.aborted && !quotaExhaustion(outcome.response) && !agyCapacityNotice(outcome.response));
 	};
 	/** At a pi tool call the native session holds the transcript through toolUse;
 	 *  retain that exact prefix in memory if Esc interrupts the running tool. */
@@ -652,6 +654,8 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					message.role === "toolResult" && deps.roundTrips.isPending(message.toolCallId),
 				);
 				const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+				const previousSession = sessions.warm?.sessionId;
+				if (previousSession) (sessions.retirementCandidates ??= new Set()).add(previousSession);
 				const plan = selectTurnPlan(context, cwd, sessions, deps.replayBudgetBytes?.() ?? UNLOCKED_REPLAY_BUDGET_BYTES);
 				// Settle completed Pi calls before cancelling the old model turn.
 				// Otherwise its generic abort handler can reject an already-completed

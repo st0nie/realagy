@@ -5,13 +5,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
 	ensure: vi.fn(), listModels: vi.fn(), close: vi.fn(), restart: vi.fn(), register: vi.fn(), fetchCliUsage: vi.fn(),
+	retire: vi.fn(), streamDeps: undefined as undefined | Record<string, any>,
 	driverOptions: undefined as undefined | Record<string, any>,
 	driver: undefined as undefined | Record<string, any>,
 	bridge: undefined as undefined | Record<string, any>,
 	roundTrips: undefined as undefined | Record<string, any>,
 	onToolCall: vi.fn(), failParkedCalls: vi.fn(),
 }));
-vi.mock("../src/acp/setup.js", () => ({ ensureAgyReady: mocks.ensure, resolveAgyBinary: () => "agy", MANUAL_SETUP: "curl -fsSL https://antigravity.google/cli/install.sh | bash" }));
+vi.mock("../src/acp/setup.js", () => ({ agyDataDir: () => path.join(process.env.PI_CODING_AGENT_DIR ?? os.tmpdir(), "fake-agy"), ensureAgyReady: mocks.ensure, resolveAgyBinary: () => "agy", MANUAL_SETUP: "curl -fsSL https://antigravity.google/cli/install.sh | bash" }));
 vi.mock("../src/acp/connection.js", () => ({ resolveAcpBinary: () => "agy" }));
 vi.mock("../src/quota.js", () => ({ fetchCliUsage: mocks.fetchCliUsage, UsageMeter: class { setQuota() {} report() { return "REPORT"; } } }));
 vi.mock("../src/acp/driver.js", () => ({ AcpDriver: class {
@@ -19,6 +20,7 @@ vi.mock("../src/acp/driver.js", () => ({ AcpDriver: class {
 	listModels = mocks.listModels;
 	close = mocks.close;
 	restart = mocks.restart;
+	retireSession = mocks.retire;
 	activeHandle = null;
 	constructor(options: Record<string, any>) { mocks.driverOptions = options; mocks.driver = this; }
 } }));
@@ -30,7 +32,7 @@ vi.mock("../src/mcp-server.js", () => ({
 	TOKEN_HEADER: "token",
 }));
 vi.mock("../src/provider.js", () => ({
-	createStreamSimple: vi.fn(),
+	createStreamSimple: vi.fn((deps: Record<string, any>) => { mocks.streamDeps = deps; return vi.fn(); }),
 	failParkedCalls: mocks.failParkedCalls,
 	POLL_TOOL_NAME: "poll",
 	ToolRoundTrips: class {
@@ -43,6 +45,7 @@ vi.mock("../src/provider.js", () => ({
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import extension from "../extensions/index.js";
 
+import { SessionRetention } from "../src/acp/session-retention.js";
 function deferred<T>() {
 	let resolve!: (value: T) => void;
 	const promise = new Promise<T>((done) => { resolve = done; });
@@ -149,6 +152,39 @@ describe("agy background work in pi", () => {
 });
 
 describe("extension session lifecycle", () => {
+	it("leases the restored checkpoint before sweeping and skips cleanup if leasing fails", async () => {
+		const h = await start();
+		const events: string[] = [];
+		const acquire = vi.spyOn(SessionRetention.prototype, "acquire").mockImplementation(() => { events.push("lease"); return false; });
+		const sweep = vi.spyOn(SessionRetention.prototype, "sweep").mockImplementation(() => { events.push("sweep"); return 0; });
+		const warm = { sessionId: "00000000-0000-4000-8000-000000000001", cwd: "/w", count: 1, hash: "h", systemPrompt: "s", tools: "" };
+		const ctx = { ...h.ctx, sessionManager: { getBranch: () => [{ type: "custom", customType: "realagy-warm-session", data: warm }] } };
+		try {
+			h.handlers.get("session_start")!({}, ctx);
+			expect(events).toEqual(["lease"]);
+			acquire.mockImplementation(() => { events.push("lease"); return true; });
+			h.handlers.get("session_start")!({}, ctx);
+			expect(events).toEqual(["lease", "lease", "sweep"]);
+		} finally { acquire.mockRestore(); sweep.mockRestore(); h.shutdown(); }
+	});
+	it("retires candidates only after a successful checkpoint is persisted", async () => {
+		const h = await start();
+		const sessions = mocks.streamDeps!.sessions;
+		sessions.retirementCandidates = new Set(["old", "current"]);
+		const entry = { sessionId: "current" };
+		sessions.onWarm(entry, false);
+		h.handlers.get("turn_end")!();
+		expect(mocks.retire).not.toHaveBeenCalled();
+		sessions.onWarm(entry, true);
+		h.pi.appendEntry.mockImplementationOnce(() => { throw new Error("read only"); });
+		h.handlers.get("turn_end")!();
+		expect(mocks.retire).not.toHaveBeenCalled();
+		sessions.onWarm(entry, true);
+		h.handlers.get("turn_end")!();
+		expect(mocks.retire).toHaveBeenCalledExactlyOnceWith("old");
+		expect(sessions.retirementCandidates.has("current")).toBe(true);
+		h.shutdown();
+	});
 	it("prompts with install instructions when agy is missing and does not install", async () => {
 		mocks.ensure.mockReturnValue({ ok: false, error: "the Antigravity CLI (agy) is not installed", manual: "curl -fsSL https://antigravity.google/cli/install.sh | bash" });
 		const session = await start();
