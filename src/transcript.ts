@@ -67,7 +67,7 @@ function contentText(content: unknown): string {
 }
 
 /** One message as transcript text. Images are numbered from `imageBase + 1`. */
-function serializeMessage(message: Message, imageBase: number): { text: string; images: AcpImage[] } {
+function serializeMessage(message: Message, imageBase: number, imageReference?: (index: number) => string): { text: string; images: AcpImage[] } {
 	const images: AcpImage[] = [];
 	if (message.role === "user" || message.role === "toolResult") {
 		const text = contentText(message.content);
@@ -75,7 +75,7 @@ function serializeMessage(message: Message, imageBase: number): { text: string; 
 		for (const block of Array.isArray(message.content) ? message.content : []) {
 			if (block.type !== "image") continue;
 			images.push({ data: block.data, mimeType: block.mimeType });
-			references.push(`[Attached image ${imageBase + images.length}]`);
+			references.push(imageReference?.(images.length - 1) ?? `[Attached image ${imageBase + images.length}]`);
 		}
 		const content = [text, ...references].filter(Boolean).join("\n");
 		if (message.role === "user") return { text: content ? `<user>\n${content}\n</user>` : "", images };
@@ -268,11 +268,10 @@ function renderSystemDelta(messages: readonly Message[]): string {
 	return parts.join("\n\n");
 }
 
-/** Render a historical image as a placeholder; only live-input images are
- *  attached to the rebuilt ACP prompt. */
-function serializeReplayMessage(message: Message): string {
-	return serializeMessage(message, 0).text.replace(/\[Attached image \d+\]/g, "[Image in original transcript]");
-}
+export const MAX_REPLAY_IMAGES = 20;
+export const MAX_REPLAY_IMAGE_BYTES = 20 * 1024 * 1024;
+const REPLAY_IMAGE_OMITTED = "[Image omitted: historical image replay limit]";
+const TRUNCATED_IMAGE_NOTICE = "[Images omitted: truncated tool result]";
 
 /** Keep a valid UTF-8 suffix of at most `maxBytes`, with an explicit marker. */
 function headWithinBytes(text: string, maxBytes: number): string {
@@ -285,34 +284,68 @@ function headWithinBytes(text: string, maxBytes: number): string {
 	return marker + buffer.subarray(start).toString("utf8");
 }
 
-/** DSH-style bounded replay: whole messages newest-first, one omission note,
- *  and only an oversized newest historical tool result may be truncated. */
-export function serializeHistoryReplay(messages: readonly Message[], maxBytes: number): string {
-	const rendered = messages.map(serializeReplayMessage).filter(Boolean);
-	if (Buffer.byteLength(rendered.join("\n\n"), "utf8") <= maxBytes) {
-		return rendered.length > 0 ? `<pi_history>\n${rendered.join("\n\n")}\n</pi_history>` : "";
-	}
-	const kept: string[] = [];
+/** Select bounded historical text before selecting its images. Image slots are
+ *  reserved at the size of the omission notice, so numbering cannot push a
+ *  retained message past the text budget. */
+function historyReplay(messages: readonly Message[], maxBytes: number): { text: string; images: AcpImage[] } {
+	const rendered = messages.map((message) => ({
+		message,
+		...serializeMessage(message, 0, () => REPLAY_IMAGE_OMITTED),
+	})).filter((item) => item.text);
+	const kept: typeof rendered = [];
 	let used = 0;
 	let omitted = 0;
+	let truncated: string | undefined;
 	for (let index = rendered.length - 1; index >= 0; index--) {
-		const text = rendered[index]!;
-		const separator = kept.length > 0 ? 2 : 0;
-		const size = Buffer.byteLength(text, "utf8") + separator;
+		const item = rendered[index];
+		if (!item) continue;
+		const size = Buffer.byteLength(item.text, "utf8") + (kept.length > 0 ? 2 : 0);
 		if (used + size <= maxBytes) {
-			kept.unshift(text);
+			kept.unshift(item);
 			used += size;
 			continue;
 		}
-		if (kept.length === 0 && maxBytes > 1024 && messages[index]?.role === "toolResult") {
-			const truncated = headWithinBytes(text, maxBytes);
-			if (truncated) kept.unshift(truncated);
+		if (kept.length === 0 && maxBytes > 1024 && item.message.role === "toolResult") {
+			const notice = item.images.length ? `\n${TRUNCATED_IMAGE_NOTICE}` : "";
+			const partial = headWithinBytes(item.text, maxBytes - Buffer.byteLength(notice, "utf8"));
+			if (partial) truncated = partial + notice;
 		}
 		omitted = index + 1;
 		break;
 	}
-	if (omitted > 0) kept.unshift(`[Earlier ${omitted} history messages omitted to fit the context replay budget]`);
-	return kept.length > 0 ? `<pi_history>\n${kept.join("\n\n")}\n</pi_history>` : "";
+	// Choose newest images first, independently of their chronological output order.
+	const allowed = kept.map((item) => item.images.map(() => false));
+	let count = 0;
+	let bytes = 0;
+	for (let i = kept.length - 1; i >= 0; i--) {
+		const item = kept[i];
+		const flags = allowed[i];
+		if (!item || !flags) continue;
+		for (let j = item.images.length - 1; j >= 0; j--) {
+			const image = item.images[j];
+			if (!image) continue;
+			const size = Buffer.byteLength(image.data, "base64");
+			if (count >= MAX_REPLAY_IMAGES || bytes + size > MAX_REPLAY_IMAGE_BYTES) continue;
+			flags[j] = true;
+			count++;
+			bytes += size;
+		}
+	}
+	const images: AcpImage[] = [];
+	const parts = kept.map((item, i) => serializeMessage(item.message, 0, (j) => {
+		const image = item.images[j];
+		if (!allowed[i]?.[j] || !image) return REPLAY_IMAGE_OMITTED;
+		images.push(image);
+		return `[Attached image ${images.length}]`;
+	}).text);
+	if (truncated) parts.unshift(truncated);
+	if (omitted > 0) parts.unshift(`[Earlier ${omitted} history messages omitted to fit the context replay budget]`);
+	return { text: parts.length ? `<pi_history>\n${parts.join("\n\n")}\n</pi_history>` : "", images };
+}
+
+/** Text-only view of bounded history; use freshInput to include image blocks. */
+export function serializeHistoryReplay(messages: readonly Message[], maxBytes: number): string {
+	return historyReplay(messages, maxBytes).text;
 }
 
 /** One fresh ACP prompt: Pi system instructions, bounded `<pi_history>`, then
@@ -321,8 +354,20 @@ export function freshInput(context: TranscriptContext, maxBytes = UNLOCKED_REPLA
 	// Fresh requests must include transient current-turn injections exactly once;
 	// only warm-prefix bookkeeping excludes them.
 	const visible = context.messages.filter((message) => message.role !== "system");
+	// pi-lens can append separate ephemeral user messages after the actual input.
+	// Keep them together without treating earlier completed user turns as live.
+	let inputStart = visible.length;
 	const last = visible.at(-1);
-	const inputStart = last?.role === "user" && !isHistorySummary(last) ? visible.length - 1 : visible.length;
+	if (last?.role === "user" && !isHistorySummary(last)) {
+		inputStart--;
+		while (inputStart > 0) {
+			const current = visible[inputStart];
+			if (!current || !isEphemeralMessage(current)) break;
+			inputStart--;
+		}
+		const first = visible[inputStart];
+		if (!first || first.role !== "user" || isHistorySummary(first)) inputStart++;
+	}
 	const history = visible.slice(0, inputStart);
 	const trailing = visible.slice(inputStart);
 	const texts: string[] = [];
@@ -339,8 +384,14 @@ export function freshInput(context: TranscriptContext, maxBytes = UNLOCKED_REPLA
 	const system = systemText ? `<pi-system>\n${systemText}\n</pi-system>` : "";
 	const fixedBytes = Buffer.byteLength([system, live].filter(Boolean).join("\n\n"), "utf8");
 	const historyBytes = Math.max(0, maxBytes - fixedBytes - Buffer.byteLength("<pi_history>\n\n</pi_history>\n\n", "utf8") - 128);
-	const replay = serializeHistoryReplay(history, historyBytes);
-	return { prompt: [system, replay, live].filter(Boolean).join("\n\n"), images };
+	const replay = historyReplay(history, historyBytes);
+	const liveReferences = replay.images.length > 0 && images.length > 0
+		? `Current input images: ${images.map((_, index) => `[Attached image ${replay.images.length + index + 1}]`).join(", ")}.`
+		: "";
+	return {
+		prompt: [system, replay.text, live, liveReferences].filter(Boolean).join("\n\n"),
+		images: [...replay.images, ...images],
+	};
 }
 
 /** Content fingerprint: role, visible text, tool identities, and image bytes.

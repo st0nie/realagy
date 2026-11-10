@@ -92,7 +92,7 @@ async function collect(stream: ReturnType<typeof createAssistantMessageEventStre
 	return events;
 }
 
-test("fresh replay keeps live images and renders historical images as text placeholders", async () => {
+test("fresh replay keeps live images and reattaches historical images", async () => {
 	const driver = new FakeDriver();
 	const entry = FALLBACK_MODELS[0];
 	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
@@ -104,10 +104,11 @@ test("fresh replay keeps live images and renders historical images as text place
 	const [a, b] = driver.requests;
 	assert.match(a.prompt, /look at this$/);
 	assert.deepEqual(a.images, [{ data: image.data, mimeType: image.mimeType }]);
-	assert.match(b.prompt, /<pi_history>[\s\S]*look at this[\s\S]*\[Image in original transcript\][\s\S]*<\/pi_history>/);
+	assert.match(b.prompt, /<pi_history>[\s\S]*look at this[\s\S]*\[Attached image 1\][\s\S]*<\/pi_history>/);
 	assert.ok(b.prompt.endsWith("what is in it?"));
 	assert.equal(b.contextBlock, undefined);
-	assert.deepEqual(b.images, [], "historical image bytes are not replayed");
+	assert.deepEqual(b.images, [{ data: image.data, mimeType: image.mimeType }, { data: image.data, mimeType: image.mimeType }]);
+	assert.match(b.prompt, /\[Attached image 2\]/);
 });
 test("provider streams native thinking/text and maps GPT to its medium ACP slug", async () => {
 	const driver = new FakeDriver();
