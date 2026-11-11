@@ -17,7 +17,8 @@ import type { AssistantMessage, AssistantMessageEvent, Message, TranscriptContex
 import { test, vi } from "vitest";
 import { AcpDriver } from "../src/acp/driver.js";
 import { createStreamSimple, failParkedCalls, ToolRoundTrips, type AcpSessions } from "../src/provider.js";
-import { FALLBACK_MODELS, toPiModel } from "../src/models.js";
+import { toPiModel } from "../src/models.js";
+import { TEST_MODELS } from "./helpers/model-fixtures.js";
 import { MAX_TRANSCRIPT_BYTES, type WarmSession } from "../src/transcript.js";
 
 type WireRequest = { id?: number; method: string; params: Record<string, any> };
@@ -49,8 +50,8 @@ function harness() {
 	driver.onTurnEnd = (outcome) => failParkedCalls(roundTrips, outcome);
 	const persisted: WarmSession[] = [];
 	const sessions: AcpSessions = { onWarm: (warm) => persisted.push(warm) };
-	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions, replayBudgetBytes: () => MAX_TRANSCRIPT_BYTES });
-	const model = toPiModel(FALLBACK_MODELS.find((entry) => entry.id === "gemini-3-8-flash")!);
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips, sessions, replayBudgetBytes: () => MAX_TRANSCRIPT_BYTES });
+	const model = toPiModel(TEST_MODELS.find((entry) => entry.id === "gemini-3-8-flash")!);
 	const wire = () => fs.readFileSync(capture, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line) as WireRequest);
 	const prompts = () => wire().filter((request) => request.method === "session/prompt").map((request) => ({
 		sessionId: request.params.sessionId as string,

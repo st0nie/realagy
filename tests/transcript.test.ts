@@ -6,7 +6,8 @@ import { createStreamSimple, ToolRoundTrips, type AcpSessions } from "../src/pro
 import { DELTA_PROMPT, EMPTY_INPUT_CONTINUATION, LOCKED_REPLAY_BUDGET_BYTES, MAX_TRANSCRIPT_BYTES, planTurn, splitUtf8, UNLOCKED_REPLAY_BUDGET_BYTES, warmAfterTurn } from "../src/transcript.js";
 import { treeRestoreExtras } from "../src/tool-loadout.js";
 import { UsageMeter } from "../src/quota.js";
-import { FALLBACK_MODELS, toPiModel } from "../src/models.js";
+import { toPiModel } from "../src/models.js";
+import { TEST_MODELS } from "./helpers/model-fixtures.js";
 import type { DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../src/driver-types.js";
 
 const tool = (name: string) => ({ name, description: name, parameters: { type: "object", properties: {} } });
@@ -103,8 +104,8 @@ test("provider reports exact step usage, reuses the ACP session, and feeds the m
 	]);
 	const sessions: AcpSessions = {};
 	const meter = new UsageMeter();
-	const model = toPiModel(FALLBACK_MODELS[0]);
-	const streamSimple = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver), sessions, meter });
+	const model = toPiModel(TEST_MODELS[0]);
+	const streamSimple = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips: new ToolRoundTrips(driver), sessions, meter });
 	const first = [system(), user("hello")];
 	const done = await run(streamSimple(model, ctx(first), { cwd: "/w" } as never));
 	assert.equal(done.type, "done");
@@ -124,8 +125,8 @@ test("provider reports exact step usage, reuses the ACP session, and feeds the m
 
 test("provider leaves unmeasured messages to pi and turns quota notices into errors", async () => {
 	const driver = new ScriptDriver([{ type: "text", delta: "x" }]);
-	const model = toPiModel(FALLBACK_MODELS[0]);
-	const done = await run(createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver) })(model, ctx([system(), user("hello")])));
+	const model = toPiModel(TEST_MODELS[0]);
+	const done = await run(createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips: new ToolRoundTrips(driver) })(model, ctx([system(), user("hello")])));
 	assert.equal(done.type, "done");
 	if (done.type === "done") assert.equal(calculateContextTokens(done.message.usage), 0);
 
@@ -133,7 +134,7 @@ test("provider leaves unmeasured messages to pi and turns quota notices into err
 	const exhaustedDriver = new ScriptDriver([{ type: "text", delta: notice }], { response: notice });
 	const meter = new UsageMeter();
 	const sessions: AcpSessions = {};
-	const failed = await run(createStreamSimple({ entries: [...FALLBACK_MODELS], driver: exhaustedDriver, roundTrips: new ToolRoundTrips(exhaustedDriver), meter, sessions })(model, ctx([system(), user("hello")])));
+	const failed = await run(createStreamSimple({ entries: [...TEST_MODELS], driver: exhaustedDriver, roundTrips: new ToolRoundTrips(exhaustedDriver), meter, sessions })(model, ctx([system(), user("hello")])));
 	assert.equal(failed.type, "error");
 	assert.match(meter.report(), /Quota exhausted/);
 	assert.equal(sessions.warm, undefined);

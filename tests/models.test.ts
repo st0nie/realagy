@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
-import { entriesFromAcpModels, FALLBACK_MODELS, familyLimits, toAgyEffort, toPiModel } from "../src/models.js";
+import { entriesFromAcpModels, familyLimits, toAgyEffort, toPiModel } from "../src/models.js";
 
 const LIVE = [
 	{ modelId: "gemini-4-argon-medium", name: "Gemini 4 Argon (Medium)" },
@@ -111,10 +111,4 @@ test("unknown families remain exact-slug fixed models and noise is rejected", ()
 		["futuremodel-x-high", undefined],
 	]);
 	assert.equal(toPiModel(entries[0]).reasoning, false);
-});
-
-test("offline fallback also includes every supported family", () => {
-	for (const id of ["gemini-4-argon", "gemini-3-8-flash", "claude-opus-5-5", "claude-sonnet-5-5", "gpt-oss-120b"]) {
-		assert.ok(FALLBACK_MODELS.some((entry) => entry.id === id), id);
-	}
 });

@@ -44,6 +44,7 @@ vi.mock("../src/provider.js", () => ({
 
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import extension from "../extensions/index.js";
+import { TEST_MODELS } from "./helpers/model-fixtures.js";
 
 import { SessionRetention } from "../src/acp/session-retention.js";
 function deferred<T>() {
@@ -55,6 +56,13 @@ function deferred<T>() {
 type FakeTool = { name: string; description?: string; exposure?: string; parameters?: object };
 
 let tempAgentDirs: string[] = [];
+
+function agentDirWithModels(): string {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-ext-agent-"));
+	fs.mkdirSync(path.join(dir, "realagy"), { recursive: true });
+	fs.writeFileSync(path.join(dir, "realagy", "models.json"), JSON.stringify({ version: 1, models: TEST_MODELS }));
+	return dir;
+}
 
 async function start(
 	tools: { all: FakeTool[]; active: string[] } = { all: [], active: [] },
@@ -153,6 +161,30 @@ describe("agy background work in pi", () => {
 });
 
 describe("extension session lifecycle", () => {
+	it("starts without models, shows discovery progress, and registers discovered models", async () => {
+		const pending = deferred<Array<{ modelId: string }>>();
+		mocks.ensure.mockReturnValue({ ok: true, bin: "agy" });
+		mocks.listModels.mockReturnValueOnce(pending.promise);
+		const session = await start();
+		expect(mocks.register.mock.calls[0][0].getModels()).toEqual([]);
+		expect(session.ui.setStatus).toHaveBeenCalledWith("realagy-model-discovery", expect.stringContaining("discovering"));
+		pending.resolve([{ modelId: "gemini-4-carbon-high" }]);
+		await vi.waitFor(() => expect(mocks.register.mock.lastCall![0].getModels().map((model: { id: string }) => model.id)).toEqual(["gemini-4-carbon"]));
+		await vi.waitFor(() => expect(session.ui.setStatus).toHaveBeenLastCalledWith("realagy-model-discovery", undefined));
+		session.shutdown();
+	});
+
+	it("warns when discovery returns no models and recovers with refresh", async () => {
+		mocks.ensure.mockReturnValue({ ok: true, bin: "agy" });
+		mocks.listModels.mockResolvedValueOnce([]);
+		const session = await start();
+		await vi.waitFor(() => expect(session.ui.notify).toHaveBeenCalledWith(expect.stringContaining("/realagy refresh"), "warning"));
+		expect(mocks.register.mock.calls[0][0].getModels()).toEqual([]);
+		mocks.listModels.mockResolvedValueOnce([{ modelId: "gemini-4-carbon-high" }]);
+		await session.commands.get("realagy").handler("refresh", session.ctx);
+		expect(mocks.register.mock.lastCall![0].getModels().map((model: { id: string }) => model.id)).toEqual(["gemini-4-carbon"]);
+		session.shutdown();
+	});
 	it("leases the restored checkpoint before sweeping and skips cleanup if leasing fails", async () => {
 		const h = await start();
 		const events: string[] = [];
@@ -244,7 +276,7 @@ describe("extension session lifecycle", () => {
 
 	it("opens Settings, Usage, or Setup from bare /realagy and honors menu cancellation", async () => {
 		mocks.ensure.mockReturnValue({ ok: true, bin: "agy" });
-		mocks.listModels.mockResolvedValue([]);
+		mocks.listModels.mockResolvedValue([{ modelId: "gemini-4-carbon-high" }]);
 		const session = await start();
 		let selected: string | undefined;
 		const select = vi.fn(async (title: string, _options: string[]) => {
@@ -277,7 +309,7 @@ describe("extension session lifecycle", () => {
 	it("registers /realagy with completions and notifies only after fresh quota resolves", async () => {
 		const quota = deferred<never[]>();
 		mocks.ensure.mockReturnValue({ ok: true, bin: "agy" });
-		mocks.listModels.mockResolvedValue([]);
+		mocks.listModels.mockResolvedValue([{ modelId: "gemini-4-carbon-high" }]);
 		mocks.fetchCliUsage.mockReturnValueOnce(quota.promise);
 		const session = await start();
 		const realagy = session.commands.get("realagy");
@@ -349,6 +381,7 @@ describe("extension session lifecycle", () => {
 				contextWindow: 400_000,
 				contextWindowOverrides: { "gemini-4-argon": 700_000 },
 			},
+			agentDirWithModels(),
 		);
 		const initialModels = mocks.register.mock.calls[0][0].getModels();
 		expect(initialModels.find((m: { id: string }) => m.id === "gemini-4-argon").contextWindow).toBe(700_000);
@@ -422,7 +455,7 @@ describe("extension session lifecycle", () => {
 	it("enables compaction bypass and 1M Argon window by default, and persists /realagy settings to config.json", async () => {
 		initTheme();
 		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
-		const session = await start({ all: [{ name: "bash", exposure: "direct" }], active: ["bash"] });
+		const session = await start({ all: [{ name: "bash", exposure: "direct" }], active: ["bash"] }, undefined, agentDirWithModels());
 		expect(session.driver.noAutoCompaction()).toBe(true);
 		expect(session.driver.fullMcpOutput()).toBe(true);
 		const initialProvider = mocks.register.mock.calls[0][0];

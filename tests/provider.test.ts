@@ -5,7 +5,8 @@ import { test, vi } from "vitest";
 import { runAgentLoop, type AgentTool } from "@earendil-works/pi-agent-core";
 import { createStreamSimple, ESCALATE_AFTER_MS, failParkedCalls, POLL_TOOL_NAME, ToolRoundTrips, type AcpSessions } from "../src/provider.js";
 import type { DriverActivity, DriverTurnRequest, TurnDriver, TurnHandle, TurnOutcome } from "../src/driver-types.js";
-import { FALLBACK_MODELS, toPiModel } from "../src/models.js";
+import { toPiModel } from "../src/models.js";
+import { TEST_MODELS } from "./helpers/model-fixtures.js";
 import { PARALLEL_TOOL_NAME } from "../src/parallel.js";
 import { freshInput, planTurn, warmAfterTurn } from "../src/transcript.js";
 class FakeHandle implements TurnHandle {
@@ -94,8 +95,8 @@ async function collect(stream: ReturnType<typeof createAssistantMessageEventStre
 
 test("fresh replay keeps live images and reattaches historical images", async () => {
 	const driver = new FakeDriver();
-	const entry = FALLBACK_MODELS[0];
-	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
+	const entry = TEST_MODELS[0];
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
 	const image = { type: "image" as const, data: "aW1hZ2U=", mimeType: "image/png" };
 	const first: Message = { role: "user", content: [{ type: "text", text: "look at this" }, image], timestamp: 1 };
 	const result: Message = { role: "toolResult", toolCallId: "call", toolName: "read", content: [{ type: "text", text: "image file" }, image], isError: false, timestamp: 2 };
@@ -113,8 +114,8 @@ test("fresh replay keeps live images and reattaches historical images", async ()
 test("provider streams native thinking/text and maps GPT to its medium ACP slug", async () => {
 	const driver = new FakeDriver();
 	driver.script = [{ type: "thought", delta: "reasoning" }, { type: "text", delta: "OK" }];
-	const entry = FALLBACK_MODELS.find((candidate) => candidate.id === "gpt-oss-120b")!;
-	const entries = [...FALLBACK_MODELS];
+	const entry = TEST_MODELS.find((candidate) => candidate.id === "gpt-oss-120b")!;
+	const entries = [...TEST_MODELS];
 	const stream = createStreamSimple({ entries, driver, roundTrips: new ToolRoundTrips(driver) })(
 		toPiModel(entry), context([system(), user("Reply")]), { reasoning: "high" },
 	);
@@ -130,10 +131,10 @@ test("provider streams native thinking/text and maps GPT to its medium ACP slug"
 test("large thinking chunks play incrementally and flush before answer text", async () => {
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
-	const simple = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
+	const simple = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
 	const events: AssistantMessageEvent[] = [];
 	const collecting = (async () => {
-		for await (const event of simple(toPiModel(FALLBACK_MODELS[0]), context([system(), user("Reply")]))) events.push(event);
+		for await (const event of simple(toPiModel(TEST_MODELS[0]), context([system(), user("Reply")]))) events.push(event);
 	})();
 	await vi.waitFor(() => assert.ok(driver.activeHandle));
 	const handle = driver.activeHandle as FakeHandle;
@@ -156,10 +157,10 @@ test("pending thinking flushes on abort and before tool dispatch", async () => {
 	for (const boundary of ["abort", "tool"] as const) {
 		const driver = new FakeDriver();
 		driver.autoFinish = false;
-		const simple = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
+		const simple = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
 		const events: AssistantMessageEvent[] = [];
 		const collecting = (async () => {
-			for await (const event of simple(toPiModel(FALLBACK_MODELS[0]), context([system(), user("Reply")]))) events.push(event);
+			for await (const event of simple(toPiModel(TEST_MODELS[0]), context([system(), user("Reply")]))) events.push(event);
 		})();
 		await vi.waitFor(() => assert.ok(driver.activeHandle));
 		const handle = driver.activeHandle as FakeHandle;
@@ -179,10 +180,10 @@ test("pending thinking flushes on abort and before tool dispatch", async () => {
 test("large answer chunks play incrementally and flush before thinking", async () => {
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
-	const simple = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
+	const simple = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
 	const events: AssistantMessageEvent[] = [];
 	const collecting = (async () => {
-		for await (const event of simple(toPiModel(FALLBACK_MODELS[0]), context([system(), user("Reply")]))) events.push(event);
+		for await (const event of simple(toPiModel(TEST_MODELS[0]), context([system(), user("Reply")]))) events.push(event);
 	})();
 	await vi.waitFor(() => assert.ok(driver.activeHandle));
 	const handle = driver.activeHandle as FakeHandle;
@@ -205,10 +206,10 @@ test("pending answer text flushes on completion, abort and tool dispatch", async
 	for (const boundary of ["complete", "abort", "tool"] as const) {
 		const driver = new FakeDriver();
 		driver.autoFinish = false;
-		const simple = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
+		const simple = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
 		const events: AssistantMessageEvent[] = [];
 		const collecting = (async () => {
-			for await (const event of simple(toPiModel(FALLBACK_MODELS[0]), context([system(), user("Reply")]))) events.push(event);
+			for await (const event of simple(toPiModel(TEST_MODELS[0]), context([system(), user("Reply")]))) events.push(event);
 		})();
 		await vi.waitFor(() => assert.ok(driver.activeHandle));
 		const handle = driver.activeHandle as FakeHandle;
@@ -232,8 +233,8 @@ test("provider preserves context occupancy separately from cumulative usage", as
 		{ type: "usage", usage: { input_tokens: 693513, output_tokens: 3731, total_tokens: 697244, cache_read_tokens: 633000, cache_write_tokens: 966 } },
 		{ type: "text", delta: "OK" },
 	];
-	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
-	const done = (await collect(stream(toPiModel(FALLBACK_MODELS[0]), context([system(), user("Reply")])))).find((event) => event.type === "done");
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
+	const done = (await collect(stream(toPiModel(TEST_MODELS[0]), context([system(), user("Reply")])))).find((event) => event.type === "done");
 	assert.equal(done?.type, "done");
 	if (done?.type !== "done") throw new Error("No done event");
 	assert.equal(done.message.usage.totalTokens, 54357);
@@ -257,9 +258,9 @@ test("provider preserves context occupancy separately from cumulative usage", as
 test("a new pi turn cancels a turn left parked on unanswered tool calls instead of queueing behind it", async () => {
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
-	const model = toPiModel(FALLBACK_MODELS[0]);
+	const model = toPiModel(TEST_MODELS[0]);
 	const roundTrips = new ToolRoundTrips(driver);
-	const streamSimple = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips });
+	const streamSimple = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips });
 	const first = collect(streamSimple(model, context([system(), user("Run bash")])));
 	await vi.waitFor(() => assert.equal(driver.requests.length, 1));
 	void roundTrips.onToolCall("call-1", "bash", { command: "sleep 1" }, new AbortController().signal);
@@ -279,8 +280,8 @@ test("a new pi turn cancels a turn left parked on unanswered tool calls instead 
 test("MCP call becomes a genuine pi toolUse and its toolResult resumes ACP", async () => {
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
-	const entries = [...FALLBACK_MODELS];
-	const model = toPiModel(FALLBACK_MODELS.find((candidate) => candidate.id === "claude-sonnet-5-5")!);
+	const entries = [...TEST_MODELS];
+	const model = toPiModel(TEST_MODELS.find((candidate) => candidate.id === "claude-sonnet-5-5")!);
 	const roundTrips = new ToolRoundTrips(driver);
 	const streamSimple = createStreamSimple({ entries, driver, roundTrips });
 
@@ -315,8 +316,8 @@ test("parallel emits genuine Pi calls that the native agent loop executes concur
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
 	const roundTrips = new ToolRoundTrips(driver);
-	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips });
-	const model = toPiModel(FALLBACK_MODELS[0]);
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips });
+	const model = toPiModel(TEST_MODELS[0]);
 	let releaseFirst!: () => void;
 	let releaseSecond!: () => void;
 	const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
@@ -467,8 +468,8 @@ test("aborting a parallel Pi turn settles the outer request and every inner call
 	driver.autoFinish = false;
 	const roundTrips = new ToolRoundTrips(driver);
 	driver.onTurnEnd = (outcome) => failParkedCalls(roundTrips, outcome);
-	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips });
-	const model = toPiModel(FALLBACK_MODELS[0]);
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips });
+	const model = toPiModel(TEST_MODELS[0]);
 	const abort = new AbortController();
 	const first = collect(stream(model, context([system(), user("parallel")]), { signal: abort.signal }));
 	await vi.waitFor(() => assert.equal(driver.requests.length, 1));
@@ -496,8 +497,8 @@ test("incomplete parallel results fail the batch without re-entering or starting
 	driver.autoFinish = false;
 	const roundTrips = new ToolRoundTrips(driver);
 	driver.onTurnEnd = (outcome) => failParkedCalls(roundTrips, outcome);
-	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips });
-	const model = toPiModel(FALLBACK_MODELS[0]);
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips });
+	const model = toPiModel(TEST_MODELS[0]);
 	let reentries = 0;
 	driver.reentry = () => {
 		reentries++;
@@ -581,8 +582,8 @@ test("slow tools early-ack after ESCALATE_AFTER_MS, long-poll on bridge_poll_res
 test("late toolResult after ACP turn ended while escalated tool was running reuses warm ACP session", async () => {
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
-	const entries = [...FALLBACK_MODELS];
-	const model = toPiModel(FALLBACK_MODELS[0]);
+	const entries = [...TEST_MODELS];
+	const model = toPiModel(TEST_MODELS[0]);
 	const roundTrips = new ToolRoundTrips(driver, { escalateAfterMs: 10, pollWaitMs: 10 });
 	const sessions: AcpSessions = {};
 	const streamSimple = createStreamSimple({ entries, driver, roundTrips, sessions });
@@ -637,8 +638,8 @@ test("image tool results go back as MCP image blocks on the existing ACP handle"
 	driver.autoFinish = false;
 	const close = vi.spyOn(driver, "close");
 	const roundTrips = new ToolRoundTrips(driver);
-	const model = toPiModel(FALLBACK_MODELS[0]);
-	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips });
+	const model = toPiModel(TEST_MODELS[0]);
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips });
 	try {
 		const first = collect(stream(model, context([system(), user("Read the image")])));
 		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
@@ -661,9 +662,9 @@ test("steering messages queued during a tool call ride the MCP tool result and p
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
 	const roundTrips = new ToolRoundTrips(driver);
-	const model = toPiModel(FALLBACK_MODELS[0]);
+	const model = toPiModel(TEST_MODELS[0]);
 	const sessions: AcpSessions = {};
-	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips, sessions });
 	const image = { type: "image" as const, data: "c3RlZXI=", mimeType: "image/png" };
 	try {
 		const turnStart = [system(), user("Update docs")];
@@ -745,7 +746,7 @@ test("large fresh replay is one bounded prompt and keeps the newest input and im
 });
 
 test("applied realctx drops and summaries force a fresh authoritative replay", () => {
-	const model = toPiModel(FALLBACK_MODELS[0]);
+	const model = toPiModel(TEST_MODELS[0]);
 	const img = { type: "image" as const, data: "dXNlckltZw==", mimeType: "image/png" };
 	const turn1User: Message = { role: "user", content: [{ type: "text", text: "inspect this screenshot" }, img], timestamp: 1 };
 	const turn1Asst: Message = {
@@ -836,8 +837,8 @@ test("applied realctx drops and summaries force a fresh authoritative replay", (
 test("retirement waits for a successful replacement and preserves the current session", async () => {
 	const driver = new FakeDriver();
 	const sessions: AcpSessions = {};
-	const model = toPiModel(FALLBACK_MODELS[0]);
-	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips: new ToolRoundTrips(driver), sessions });
+	const model = toPiModel(TEST_MODELS[0]);
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips: new ToolRoundTrips(driver), sessions });
 	const firstUser = user("original question");
 	driver.script = [{ type: "text", delta: "first" }];
 	const first = (await collect(stream(model, context([system(), firstUser])))).find((event) => event.type === "done");
@@ -863,9 +864,9 @@ test("mid-turn history compression rebuilds once, then reuses the rebuilt sessio
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
 	const roundTrips = new ToolRoundTrips(driver);
-	const model = toPiModel(FALLBACK_MODELS[0]);
+	const model = toPiModel(TEST_MODELS[0]);
 	const sessions: AcpSessions = {};
-	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips, sessions });
 	try {
 		const oldTurnUser = user("old question");
 		const oldTurnAsst: Message = {
@@ -935,9 +936,9 @@ test("/tree rewind invalidates the native cache and replays only the selected Pi
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
 	const roundTrips = new ToolRoundTrips(driver);
-	const model = toPiModel(FALLBACK_MODELS[0]);
+	const model = toPiModel(TEST_MODELS[0]);
 	const sessions: AcpSessions = {};
-	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips, sessions });
 	const run = async (messages: Message[], sessionId: string) => {
 		driver.script = [{ type: "text", delta: "answer" }];
 		const previousRequests = driver.requests.length;
@@ -975,7 +976,7 @@ test("/tree rewind invalidates the native cache and replays only the selected Pi
 });
 
 test("effective history changes synchronize while genuine user identity edits diverge", async () => {
-	const model = toPiModel(FALLBACK_MODELS[0]);
+	const model = toPiModel(TEST_MODELS[0]);
 	const makeAsst = (text: string): Message => ({
 		role: "assistant",
 		content: [{ type: "text", text }],
@@ -1072,8 +1073,8 @@ test("effective history changes synchronize while genuine user identity edits di
 test("agy's native tool calls become thinking lines without duplicating the reply text", async () => {
 	const driver = new FakeDriver();
 	const roundTrips = new ToolRoundTrips(driver);
-	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips });
-	const entry = FALLBACK_MODELS.find((candidate) => candidate.id === "gemini-3-8-flash")!;
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips });
+	const entry = TEST_MODELS.find((candidate) => candidate.id === "gemini-3-8-flash")!;
 	driver.autoFinish = false;
 	driver.script = [
 		{ type: "thought", delta: "Let me look" },
@@ -1128,8 +1129,8 @@ test("a reply split by native-tool thinking lines is one assistant reply in the 
 test("agy's high-traffic notice fails the turn as a retryable overload instead of becoming the answer", async () => {
 	const driver = new FakeDriver();
 	const roundTrips = new ToolRoundTrips(driver);
-	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips });
-	const entry = FALLBACK_MODELS.find((candidate) => candidate.id === "gpt-oss-120b")!;
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips });
+	const entry = TEST_MODELS.find((candidate) => candidate.id === "gpt-oss-120b")!;
 	const notice = "\n⚠ Our servers are experiencing high traffic right now, please try again in a minute.\n";
 	driver.autoFinish = false;
 	driver.script = [{ type: "text", delta: notice }];
@@ -1147,7 +1148,7 @@ test("agy's high-traffic notice fails the turn as a retryable overload instead o
 });
 
 function assistantMessage(content: Extract<Message, { role: "assistant" }>["content"], timestamp = Date.now()): Extract<Message, { role: "assistant" }> {
-	const model = toPiModel(FALLBACK_MODELS[0]);
+	const model = toPiModel(TEST_MODELS[0]);
 	return {
 		role: "assistant", content, api: model.api, provider: model.provider, model: model.id,
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
@@ -1165,9 +1166,9 @@ test("mid-turn history drops cancel the parked turn and rebuild from current Pi 
 		driver.autoFinish = false;
 		const roundTrips = new ToolRoundTrips(driver);
 		driver.onTurnEnd = (outcome) => failParkedCalls(roundTrips, outcome);
-		const model = toPiModel(FALLBACK_MODELS[0]);
+		const model = toPiModel(TEST_MODELS[0]);
 		const sessions: AcpSessions = {};
-		const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
+		const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips, sessions });
 		const u1 = user(`read ${"x".repeat(bytes)}`);
 		driver.script = [{ type: "bridge_call", callId: "c1", name: "read", args: {} }];
 		const first = collect(stream(model, context([system(), u1])));
@@ -1199,8 +1200,8 @@ test("an edited aborted assistant cannot reuse its old native session", async ()
 	const driver = new FakeDriver();
 	const roundTrips = new ToolRoundTrips(driver);
 	const sessions: AcpSessions = {};
-	const stream = createStreamSimple({ entries: [...FALLBACK_MODELS], driver, roundTrips, sessions });
-	const model = toPiModel(FALLBACK_MODELS[0]);
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips, sessions });
+	const model = toPiModel(TEST_MODELS[0]);
 	const u1 = user("original question");
 	const aborted = assistantMessage([{ type: "text", text: "partial answer" }]);
 	(aborted as { stopReason: string }).stopReason = "aborted";

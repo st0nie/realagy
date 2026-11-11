@@ -41,7 +41,7 @@ The catalog comes live from agy and depends on the account.
 | `/realagy usage` | Cache-hit rate for this session plus every quota group's 5-hour and weekly remaining share and reset times (from the live `agy acp` server, or `agy --print /usage`) |
 
 Quota is fetched only when you run `/realagy usage`. There is no engine switch, delegation tool, or global MCP registration.
-The last successful model catalog is cached in `~/.pi/agent/realagy/models.json` and loaded immediately on startup. Live discovery replaces it in the background; `/realagy refresh` requests another catalog without restarting agy. A model must first be discovered before it can appear in the cache.
+The last successful model catalog is cached in `~/.pi/agent/realagy/models.json` and loaded immediately on startup. Live discovery replaces it in the background; `/realagy refresh` requests another catalog without restarting agy. Without a valid cache, no models are shown until discovery succeeds. If discovery returns no models, try `/realagy refresh`; if it fails, run `/realagy setup`.
 
 ## Pi tools and agy's own tools
 
@@ -146,7 +146,7 @@ See [docs/configuration.md](docs/configuration.md) for the full configuration re
 | `src/provider.ts` | pi assistant event stream, MCP → `toolUse` → `toolResult` round-trips, usage mapping |
 | `src/parallel.ts` | Explicit `parallel` schema and validation, ordered result/image aggregation |
 | `src/transcript.ts` | Authoritative transcript serialization, exact-prefix warm reuse, and bounded `<pi_history>` rebuild planning |
-| `src/models.ts` | ACP model catalog parsing, effort grouping, per-model limits and overrides, offline fallback catalog |
+| `src/models.ts` | ACP model catalog parsing, effort grouping, per-model limits and overrides |
 | `src/settings.ts` | `/realagy settings` TUI component, validation, and `~/.pi/agent/realagy/config.json` persistence |
 | `src/mcp-server.ts`, `src/bridge-catalog.ts` | Loopback, token-protected MCP server for pi's tools (every tool an extension may activate; only active ones run) |
 | `src/tool-loadout.ts` | Undoes the situational tools pi's `/tree` restore activates |

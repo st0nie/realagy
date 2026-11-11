@@ -18,7 +18,7 @@ import { SessionRetention } from "../src/acp/session-retention.js";
 import { ensureAgyReady, MANUAL_SETUP, resolveAgyBinary } from "../src/acp/setup.js";
 import { bridgedPiTools, bridgeInputSchema, declaresToolArgument, dispatchablePiTool } from "../src/bridge-catalog.js";
 import { startMcpServer, TOKEN_HEADER, type McpServerHandle } from "../src/mcp-server.js";
-import { entriesFromAcpModels, FALLBACK_MODELS, toPiModel, type AgyModelEntry } from "../src/models.js";
+import { entriesFromAcpModels, toPiModel, type AgyModelEntry } from "../src/models.js";
 import { loadModelCache, saveModelCache } from "../src/model-cache.js";
 import {
 	editRealagyConfigMenu,
@@ -52,7 +52,7 @@ const SIGN_IN = [
 ].join("\n");
 
 export default async function (pi: ExtensionAPI): Promise<void> {
-	const entries: AgyModelEntry[] = [...(loadModelCache() ?? FALLBACK_MODELS)];
+	const entries: AgyModelEntry[] = [...(loadModelCache() ?? [])];
 	const configPath = realagyConfigPath();
 	let config = loadRealagyConfig(configPath);
 	pi.registerMessageRenderer(AGY_BACKGROUND_MESSAGE, renderBackgroundCard);
@@ -213,7 +213,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	};
 	const refreshCatalog = async (ctx: { hasUI: boolean; ui: ExtensionUIContext }): Promise<void> => {
 		const result = await discover();
-		if (stopped || result.ok) return;
+		if (stopped || !ctx.hasUI) return;
+		if (result.ok) {
+			if (result.models === 0 && entries.length === 0) ctx.ui.notify("Antigravity returned no models. Run /realagy refresh to try again.", "warning");
+			return;
+		}
 		ctx.ui.notify(result.missing
 			? `Antigravity: ${result.error}. Run /realagy setup for install steps.`
 			: `Antigravity model discovery failed: ${result.error}. Run /realagy setup to sign in.`, "warning");
@@ -234,9 +238,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		if (ctx.hasUI) ui = ctx.ui;
 		// Do not sweep if we could not protect the restored checkpoint.
 		if (syncWarmFromSession(ctx)) sessionRetention.sweep();
+		if (!refresh && ctx.hasUI && entries.length === 0) ctx.ui.setStatus("realagy-model-discovery", "Antigravity: discovering models…");
 		refresh ??= refreshCatalog(ctx).catch((error: unknown) => {
 			if (!stopped && ctx.hasUI) ctx.ui.notify(`Antigravity setup failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
-		}).finally(() => { refresh = null; });
+		}).finally(() => { refresh = null; if (!stopped && ctx.hasUI) ctx.ui.setStatus("realagy-model-discovery", undefined); });
 	});
 	// Active tools before a /tree navigation, to undo the situational tools
 	// pi's restore activates (src/tool-loadout.ts).
@@ -422,6 +427,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				if (stopped || loaded.aborted) return;
 				const result = loaded.value;
 				if (result.ok) {
+					if (result.models === 0) {
+						ctx.ui.notify("Antigravity returned no models. Run /realagy refresh to try again.", "warning");
+						return;
+					}
 					ctx.ui.notify(`Antigravity is ready: ${bin} is signed in and offers ${result.models} models. Pick one with /model.`, "info");
 				} else if (result.missing) {
 					ctx.ui.notify(`Antigravity: ${result.error}.\n\n${MANUAL_SETUP}\n\nThen run /realagy setup again.`, "warning");
