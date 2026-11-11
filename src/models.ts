@@ -1,5 +1,5 @@
 // Antigravity's ACP model catalog, projected into pi's native Model shape.
-// No agy CLI discovery, config file, or second model cache is involved.
+// The last successful projection is persisted by model-cache.ts.
 
 import type { Api, Model, ThinkingLevel, ThinkingLevelMap } from "@earendil-works/pi-ai";
 

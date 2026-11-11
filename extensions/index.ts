@@ -19,6 +19,7 @@ import { ensureAgyReady, MANUAL_SETUP, resolveAgyBinary } from "../src/acp/setup
 import { bridgedPiTools, bridgeInputSchema, declaresToolArgument, dispatchablePiTool } from "../src/bridge-catalog.js";
 import { startMcpServer, TOKEN_HEADER, type McpServerHandle } from "../src/mcp-server.js";
 import { entriesFromAcpModels, FALLBACK_MODELS, toPiModel, type AgyModelEntry } from "../src/models.js";
+import { loadModelCache, saveModelCache } from "../src/model-cache.js";
 import {
 	editRealagyConfigMenu,
 	formatConfigSummary,
@@ -51,7 +52,7 @@ const SIGN_IN = [
 ].join("\n");
 
 export default async function (pi: ExtensionAPI): Promise<void> {
-	const entries: AgyModelEntry[] = [...FALLBACK_MODELS];
+	const entries: AgyModelEntry[] = [...(loadModelCache() ?? FALLBACK_MODELS)];
 	const configPath = realagyConfigPath();
 	let config = loadRealagyConfig(configPath);
 	pi.registerMessageRenderer(AGY_BACKGROUND_MESSAGE, renderBackgroundCard);
@@ -202,6 +203,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 			const discovered = entriesFromAcpModels(await driver.listModels(process.cwd()));
 			if (!stopped && discovered.length > 0) {
 				entries.splice(0, entries.length, ...discovered);
+				saveModelCache(discovered);
 				registerModels();
 			}
 			return { ok: true, models: discovered.length };
@@ -341,11 +343,12 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	};
 
 	pi.registerCommand("realagy", {
-		description: "Antigravity: /realagy settings, /realagy setup, or /realagy usage",
+		description: "Antigravity: /realagy settings, /realagy setup, /realagy refresh, or /realagy usage",
 		getArgumentCompletions: (prefix) => {
 			const items = [
 				{ value: "settings", label: "settings", description: "Configure compaction bypass, agent profile, Pi token limits, and context release" },
 				{ value: "setup", label: "setup", description: "Check agy and show how to install it or sign in" },
+				{ value: "refresh", label: "refresh", description: "Refresh the Antigravity model catalog" },
 				{ value: "usage", label: "usage", description: "Cache hits and plan quota" },
 			];
 			const matches = items.filter((item) => item.value.startsWith(prefix.trim()));
@@ -427,8 +430,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				}
 				return;
 			}
+			if (sub === "refresh") {
+				const loaded = await runWithLoader(ctx, "Refreshing Antigravity models…", () => discover());
+				if (stopped || loaded.aborted) return;
+				const result = loaded.value;
+				if (!result.ok) ctx.ui.notify(`Antigravity model refresh failed: ${result.error}. Previous models retained.`, "warning");
+				else if (result.models === 0) ctx.ui.notify("Antigravity returned no models. Previous models retained.", "warning");
+				else ctx.ui.notify(`Antigravity model catalog refreshed: ${result.models} models. Pick one with /model.`, "info");
+				return;
+			}
 			if (sub !== "usage") {
-				ctx.ui.notify("Usage: /realagy settings | /realagy setup | /realagy usage", "info");
+				ctx.ui.notify("Usage: /realagy settings | /realagy setup | /realagy refresh | /realagy usage", "info");
 				return;
 			}
 			if (!ready) {

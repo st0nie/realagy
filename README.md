@@ -37,9 +37,11 @@ The catalog comes live from agy and depends on the account.
 | `/realagy` | Open an interactive Settings / Usage / Setup menu (cancel returns without running a command) |
 | `/realagy settings` | Configure Agy auto-compaction bypass, Pi-only agent profile, and optional Pi token-limit overrides (`~/.pi/agent/realagy/config.json`) |
 | `/realagy setup` | Checks agy: shows install steps when it is missing, sign-in steps when it cannot start a session, and reloads the model catalog when it is ready |
+| `/realagy refresh` | Refresh the model catalog and update its local cache |
 | `/realagy usage` | Cache-hit rate for this session plus every quota group's 5-hour and weekly remaining share and reset times (from the live `agy acp` server, or `agy --print /usage`) |
 
 Quota is fetched only when you run `/realagy usage`. There is no engine switch, delegation tool, or global MCP registration.
+The last successful model catalog is cached in `~/.pi/agent/realagy/models.json` and loaded immediately on startup. Live discovery replaces it in the background; `/realagy refresh` requests another catalog without restarting agy. A model must first be discovered before it can appear in the cache.
 
 ## Pi tools and agy's own tools
 

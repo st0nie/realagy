@@ -59,8 +59,9 @@ let tempAgentDirs: string[] = [];
 async function start(
 	tools: { all: FakeTool[]; active: string[] } = { all: [], active: [] },
 	config?: Record<string, unknown>,
+	existingAgentDir?: string,
 ) {
-	const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-ext-agent-"));
+	const agentDir = existingAgentDir ?? fs.mkdtempSync(path.join(os.tmpdir(), "realagy-ext-agent-"));
 	if (config) {
 		const configFile = path.join(agentDir, "realagy", "config.json");
 		fs.mkdirSync(path.dirname(configFile), { recursive: true });
@@ -193,6 +194,41 @@ describe("extension session lifecycle", () => {
 		expect(mocks.listModels).not.toHaveBeenCalled();
 	});
 
+	it("restores the last discovered catalog immediately on restart and refreshes it", async () => {
+		mocks.ensure.mockReturnValue({ ok: true, bin: "agy" });
+		mocks.listModels.mockResolvedValueOnce([{ modelId: "gemini-4-carbon-high", name: "Gemini 4 Carbon (High)", contextWindow: 500000, maxTokens: 8192 }]);
+		const first = await start();
+		await vi.waitFor(() => expect(fs.existsSync(path.join(first.agentDir, "realagy", "models.json"))).toBe(true));
+		first.shutdown();
+		mocks.register.mockClear();
+		const pending = deferred<never[]>();
+		mocks.listModels.mockReturnValueOnce(pending.promise);
+		const second = await start(undefined, undefined, first.agentDir);
+		expect(mocks.streamDeps!.entries).toEqual([expect.objectContaining({ id: "gemini-4-carbon", contextWindow: 500000, maxTokens: 8192 })]);
+		pending.resolve([]);
+		await vi.waitFor(() => expect(mocks.listModels).toHaveBeenCalledTimes(2));
+		second.shutdown();
+	});
+
+	it("refreshes the catalog on demand and retains it on failure or empty response", async () => {
+		mocks.ensure.mockReturnValue({ ok: true, bin: "agy" });
+		mocks.listModels.mockResolvedValueOnce([]);
+		const session = await start();
+		await vi.waitFor(() => expect(mocks.listModels).toHaveBeenCalled());
+		mocks.listModels.mockResolvedValueOnce([{ modelId: "gemini-4-carbon-high" }]);
+		await session.commands.get("realagy").handler("refresh", session.ctx);
+		expect(session.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("catalog refreshed: 1 models"), "info");
+		expect(mocks.streamDeps!.entries[0].id).toBe("gemini-4-carbon");
+		const cache = fs.readFileSync(path.join(session.agentDir, "realagy", "models.json"), "utf8");
+		mocks.listModels.mockRejectedValueOnce(new Error("offline"));
+		await session.commands.get("realagy").handler("refresh", session.ctx);
+		expect(session.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("offline"), "warning");
+		mocks.listModels.mockResolvedValueOnce([]);
+		await session.commands.get("realagy").handler("refresh", session.ctx);
+		expect(session.ui.notify).toHaveBeenLastCalledWith(expect.stringContaining("no models"), "warning");
+		expect(fs.readFileSync(path.join(session.agentDir, "realagy", "models.json"), "utf8")).toBe(cache);
+		session.shutdown();
+	});
 	it("ignores model discovery completion after shutdown", async () => {
 		const discovery = deferred<never[]>();
 		mocks.ensure.mockReturnValue({ ok: true, bin: "agy" });
@@ -247,7 +283,7 @@ describe("extension session lifecycle", () => {
 		const realagy = session.commands.get("realagy");
 		expect([...session.commands.keys()]).toEqual(["realagy"]);
 		expect(realagy.getArgumentCompletions("u")).toEqual([{ value: "usage", label: "usage", description: "Cache hits and plan quota" }]);
-		expect(realagy.getArgumentCompletions("").map((item: { value: string }) => item.value)).toEqual(["settings", "setup", "usage"]);
+		expect(realagy.getArgumentCompletions("").map((item: { value: string }) => item.value)).toEqual(["settings", "setup", "refresh", "usage"]);
 		expect(realagy.getArgumentCompletions("x")).toBeNull();
 		await vi.waitFor(() => expect(mocks.listModels).toHaveBeenCalled());
 		const pending = realagy.handler("usage", session.ctx);
