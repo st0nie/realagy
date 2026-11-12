@@ -300,3 +300,23 @@ test("legacy reclaim keys are ignored", () => {
 	}), DEFAULT_REALAGY_CONFIG);
 	assert.doesNotMatch(formatConfigSummary(DEFAULT_REALAGY_CONFIG, "/x"), /Release context dropped/);
 });
+
+test("inactivityMin accepts positive minutes and 0 (guard off), drops invalid values", () => {
+	assert.equal(normalizeRealagyConfig({ inactivityMin: 10 }).inactivityMin, 10);
+	assert.equal(normalizeRealagyConfig({ inactivityMin: "15" }).inactivityMin, 15);
+	assert.equal(normalizeRealagyConfig({ inactivityMin: 0 }).inactivityMin, 0);
+	assert.equal(normalizeRealagyConfig({ inactivityMin: -1 }).inactivityMin, undefined);
+	assert.equal(normalizeRealagyConfig({ inactivityMin: 1.5 }).inactivityMin, undefined);
+	assert.equal(normalizeRealagyConfig({ inactivityMin: "abc" }).inactivityMin, undefined);
+	assert.match(formatConfigSummary(DEFAULT_REALAGY_CONFIG, "/x"), /Inactivity timeout: 5 min \(default\)/);
+	assert.match(formatConfigSummary({ ...DEFAULT_REALAGY_CONFIG, inactivityMin: 0 }, "/x"), /Inactivity timeout: disabled/);
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-inactivity-"));
+	try {
+		const file = realagyConfigPath(directory);
+		const saved = saveRealagyConfig({ ...DEFAULT_REALAGY_CONFIG, inactivityMin: 10 }, file);
+		assert.deepEqual(loadRealagyConfig(file), saved);
+		assert.equal(saved.inactivityMin, 10);
+	} finally {
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});

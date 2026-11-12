@@ -659,6 +659,8 @@ export interface StreamSimpleDeps {
 	meter?: UsageMeter;
 	/** Live replay budget: 2.2 MB unlocked, 160 KB with native context gates. */
 	replayBudgetBytes?: () => number;
+	/** Live inactivity guard cap in minutes; 0 disables it. Default 5. */
+	inactivityMin?: () => number | undefined;
 }
 
 export function createStreamSimple(deps: StreamSimpleDeps) {
@@ -773,7 +775,7 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					...(plan.input.parts ? { parts: plan.input.parts } : {}),
 					...(plan.kind === "warm" ? { fallback: plan.fallback } : {}),
 					signal: options?.signal,
-					inactivityMin: 5,
+					inactivityMin: deps.inactivityMin?.() ?? 5,
 				};
 				const replacement = await options?.onPayload?.(request, model);
 				const handle = await deps.driver.run((replacement === undefined ? request : replacement) as DriverTurnRequest);
