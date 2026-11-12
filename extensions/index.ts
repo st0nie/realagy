@@ -171,6 +171,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	const streamSimple = createStreamSimple({
 		entries, driver, roundTrips, sessions, meter,
 		replayBudgetBytes: () => config.noAutoCompaction ? UNLOCKED_REPLAY_BUDGET_BYTES : LOCKED_REPLAY_BUDGET_BYTES,
+		inactivityMin: () => config.inactivityMin,
 	});
 	const registerModels = () => {
 		// Sign-in belongs to the agy CLI. Ambient-only auth (no `login`) means pi

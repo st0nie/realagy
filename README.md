@@ -129,6 +129,7 @@ The bypass does not increase real server-side model limits; when a conversation 
 | `contextWindowOverrides` | *(none)* | Optional map of exact Pi model IDs to positive-integer context windows; each match takes precedence over `contextWindow` |
 | `maxOutputTokens` | *(model default)* | Optional positive integer overriding the output limit reported to Pi for all models |
 | `maxOutputTokensOverrides` | *(none)* | Optional map of exact Pi model IDs to positive-integer output limits; each match takes precedence over `maxOutputTokens` |
+| `inactivityMin` | `5` | Minutes without agy output before the turn fails; `0` disables the guard. File-only (not in the settings menu) |
 
 | Environment | Effect |
 | --- | --- |

@@ -51,12 +51,14 @@ Every change in `/realagy settings` is normalized and written atomically to `~/.
 | `contextWindowOverrides` | `Record<string, number>` | *(none)* | Optional map of exact Pi model IDs to positive integer context windows; takes precedence over `contextWindow` |
 | `maxOutputTokens` | `number` | *(model default)* | Optional positive integer overriding the global fallback max output token limit reported to Pi |
 | `maxOutputTokensOverrides` | `Record<string, number>` | *(none)* | Optional map of exact Pi model IDs to positive integer max output limits; takes precedence over `maxOutputTokens` |
+| `inactivityMin` | `number` | `5` | Inactivity guard in minutes: if `agy` streams no output for this long (and no tool call is running), the turn fails with "Antigravity produced no output…". Raise it for models that generate very large single tool payloads silently; `0` disables the guard. File-only: not shown in the `/realagy settings` menu, but preserved when the menu saves |
 
 ### Validation and fallback rules
 
 - If `config.json` does not exist, cannot be read, or contains invalid JSON, realagy uses `{ noAutoCompaction: true, fullMcpOutput: true, agentProfile: true }`.
 - Non-boolean values for `noAutoCompaction`, `fullMcpOutput`, or `agentProfile` fall back to `true`.
 - Token limits must be positive safe integers (or numeric strings with optional commas, underscores, or spaces, such as `"1,048,576"`). Zero, negative, non-integer, or empty values are ignored and omitted when saving.
+- `inactivityMin` must be a positive safe integer (or numeric string); the literal number `0` is also accepted and disables the inactivity guard. Other values are ignored.
 - Unknown keys in `config.json` are ignored and stripped the next time `/realagy settings` saves the file.
 - When `noAutoCompaction` or `fullMcpOutput` is enabled, realagy must be able to derive and verify the patched `agy` binary for the current platform (Windows x64 PE, Linux x64 ELF, or macOS arm64 Mach-O). If an unsupported architecture or unrecognized binary layout is encountered, startup fails closed rather than running an unverified binary; disable the corresponding toggle only if you intentionally want the stock `agy` behavior.
 

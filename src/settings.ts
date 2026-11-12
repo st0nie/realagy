@@ -36,6 +36,9 @@ export interface RealagyConfig extends ModelLimitOverrides {
 	/** Run Agy with realagy's hidden agent profile (Pi's prompt and tools only)
 	 * instead of Agy's default agent. */
 	agentProfile: boolean;
+	/** Inactivity guard in minutes: no agy output for this long fails the
+	 * turn. Default 5; 0 disables the guard. */
+	inactivityMin?: number;
 }
 
 export const DEFAULT_REALAGY_CONFIG: Readonly<RealagyConfig> = {
@@ -154,11 +157,14 @@ export function normalizeRealagyConfig(raw: unknown): RealagyConfig {
 	const contextWindowOverrides = normalizeModelLimitOverrides(record.contextWindowOverrides);
 	const maxOutputTokens = parsePositiveInt(record.maxOutputTokens);
 	const maxOutputTokensOverrides = normalizeModelLimitOverrides(record.maxOutputTokensOverrides);
+	// 0 is a valid choice (guard off), so it bypasses parsePositiveInt.
+	const inactivityMin = record.inactivityMin === 0 ? 0 : parsePositiveInt(record.inactivityMin);
 	const result: RealagyConfig = { noAutoCompaction, fullMcpOutput, agentProfile };
 	if (contextWindow !== undefined) result.contextWindow = contextWindow;
 	if (contextWindowOverrides !== undefined) result.contextWindowOverrides = contextWindowOverrides;
 	if (maxOutputTokens !== undefined) result.maxOutputTokens = maxOutputTokens;
 	if (maxOutputTokensOverrides !== undefined) result.maxOutputTokensOverrides = maxOutputTokensOverrides;
+	if (inactivityMin !== undefined) result.inactivityMin = inactivityMin;
 	return result;
 }
 
@@ -215,6 +221,7 @@ export function formatConfigSummary(config: RealagyConfig, file: string = realag
 			([modelId, limit]) => `  Pi context window (${modelId}): ${formatConfigLimit(limit)}`,
 		),
 		`  Pi max output tokens: ${formatConfigLimit(config.maxOutputTokens)}`,
+		`  Inactivity timeout: ${config.inactivityMin === undefined ? "5 min (default)" : config.inactivityMin === 0 ? "disabled" : `${config.inactivityMin} min`}`,
 		...Object.entries(config.maxOutputTokensOverrides ?? {}).map(
 			([modelId, limit]) => `  Pi max output tokens (${modelId}): ${formatConfigLimit(limit)}`,
 		),
@@ -250,6 +257,7 @@ function withUpdatedSetting(current: RealagyConfig, id: string, rawValue: string
 	if (maxOutputTokens !== undefined) next.maxOutputTokens = maxOutputTokens;
 	if (current.contextWindowOverrides !== undefined) next.contextWindowOverrides = current.contextWindowOverrides;
 	if (current.maxOutputTokensOverrides !== undefined) next.maxOutputTokensOverrides = current.maxOutputTokensOverrides;
+	if (current.inactivityMin !== undefined) next.inactivityMin = current.inactivityMin;
 	return next;
 }
 

@@ -93,6 +93,15 @@ async function collect(stream: ReturnType<typeof createAssistantMessageEventStre
 	return events;
 }
 
+test("configured inactivity cap reaches the driver request; default stays 5", async () => {
+	for (const [inactivityMin, expected] of [[() => 12, 12], [() => 0, 0], [undefined, 5]] as const) {
+		const driver = new FakeDriver();
+		const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips: new ToolRoundTrips(driver), inactivityMin });
+		await collect(stream(toPiModel(TEST_MODELS[0]), context([system(), user("Reply")])));
+		assert.equal(driver.requests[0].inactivityMin, expected);
+	}
+});
+
 test("fresh replay keeps live images and reattaches historical images", async () => {
 	const driver = new FakeDriver();
 	const entry = TEST_MODELS[0];
