@@ -3,10 +3,16 @@
 
 import type { Api, Model, ThinkingLevel, ThinkingLevelMap } from "@earendil-works/pi-ai";
 
-export type AgyEffort = "low" | "medium" | "high";
-export const AGY_EFFORT_ORDER: readonly AgyEffort[] = ["low", "medium", "high"];
-const EFFORT_RANK: Record<AgyEffort, number> = { low: 0, medium: 1, high: 2 };
-const TIER_RE = /^(.+)-(high|medium|low)$/;
+export const AGY_EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"] as const;
+export type AgyEffort = (typeof AGY_EFFORT_ORDER)[number];
+/** Tiers pi shows only when the model maps them explicitly. */
+const EXTENDED_EFFORTS: readonly AgyEffort[] = ["xhigh", "max"];
+const TIER_RE = /^(.+)-(max|xhigh|high|medium|low)$/;
+const TIER_LABEL_RE = /\s+\((?:Max|XHigh|High|Medium|Low)\)$/i;
+
+export function isAgyEffort(value: unknown): value is AgyEffort {
+	return (AGY_EFFORT_ORDER as readonly unknown[]).includes(value);
+}
 const MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._]*-[A-Za-z0-9._-]*$/;
 // Base-slug + effort is verified for these families. GPT-OSS currently offers
 // only medium, so pi exposes a one-stop thinking toggle rather than hiding it.
@@ -32,9 +38,13 @@ export interface AcpModelInfo {
 export function toAgyEffort(reasoning: ThinkingLevel | undefined, efforts: readonly AgyEffort[]): AgyEffort {
 	let wanted: AgyEffort;
 	switch (reasoning) {
-		case "high":
-		case "xhigh":
 		case "max":
+			wanted = "max";
+			break;
+		case "xhigh":
+			wanted = "xhigh";
+			break;
+		case "high":
 			wanted = "high";
 			break;
 		case "medium":
@@ -75,7 +85,7 @@ export function entriesFromRaw(raw: string): AgyModelEntry[] {
 	}
 	const entries: AgyModelEntry[] = [];
 	for (const [base, group] of groups) {
-		const efforts = [...group.tiers].sort((a, b) => EFFORT_RANK[a] - EFFORT_RANK[b]);
+		const efforts = AGY_EFFORT_ORDER.filter((tier) => group.tiers.has(tier));
 		if (efforts.length > 0 && EFFORT_CAPABLE.some((re) => re.test(base))) {
 			entries.push({ full: base, id: slugify(base), efforts });
 		} else {
@@ -98,7 +108,7 @@ export function entriesFromAcpModels(models: readonly AcpModelInfo[]): AgyModelE
 		const named = variants.find((m) => m.name !== undefined);
 		const rawName = named?.name
 			? entry.efforts
-				? named.name.replace(/\s+\((?:High|Medium|Low)\)$/i, "")
+				? named.name.replace(TIER_LABEL_RE, "")
 				: named.name
 			: undefined;
 		const contextWindow = variants.find((m) => m.contextWindow !== undefined)?.contextWindow;
@@ -111,9 +121,17 @@ export function entriesFromAcpModels(models: readonly AcpModelInfo[]): AgyModelE
 	});
 }
 
+/** pi offers low/medium/high unless mapped to null, but xhigh/max only when
+ * mapped to a value, so those two are listed exactly when the catalog has them. */
 function thinkingLevelMapFor(efforts: readonly AgyEffort[]): ThinkingLevelMap {
 	const map: Record<string, string | null> = { off: null, minimal: null };
-	for (const level of AGY_EFFORT_ORDER) if (!efforts.includes(level)) map[level] = null;
+	for (const level of AGY_EFFORT_ORDER) {
+		if (EXTENDED_EFFORTS.includes(level)) {
+			if (efforts.includes(level)) map[level] = level;
+		} else if (!efforts.includes(level)) {
+			map[level] = null;
+		}
+	}
 	return map as ThinkingLevelMap;
 }
 

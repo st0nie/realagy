@@ -152,7 +152,7 @@ interface ActiveTurn {
  *  ("gemini-3.8-flash-low"). Fixed families pass through unchanged. */
 export function acpModelSlug(model: string, effort?: string): string {
 	if (!effort) return model;
-	if (/(?:^|-)(?:high|medium|low)$/.test(model)) return model;
+	if (/(?:^|-)(?:max|xhigh|high|medium|low)$/.test(model)) return model;
 	return `${model}-${effort}`;
 }
 

@@ -74,7 +74,7 @@ Pi uses each model's `contextWindow` and `maxTokens` for its footer context bar,
    - **Claude** (`claude-opus-5-5`, `claude-sonnet-5-5`): `1,000,000` context / `128,000` max output tokens
    - **GPT-OSS** (`gpt-oss-120b`): `131,072` context / `32,768` max output tokens
 
-In `contextWindowOverrides` and `maxOutputTokensOverrides`, keys are the exact, case-sensitive Pi model IDs shown after `antigravity/` in `/model` (for example `gemini-3-8-flash`, `claude-sonnet-5-5`, `gpt-oss-120b`). Because effort variants (`-low`, `-medium`, `-high`) collapse into one Pi model with thinking levels, a single model ID entry applies to all thinking levels of that model.
+In `contextWindowOverrides` and `maxOutputTokensOverrides`, keys are the exact, case-sensitive Pi model IDs shown after `antigravity/` in `/model` (for example `gemini-3-8-flash`, `claude-sonnet-5-5`, `gpt-oss-120b`). Because effort variants (`-low`, `-medium`, `-high`, `-xhigh`, `-max`) collapse into one Pi model with thinking levels, a single model ID entry applies to all thinking levels of that model.
 
 In `/realagy settings`:
 

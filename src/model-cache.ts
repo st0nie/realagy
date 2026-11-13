@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { AgyModelEntry } from "./models.js";
+import { isAgyEffort, type AgyModelEntry } from "./models.js";
 
 export function modelCachePath(): string {
 	return path.join(getAgentDir(), "realagy", "models.json");
@@ -16,7 +16,7 @@ function validEntry(value: unknown): value is AgyModelEntry {
 	return typeof entry.full === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(entry.full)
 		&& typeof entry.id === "string" && /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(entry.id)
 		&& (entry.name === undefined || typeof entry.name === "string")
-		&& (entry.efforts === undefined || (Array.isArray(entry.efforts) && entry.efforts.length > 0 && entry.efforts.every((e: unknown) => e === "low" || e === "medium" || e === "high")))
+		&& (entry.efforts === undefined || (Array.isArray(entry.efforts) && entry.efforts.length > 0 && entry.efforts.every(isAgyEffort)))
 		&& positive(entry.contextWindow) && positive(entry.maxTokens);
 }
 

@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "vitest";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
+import { acpModelSlug } from "../src/acp/driver.js";
 import { entriesFromAcpModels, familyLimits, toAgyEffort, toPiModel } from "../src/models.js";
 
 const LIVE = [
@@ -98,6 +100,42 @@ test("per-model output tokens take precedence over the global fallback with exac
 	assert.equal(toPiModel(claude, overrides).contextWindow, 1_000_000);
 	assert.equal(toPiModel(argon, { maxOutputTokensOverrides: { "Gemini-4-argon": 48_000 } }).maxTokens, 65_536);
 	assert.equal(toPiModel(argon, { maxOutputTokensOverrides: { "gemini-4-argon-high": 48_000 } }).maxTokens, 65_536);
+});
+
+test("xhigh and max tiers fold into the base model and map to pi's extended thinking levels", () => {
+	const entries = entriesFromAcpModels([
+		{ modelId: "gemini-4-hydrogen-high", name: "Gemini 4 Hydrogen (High)" },
+		{ modelId: "gemini-4-hydrogen-xhigh", name: "Gemini 4 Hydrogen (XHigh)" },
+		{ modelId: "gemini-4-hydrogen-medium", name: "Gemini 4 Hydrogen (Medium)" },
+		{ modelId: "gemini-4-hydrogen-low", name: "Gemini 4 Hydrogen (Low)" },
+		{ modelId: "claude-future-max", name: "Claude Future (Max)" },
+		{ modelId: "claude-future-high", name: "Claude Future (High)" },
+	]);
+	assert.deepEqual(entries.map((entry) => [entry.id, entry.name, entry.efforts]), [
+		["gemini-4-hydrogen", "Gemini 4 Hydrogen", ["low", "medium", "high", "xhigh"]],
+		["claude-future", "Claude Future", ["high", "max"]],
+	]);
+
+	const hydrogen = toPiModel(entries[0]);
+	assert.deepEqual(hydrogen.thinkingLevelMap, { off: null, minimal: null, xhigh: "xhigh" });
+	assert.deepEqual(getSupportedThinkingLevels(hydrogen), ["low", "medium", "high", "xhigh"]);
+	assert.equal(toAgyEffort("xhigh", entries[0].efforts!), "xhigh");
+	assert.equal(toAgyEffort("max", entries[0].efforts!), "xhigh");
+	assert.equal(toAgyEffort("high", entries[0].efforts!), "high");
+	assert.equal(toAgyEffort(undefined, entries[0].efforts!), "medium");
+	assert.equal(acpModelSlug(entries[0].full, "xhigh"), "gemini-4-hydrogen-xhigh");
+
+	const future = toPiModel(entries[1]);
+	assert.deepEqual(future.thinkingLevelMap, { off: null, minimal: null, low: null, medium: null, max: "max" });
+	assert.deepEqual(getSupportedThinkingLevels(future), ["high", "max"]);
+	assert.equal(toAgyEffort("xhigh", entries[1].efforts!), "max");
+	assert.equal(toAgyEffort("max", entries[1].efforts!), "max");
+
+	// Models without an extended tier keep hiding xhigh/max and clamp to high.
+	const argonEntry = entriesFromAcpModels(LIVE).find((entry) => entry.id === "gemini-4-argon")!;
+	assert.deepEqual(getSupportedThinkingLevels(toPiModel(argonEntry)), ["low", "medium", "high"]);
+	assert.equal(toAgyEffort("xhigh", argonEntry.efforts!), "high");
+	assert.equal(toAgyEffort("max", argonEntry.efforts!), "high");
 });
 
 test("unknown families remain exact-slug fixed models and noise is rejected", () => {

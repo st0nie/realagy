@@ -13,7 +13,7 @@ function cacheFile(): string {
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
 
 describe("model catalog cache", () => {
-	const models = [{ full: "gemini-4-carbon", id: "gemini-4-carbon", name: "Gemini 4 Carbon", efforts: ["low", "high"] as ("low" | "high")[], contextWindow: 123456, maxTokens: 4096 }];
+	const models = [{ full: "gemini-4-carbon", id: "gemini-4-carbon", name: "Gemini 4 Carbon", efforts: ["low", "high", "xhigh"] as ("low" | "high" | "xhigh")[], contextWindow: 123456, maxTokens: 4096 }];
 	it("round-trips discovered metadata and never replaces it with an empty catalog", () => {
 		const file = cacheFile();
 		expect(loadModelCache(file)).toBeUndefined();
