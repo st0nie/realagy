@@ -11,7 +11,7 @@
 //   - abort: ACP session/cancel notification; the prompt then ends
 //     "cancelled" and process and session survive. Only when agy ignores the
 //     cancel is the process torn down.
-//   - inactivity guard: no session/update for `inactivityMin` fails the turn;
+//   - inactivity guard (off by default): no session/update for `inactivityMin` fails the turn;
 //     parked pi tool calls (bridge_call) and running native agy tools pause
 //     the guard.
 //   - native tools: agy's own calls are reported as native_tool activities
@@ -42,7 +42,7 @@ import type { AgyStepUsage, DriverActivity, DriverTurnRequest, TurnDriver, TurnH
 
 export type { AcpMcpServer } from "./connection.js";
 
-const DEFAULT_INACTIVITY_MIN = 5;
+const DEFAULT_INACTIVITY_MIN = 0;
 /** How long a cancelled prompt may take to settle before teardown. */
 const CANCEL_GRACE_MS = 10_000;
 

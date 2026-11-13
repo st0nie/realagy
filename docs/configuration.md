@@ -51,7 +51,7 @@ Every change in `/realagy settings` is normalized and written atomically to `~/.
 | `contextWindowOverrides` | `Record<string, number>` | *(none)* | Optional map of exact Pi model IDs to positive integer context windows; takes precedence over `contextWindow` |
 | `maxOutputTokens` | `number` | *(model default)* | Optional positive integer overriding the global fallback max output token limit reported to Pi |
 | `maxOutputTokensOverrides` | `Record<string, number>` | *(none)* | Optional map of exact Pi model IDs to positive integer max output limits; takes precedence over `maxOutputTokens` |
-| `inactivityMin` | `number` | `5` | Inactivity guard in minutes: if `agy` streams no output for this long (and no tool call is running), the turn fails with "Antigravity produced no output…". Raise it for models that generate very large single tool payloads silently; `0` disables the guard. File-only: not shown in the `/realagy settings` menu, but preserved when the menu saves |
+| `inactivityMin` | `number` | `0` | Inactivity guard in minutes, disabled by default (`0`). With a positive value, if `agy` streams no output for this long (and no tool call is running), the turn fails with "Antigravity produced no output…". Keep it off or high for models that generate very large single tool payloads silently. File-only: not shown in the `/realagy settings` menu, but preserved when the menu saves |
 
 ### Validation and fallback rules
 

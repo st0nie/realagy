@@ -30,8 +30,8 @@ export interface DriverTurnRequest {
 	 *  would reach a session that never saw the earlier turns. */
 	fallback?: { prompt: string; images?: Array<{ data: string; mimeType: string }>; contextBlock?: { uri: string; text: string }; parts?: TurnPart[] };
 	signal?: AbortSignal;
-	/** Inactivity cap in minutes (default 5; parked tool calls pause it).
-	 *  Fractional values are valid. 0 disables the cap. */
+	/** Inactivity cap in minutes (parked tool calls pause it). Fractional
+	 *  values are valid. 0, the default, disables the cap. */
 	inactivityMin?: number;
 }
 

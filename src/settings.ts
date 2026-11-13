@@ -37,7 +37,7 @@ export interface RealagyConfig extends ModelLimitOverrides {
 	 * instead of Agy's default agent. */
 	agentProfile: boolean;
 	/** Inactivity guard in minutes: no agy output for this long fails the
-	 * turn. Default 5; 0 disables the guard. */
+	 * turn. 0, the default, disables the guard. */
 	inactivityMin?: number;
 }
 
@@ -221,7 +221,7 @@ export function formatConfigSummary(config: RealagyConfig, file: string = realag
 			([modelId, limit]) => `  Pi context window (${modelId}): ${formatConfigLimit(limit)}`,
 		),
 		`  Pi max output tokens: ${formatConfigLimit(config.maxOutputTokens)}`,
-		`  Inactivity timeout: ${config.inactivityMin === undefined ? "5 min (default)" : config.inactivityMin === 0 ? "disabled" : `${config.inactivityMin} min`}`,
+		`  Inactivity timeout: ${config.inactivityMin ? `${config.inactivityMin} min` : config.inactivityMin === undefined ? "disabled (default)" : "disabled"}`,
 		...Object.entries(config.maxOutputTokensOverrides ?? {}).map(
 			([modelId, limit]) => `  Pi max output tokens (${modelId}): ${formatConfigLimit(limit)}`,
 		),

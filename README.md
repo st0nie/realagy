@@ -50,7 +50,7 @@ realagy starts agy with its own hidden agent profile, `~/.gemini/config/agents/r
 When `agentProfile` is set to `false` in `/realagy settings` (or when the profile cannot be written) agy keeps its default agent. The model then sees pi's tools next to agy's built-in ones, since agy cannot switch its own tools off. realagy adds a short policy to agy's system prompt that asks the model to use pi's tools for reading files (images included), running commands, and changing files, to work itself instead of starting subagents, background tasks, or scheduled tasks, and to write plain paths instead of `file://` links. agy's own tools still work when the model picks them, and pi always shows it:
 
 - each finished call adds a line to the reply's thinking, for example `agy → run_command npm test ✓ 2.1s`;
-- while agy works on its own, a live panel above the editor lists each running call, background command, and subagent with a spinner and its elapsed time (the 5-minute inactivity limit waits for a running call);
+- while agy works on its own, a live panel above the editor lists each running call, background command, and subagent with a spinner and its elapsed time (the optional inactivity limit waits for a running call);
 - a command agy moved to the background, or a subagent, is marked `(runs in background)`. When it finishes, a tool card with the exit code and the last 5 lines of its output (expand it with ctrl+o or a left click for the whole output and the log path) is added to the conversation and pi's agent reacts to it: right away when idle, otherwise after its current work. agy's own leftover output never leaks into your next reply.
 
 ## Parallel Pi tools
@@ -78,7 +78,7 @@ A batch still running after 150 seconds returns `STILL RUNNING` with its outer `
 - Esc cancels the running Antigravity turn through ACP. agy keeps running, and the next prompt continues in the same session. agy is restarted only if it ignores the cancel for 10 seconds.
 - Starting a new prompt while Antigravity still waits on pi tool results (for example, after the tool calls were interrupted) ends that stale turn instead of waiting for it to time out.
 - When agy answers that its servers are busy ("high traffic"), the turn fails as an overload error, so pi retries it instead of keeping the notice as the answer.
-- If agy cannot start or exits mid-turn, the turn fails with the binary path, the exit code, and agy's last error line. The next prompt starts it again. A turn with no output for 5 minutes is stopped, unless one of agy's own tools is still running.
+- If agy cannot start or exits mid-turn, the turn fails with the binary path, the exit code, and agy's last error line. The next prompt starts it again. There is no inactivity timeout by default; with `inactivityMin` set in `config.json`, a turn with no output for that many minutes is stopped, unless one of agy's own tools is still running.
 - After `/reload` or `pi -c`, realagy restores only the latest warm session on the current Pi branch, and only an exact unchanged transcript prefix reuses it. `/tree`, compaction, editing, or rollback invalidates that cache; the next prompt starts a new ACP session with one bounded replay of the selected Pi history. agy's SQLite conversation store is never forked or rewritten.
 
 ## Context windows, compaction bypass, and settings
@@ -129,7 +129,7 @@ The bypass does not increase real server-side model limits; when a conversation 
 | `contextWindowOverrides` | *(none)* | Optional map of exact Pi model IDs to positive-integer context windows; each match takes precedence over `contextWindow` |
 | `maxOutputTokens` | *(model default)* | Optional positive integer overriding the output limit reported to Pi for all models |
 | `maxOutputTokensOverrides` | *(none)* | Optional map of exact Pi model IDs to positive-integer output limits; each match takes precedence over `maxOutputTokens` |
-| `inactivityMin` | `5` | Minutes without agy output before the turn fails; `0` disables the guard. File-only (not in the settings menu) |
+| `inactivityMin` | `0` | Minutes without agy output before the turn fails; `0` (the default) disables the guard. File-only (not in the settings menu) |
 
 | Environment | Effect |
 | --- | --- |

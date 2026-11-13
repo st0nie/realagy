@@ -308,8 +308,9 @@ test("inactivityMin accepts positive minutes and 0 (guard off), drops invalid va
 	assert.equal(normalizeRealagyConfig({ inactivityMin: -1 }).inactivityMin, undefined);
 	assert.equal(normalizeRealagyConfig({ inactivityMin: 1.5 }).inactivityMin, undefined);
 	assert.equal(normalizeRealagyConfig({ inactivityMin: "abc" }).inactivityMin, undefined);
-	assert.match(formatConfigSummary(DEFAULT_REALAGY_CONFIG, "/x"), /Inactivity timeout: 5 min \(default\)/);
-	assert.match(formatConfigSummary({ ...DEFAULT_REALAGY_CONFIG, inactivityMin: 0 }, "/x"), /Inactivity timeout: disabled/);
+	assert.match(formatConfigSummary(DEFAULT_REALAGY_CONFIG, "/x"), /Inactivity timeout: disabled \(default\)$/m);
+	assert.match(formatConfigSummary({ ...DEFAULT_REALAGY_CONFIG, inactivityMin: 0 }, "/x"), /Inactivity timeout: disabled$/m);
+	assert.match(formatConfigSummary({ ...DEFAULT_REALAGY_CONFIG, inactivityMin: 10 }, "/x"), /Inactivity timeout: 10 min$/m);
 	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-inactivity-"));
 	try {
 		const file = realagyConfigPath(directory);
