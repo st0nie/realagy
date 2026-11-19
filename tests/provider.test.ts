@@ -66,6 +66,9 @@ class FakeDriver implements TurnDriver {
 	}
 
 	reentry(): TurnHandle | null { return this.activeHandle; }
+	/** Test switch: the next turn would respawn agy (its declared tools changed). */
+	stale = false;
+	outdated(): boolean { return this.stale; }
 	kickIdle(): void {}
 	cancels: string[] = [];
 	async cancelActive(reason: string): Promise<void> {
@@ -438,6 +441,22 @@ test("presentation metadata is stripped for all tools unless explicitly declared
 	bridge.resolve("batch:3", "ok", false);
 	await batch;
 });
+test("without realagy's batching tool, a call named parallel is an ordinary pi tool call", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const handle = await driver.run({ cwd: process.cwd(), model: "gpt-oss-120b", mode: "default", skipPermissions: true, prompt: "test" });
+	const bridge = new ToolRoundTrips(driver, { batchTool: () => false });
+	const call = bridge.onToolCall("p1", PARALLEL_TOOL_NAME, { jobs: ["a", "b"] }, new AbortController().signal);
+	const event = await handle.next();
+	assert.equal(event?.type, "bridge_call");
+	if (event?.type !== "bridge_call") throw new Error("missing bridge call");
+	assert.equal(event.name, PARALLEL_TOOL_NAME);
+	assert.deepEqual(event.args, { jobs: ["a", "b"] });
+	assert.equal(event.calls, undefined);
+	bridge.resolve("p1", "ok", false);
+	assert.deepEqual(await call, { content: [{ type: "text", text: "ok" }], isError: false });
+});
+
 test("parallel keeps one outer poll handle and survives the initial HTTP disconnect", async () => {
 	vi.useFakeTimers();
 	try {
@@ -664,6 +683,111 @@ test("image tool results go back as MCP image blocks on the existing ACP handle"
 		assert.deepEqual(reply.content, [{ type: "text", text: "(image result)" }, { type: "image", data: "aW1hZ2U=", mimeType: "image/png" }]);
 		assert.equal(driver.requests.length, 1);
 		assert.equal(close.mock.calls.length, 0);
+	} finally { roundTrips.failAll("test done"); }
+});
+
+test("tools a pi tool activates mid-turn are announced on its MCP result, and the native turn continues", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const roundTrips = new ToolRoundTrips(driver);
+	const model = toPiModel(TEST_MODELS[0]);
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips, sessions: {} });
+	const declare = (added: string[], removed: string[] = []): Message => ({
+		role: "system", content: "", timestamp: Date.now(),
+		...(added.length > 0 ? { toolsAdded: added.map((name) => ({ name, description: name, parameters: {} })) } : {}),
+		...(removed.length > 0 ? { toolsRemoved: removed.map((name) => ({ name, description: name, parameters: {} })) } : {}),
+	}) as unknown as Message;
+	try {
+		const turnStart = [system(), declare(["read", "lens_activate"]), user("Find the symbol")];
+		const step1 = collect(stream(model, context(turnStart)));
+		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+		const parked = roundTrips.onToolCall("call-1", "lens_activate", {}, new AbortController().signal);
+		const step1Done = (await step1).find((event) => event.type === "done");
+		if (step1Done?.type !== "done") throw new Error("missing toolUse");
+		const result: Message = { role: "toolResult", toolCallId: "call-1", toolName: "lens_activate", content: [{ type: "text", text: "activated" }], isError: false, timestamp: Date.now() };
+		// pi declares the loadout change before its next request.
+		const step2 = collect(stream(model, context([...turnStart, step1Done.message, result, declare(["lens_symbols"], ["lens_activate"])])));
+		const reply = await parked;
+		assert.deepEqual(reply.content, [{
+			type: "text",
+			// Ahead of the output, so agy truncating a long result cannot drop it.
+			text: "<pi-tools-update>\nThe active pi tools are now: lens_symbols, read. Call only these pi tools.\n</pi-tools-update>\n\nactivated",
+		}]);
+		assert.equal(driver.requests.length, 1, "the parked native turn continues");
+		(driver.activeHandle as FakeHandle).complete();
+		await step2;
+	} finally { roundTrips.failAll("test done"); }
+});
+
+test("a parallel batch that activates tools announces them ahead of its aggregate result", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const roundTrips = new ToolRoundTrips(driver);
+	const model = toPiModel(TEST_MODELS[0]);
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips, sessions: {} });
+	const declare = (added: string[]): Message => ({
+		role: "system", content: "", timestamp: Date.now(), toolsAdded: added.map((name) => ({ name, description: name, parameters: {} })),
+	}) as unknown as Message;
+	const result = (toolCallId: string, toolName: string, text: string): Message =>
+		({ role: "toolResult", toolCallId, toolName, content: [{ type: "text", text }], isError: false, timestamp: Date.now() });
+	try {
+		const turnStart = [system(), declare(["read", "lens_activate"]), user("Find the symbol")];
+		const step1 = collect(stream(model, context(turnStart)));
+		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+		const parked = roundTrips.onToolCall("batch", PARALLEL_TOOL_NAME, {
+			calls: [{ name: "read", arguments: {} }, { name: "lens_activate", arguments: {} }],
+		}, new AbortController().signal);
+		const step1Done = (await step1).find((event) => event.type === "done");
+		if (step1Done?.type !== "done") throw new Error("missing toolUse");
+		const step2 = collect(stream(model, context([
+			...turnStart, step1Done.message, result("batch:1", "read", "file text"), result("batch:2", "lens_activate", "activated"), declare(["lens_symbols"]),
+		])));
+		const text = (await parked).content[0];
+		if (text.type !== "text") throw new Error("missing text");
+		const update = "<pi-tools-update>\nThe active pi tools are now: lens_activate, lens_symbols, read. Call only these pi tools.\n</pi-tools-update>\n\n";
+		assert.ok(text.text.startsWith(update), text.text);
+		const payload = JSON.parse(text.text.slice(update.length));
+		assert.deepEqual(payload.results.map((entry: { content: Array<{ text: string }> }) => entry.content[0].text), ["file text", "activated"]);
+		(driver.activeHandle as FakeHandle).complete();
+		await step2;
+	} finally { roundTrips.failAll("test done"); }
+});
+
+test("tools activated mid-turn that agy's session never declared replay the turn fresh in a respawned agy", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const roundTrips = new ToolRoundTrips(driver);
+	driver.onTurnEnd = (outcome) => failParkedCalls(roundTrips, outcome);
+	const sessions: AcpSessions = {};
+	const model = toPiModel(TEST_MODELS[0]);
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips, sessions });
+	const declare = (added: string[]): Message => ({
+		role: "system", content: "", timestamp: Date.now(), toolsAdded: added.map((name) => ({ name, description: name, parameters: {} })),
+	}) as unknown as Message;
+	try {
+		const turnStart = [system(), declare(["read", "web_enable"]), user("Search the web")];
+		const step1 = collect(stream(model, context(turnStart)));
+		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+		const parked = roundTrips.onToolCall("call-1", "web_enable", {}, new AbortController().signal);
+		const step1Done = (await step1).find((event) => event.type === "done");
+		if (step1Done?.type !== "done") throw new Error("missing toolUse");
+		const result: Message = { role: "toolResult", toolCallId: "call-1", toolName: "web_enable", content: [{ type: "text", text: "web tools enabled" }], isError: false, timestamp: Date.now() };
+		// web_enable activated deferred tools the bridge had not declared: the policy changed.
+		driver.stale = true;
+		const step2 = collect(stream(model, context([...turnStart, step1Done.message, result, declare(["web_search"])])));
+		// The old native turn never receives the result: it could record it
+		// before the cancel and see it twice once the session resumed.
+		await assert.rejects(parked);
+		await vi.waitFor(() => assert.equal(driver.requests.length, 2));
+		assert.deepEqual(driver.cancels, ["superseded by a new pi turn"]);
+		const fresh = driver.requests[1]!;
+		assert.equal(fresh.conversationId, null);
+		assert.match(fresh.prompt, /<pi-system>/);
+		assert.match(fresh.prompt, /<pi_history>[\s\S]*web tools enabled/);
+		assert.match(fresh.prompt, /<pi-tools>\nThe active pi tools are: read, web_enable, web_search\./);
+		assert.ok(sessions.retirementCandidates?.has("acp-fake-1"), "the old session is retired once replaced");
+		(driver.activeHandle as FakeHandle).complete();
+		await step2;
 	} finally { roundTrips.failAll("test done"); }
 });
 

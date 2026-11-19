@@ -47,7 +47,7 @@ The last successful model catalog is cached in `~/.pi/agent/realagy/models.json`
 
 realagy starts agy with its own hidden agent profile, `~/.gemini/config/agents/realagy-<hash>.md`. It replaces agy's system prompt (Antigravity's identity, artifacts, IDE slash commands, and its rule to write every file and symbol as a `file://` link) with a short prompt of realagy's, and leaves the model with pi's tools only: agy's `read_file`, `run_command`, `write_file`, `edit_file`, subagents, and web search are gone. pi's tools stay direct tools, so their calls go through pi's permissions and show up as pi tool calls. File references arrive as plain paths (`src/app.ts:10-20`); a `file://` link a model still writes is rewritten to one while the reply streams. The profile is hidden from normal agy sessions (only `agy agents` lists it), changes only processes realagy starts, and is deleted after 7 days without use.
 
-When `agentProfile` is set to `false` in `/realagy settings` (or when the profile cannot be written) agy keeps its default agent. The model then sees pi's tools next to agy's built-in ones, since agy cannot switch its own tools off. realagy adds a short policy to agy's system prompt that asks the model to use pi's tools for reading files (images included), running commands, and changing files, to work itself instead of starting subagents, background tasks, or scheduled tasks, and to write plain paths instead of `file://` links. agy's own tools still work when the model picks them, and pi always shows it:
+When `agentProfile` is set to `false` in `/realagy settings` (or when the profile cannot be written) agy keeps its default agent. The model then sees pi's tools next to agy's built-in ones, since agy cannot switch its own tools off. realagy adds a short policy to agy's system prompt that asks the model to use pi's tools for reading files (images included), running commands, and changing files, to use pi's tools rather than its own for delegation, background work, and scheduling, and to write plain paths instead of `file://` links. agy's own tools still work when the model picks them, and pi always shows it:
 
 - each finished call adds a line to the reply's thinking, for example `agy → run_command npm test ✓ 2.1s`;
 - while agy works on its own, a live panel above the editor lists each running call, background command, and subagent with a spinner and its elapsed time (the optional inactivity limit waits for a running call);
@@ -149,7 +149,7 @@ See [docs/configuration.md](docs/configuration.md) for the full configuration re
 | `src/transcript.ts` | Authoritative transcript serialization, exact-prefix warm reuse, and bounded `<pi_history>` rebuild planning |
 | `src/models.ts` | ACP model catalog parsing, effort grouping, per-model limits and overrides |
 | `src/settings.ts` | `/realagy settings` TUI component, validation, and `~/.pi/agent/realagy/config.json` persistence |
-| `src/mcp-server.ts`, `src/bridge-catalog.ts` | Loopback, token-protected MCP server for pi's tools (every tool an extension may activate; only active ones run) |
+| `src/mcp-server.ts`, `src/bridge-catalog.ts` | Loopback, token-protected MCP server for pi's tools (the `toolCatalog` setting picks which inactive tools are pre-declared; only active ones run) |
 | `src/tool-loadout.ts` | Undoes the situational tools pi's `/tree` restore activates |
 | `src/quota.ts`, `src/usage-trace.ts` | Cache/quota meter, quota-exhaustion notice, usage diagnostics |
 | `src/acp/setup.ts` | Finding `agy` and its data dir |

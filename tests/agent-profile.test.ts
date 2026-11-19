@@ -29,6 +29,13 @@ test("the profile replaces agy's prompt, hides itself, and makes every bridged t
 	assert.match(PROFILE_PROMPT, /Never use file:\/\/ URLs or Markdown links for local files or code symbols/);
 });
 
+test("the profile defers how to work to pi's system prompt and steers agy's leftover tools to pi's", () => {
+	assert.match(PROFILE_PROMPT, /how you work, including background work and delegation/);
+	// excludeDefaultComponents keeps these; they cannot be disabled (agy 1.5.9).
+	assert.match(PROFILE_PROMPT, /built-in manage_task, list_resources, and read_resource/);
+	assert.doesNotMatch(PROFILE_PROMPT, /foreground|do not start/i);
+});
+
 test("the profile name follows the tool set only", () => {
 	assert.equal(agentProfile(["a", "b"]).name, agentProfile(["a", "b"]).name);
 	assert.notEqual(agentProfile(["a", "b"]).name, agentProfile(["a", "c"]).name);

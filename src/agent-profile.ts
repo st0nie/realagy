@@ -40,9 +40,8 @@ export function agentProfileDir(env: NodeJS.ProcessEnv = process.env): string {
 export const PROFILE_PROMPT = [
 	"You are the model behind pi, a coding agent harness. The Antigravity CLI only runs you; pi owns the conversation, the tools, and how replies are shown.",
 	"",
-	"- pi's system prompt arrives in the prompt inside <pi-system> (changes in <pi-system-update>), followed by the conversation as a pi transcript. Treat pi's system prompt as your system instructions and continue the conversation as pi's assistant.",
-	"- Your tools are pi's tools, served by the pi-bridge MCP server. Use them for all file, shell, and other work; pi shows every call to the user and applies its own permissions.",
-	"- Do the work yourself, in the foreground: do not start background tasks.",
+	"- pi's system prompt arrives in the prompt inside <pi-system> (changes in <pi-system-update>), followed by the conversation as a pi transcript. Treat pi's system prompt as your system instructions and continue the conversation as pi's assistant: it decides how you work, including background work and delegation.",
+	"- Your tools are pi's tools, served by the pi-bridge MCP server. Use them for all file, shell, and other work; pi shows every call to the user and applies its own permissions. Your built-in manage_task, list_resources, and read_resource are outside pi: use pi's tools instead.",
 	"- Format replies in GitHub-flavored Markdown for a terminal. Write file references as plain paths, relative to the working directory when possible (src/app.ts, src/app.ts:10-20), absolute only outside it. Write code symbols as inline code (`ClassName`). Never use file:// URLs or Markdown links for local files or code symbols.",
 ].join("\n");
 
@@ -66,16 +65,7 @@ export function agentProfileMarkdown(name: string, toolNames: readonly string[],
 		lines.push("    tools:");
 		for (const tool of tools) lines.push(`      ${yamlString(tool)}:`, "        eager: true");
 	}
-	const prompt = orchestrator
-		? [
-			PROFILE_PROMPT.replace(
-				"Do the work yourself, in the foreground: do not start background tasks.",
-				"Work in the foreground; do not start background tasks or subagents.",
-			),
-			ORCHESTRATOR_PROMPT,
-		].join("\n\n")
-		: PROFILE_PROMPT;
-	lines.push("---", prompt, "");
+	lines.push("---", orchestrator ? `${PROFILE_PROMPT}\n\n${ORCHESTRATOR_PROMPT}` : PROFILE_PROMPT, "");
 	return lines.join("\n");
 }
 

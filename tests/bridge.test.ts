@@ -28,6 +28,41 @@ test("bridge lists every model-facing pi tool, active or not, and dispatches onl
 	assert.equal(dispatchablePiTool(tools, active, "secret"), false);
 });
 
+test("the balanced catalog declares pi's core builtins only while active; other modes widen or narrow it", () => {
+	const builtin = (name: string) => ({ name, sourceInfo: { source: "builtin" } });
+	const tools = [
+		...["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"].map(builtin),
+		// pi's builtin extensions register these inactive until needed.
+		{ name: "codemode", sourceInfo: { source: "builtin" } },
+		{ name: "tool_search", sourceInfo: { source: "builtin" } },
+		// An extension replacing a builtin name is not a core builtin.
+		{ name: "grep_ext", sourceInfo: { source: "npm:pi-fff" } },
+		{ name: "lens_symbols", sourceInfo: { source: "npm:pi-lens" } },
+	];
+	const active = ["read", "bash", "edit", "write", "grep_ext"];
+	const names = (catalog?: "balanced" | "active" | "registered") => bridgedPiTools(tools, active, { catalog }).map((tool) => tool.name);
+	assert.deepEqual(names(), ["read", "bash", "edit", "write", "codemode", "tool_search", "grep_ext", "lens_symbols"]);
+	assert.deepEqual(names("balanced"), names());
+	assert.deepEqual(names("active"), ["read", "bash", "edit", "write", "grep_ext"]);
+	assert.deepEqual(names("registered"), tools.map((tool) => tool.name));
+	// An activated builtin joins the balanced catalog.
+	assert.ok(bridgedPiTools(tools, [...active, "ls"]).some((tool) => tool.name === "ls"));
+	assert.equal(dispatchablePiTool(tools, [...active, "ls"], "ls"), true);
+	assert.equal(dispatchablePiTool(tools, [...active, "ls"], "ls", { catalog: "active" }), true);
+	assert.equal(dispatchablePiTool(tools, active, "lens_symbols", { catalog: "active" }), false);
+});
+
+test("tools pi hides from the model are neither declared nor dispatched", () => {
+	const tools = [{ name: "codemode" }, { name: "read" }, { name: "bash" }];
+	const active = ["codemode", "read", "bash"];
+	const hidden = new Set(["read", "bash"]);
+	for (const catalog of ["balanced", "active", "registered"] as const) {
+		assert.deepEqual(bridgedPiTools(tools, active, { catalog, hidden }).map((tool) => tool.name), ["codemode"], catalog);
+	}
+	assert.equal(dispatchablePiTool(tools, active, "read", { hidden }), false);
+	assert.equal(dispatchablePiTool(tools, active, "codemode", { hidden }), true);
+});
+
 test("loopback MCP requires its token and lists/calls pi tools", async () => {
 	const started = await startMcpServer({
 		listTools: () => [{ name: "bash", description: "pi bash", inputSchema: { type: "object" } }],

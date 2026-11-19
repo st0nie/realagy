@@ -137,6 +137,10 @@ export interface TurnDriver {
 	run(request: DriverTurnRequest): Promise<TurnHandle>;
 	/** Re-attach to the active turn (pi toolUse continuation). */
 	reentry(): TurnHandle | null;
+	/** Whether the next turn for `model` respawns agy (src/acp/driver.ts):
+	 *  a continuation cannot reenter the live turn, whose session froze the
+	 *  old tool list and policy, and resumes in the new process instead. */
+	outdated?(model: string): boolean;
 	/** Resume the inactivity guard after a parked pi tool call settles. */
 	kickIdle(): void;
 	/** Abort the active turn (if any) and resolve once it has settled. */

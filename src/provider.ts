@@ -21,6 +21,8 @@ import type { BridgeResult } from "./mcp-server.js";
 import {
 	formatToolResult,
 	planTurn,
+	toolsKey,
+	toolsUpdate,
 	UNLOCKED_REPLAY_BUDGET_BYTES,
 	warmAfterTurn,
 	type TurnPlan,
@@ -48,6 +50,9 @@ export interface ToolRoundTripsOptions {
 	pollWaitMs?: number;
 	/** True when a Pi tool explicitly declares the metadata-named argument. */
 	preserveToolSummary?: (name: string) => boolean;
+	/** Whether `parallel` is realagy's batching tool (default) rather than a
+	 *  pi tool of that name. */
+	batchTool?: () => boolean;
 }
 
 interface PendingCall {
@@ -115,6 +120,8 @@ function bridgeToolArguments(args: Record<string, unknown>, preserve: boolean): 
 export class ToolRoundTrips {
 	#pending = new Map<string, PendingCall>();
 	#polls = new Map<string, PollResult>();
+	/** Prefaces of parallel batches' calls, keyed by batch call id. */
+	#batchPrefaces = new Map<string, string>();
 	#escalateAfterMs: number;
 	#pollWaitMs: number;
 
@@ -138,7 +145,7 @@ export class ToolRoundTrips {
 		const handle = this.driver.activeHandle;
 		if (!handle) return Promise.reject(new Error("no active Antigravity turn for this pi tool call"));
 		this.#prunePolls();
-		if (name === PARALLEL_TOOL_NAME) return this.#parallel(callId, args, signal, handle);
+		if (name === PARALLEL_TOOL_NAME && (this.opts.batchTool?.() ?? true)) return this.#parallel(callId, args, signal, handle);
 		const result = this.#park(callId, name, signal, {});
 		handle.pushExternal({ type: "bridge_call", callId, name, args: bridgeToolArguments(args, this.opts.preserveToolSummary?.(name) ?? false) });
 		return result;
@@ -208,9 +215,12 @@ export class ToolRoundTrips {
 		});
 		void Promise.all(innerPromises).then((results) => {
 			const aggregated = formatParallelResults(calls, results);
-			this.resolve(callId, aggregated.text, aggregated.isError, aggregated.images);
+			const preface = this.#batchPrefaces.get(callId);
+			this.#batchPrefaces.delete(callId);
+			this.resolve(callId, aggregated.text, aggregated.isError, aggregated.images, preface);
 			cleanup();
 		}).catch((error: unknown) => {
+			this.#batchPrefaces.delete(callId);
 			cleanup();
 			innerAbort.abort();
 			this.#fail(callId, error instanceof Error ? error.message : String(error));
@@ -231,10 +241,16 @@ export class ToolRoundTrips {
 		return false;
 	}
 
-	resolve(callId: string, text: string, isError: boolean, images: Array<{ data: string; mimeType: string }> = []): boolean {
+	/** Settle a parked call. A `preface` goes ahead of the output, so agy
+	 *  truncating a long result cannot drop it; for a call inside a parallel
+	 *  batch it goes ahead of the batch's aggregate result. */
+	resolve(callId: string, output: string, isError: boolean, images: Array<{ data: string; mimeType: string }> = [], preface?: string): boolean {
 		const pending = this.#pending.get(callId);
 		if (!pending) return false;
 		this.#pending.delete(callId);
+		let text = output;
+		if (preface !== undefined && pending.batchId !== undefined) this.#batchPrefaces.set(pending.batchId, preface);
+		else if (preface !== undefined) text = `${preface}\n\n${output || (images.length > 0 ? "(image result)" : "(no output)")}`;
 		if (pending.timer) clearTimeout(pending.timer);
 		if (pending.escalateTimer) clearTimeout(pending.escalateTimer);
 		pending.signal.removeEventListener("abort", pending.onAbort);
@@ -706,20 +722,37 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 				const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 				const previousSession = sessions.warm?.sessionId;
 				if (previousSession) (sessions.retirementCandidates ??= new Set()).add(previousSession);
-				const plan = selectTurnPlan(context, cwd, sessions, deps.replayBudgetBytes?.() ?? UNLOCKED_REPLAY_BUDGET_BYTES);
+				// The active tools the parked step's session was told about.
+				const parkedTools = sessions.warm?.tools;
+				const entry = deps.entries.find((candidate) => candidate.id === model.id);
+				const budget = deps.replayBudgetBytes?.() ?? UNLOCKED_REPLAY_BUDGET_BYTES;
+				// The next turn respawns agy (a tool call activated a tool the
+				// bridge never declared, so the policy changed): the parked native
+				// turn cannot continue. Its results are not resolved to it, since
+				// agy may record them before the cancel below and then see them
+				// again in a resumed session's delta; the cancel fails its calls
+				// (failParkedCalls) and the turn replays fresh.
+				const respawn = results.length > 0 && deps.driver.outdated?.(entry?.full ?? model.id) === true;
+				const plan = respawn ? planTurn(context, cwd, undefined, budget) : selectTurnPlan(context, cwd, sessions, budget);
+				const tools = toolsKey(context);
 				// Settle completed Pi calls before cancelling the old model turn.
 				// Otherwise its generic abort handler can reject an already-completed
 				// MCP request before the native continuation consumes its result.
-				for (const result of results) {
-					const trailing = plan.kind === "warm" && result === results.at(-1)
-						? context.messages.slice(context.messages.lastIndexOf(result) + 1)
-						: [];
+				if (!respawn) for (const result of results) {
+					const last = plan.kind === "warm" && result === results.at(-1);
+					const trailing = last ? context.messages.slice(context.messages.lastIndexOf(result) + 1) : [];
+					// A call that changed pi's active tools (pi-lens activation,
+					// web_enable) tells the continuing native turn which it may call.
 					const payload = formatToolResult(result, trailing);
-					deps.roundTrips.resolve(result.toolCallId, payload.text, result.isError, payload.images);
+					const preface = last && parkedTools !== undefined && tools !== parkedTools ? toolsUpdate(tools) : undefined;
+					deps.roundTrips.resolve(result.toolCallId, payload.text, result.isError, payload.images, preface);
 				}
 				// Exact-prefix reuse can continue the parked native turn. A fresh
-				// replay already contains these tool results, so the old turn is cancelled below.
-			const active = results.length > 0 && plan.kind === "warm" && !options?.signal?.aborted && !deps.roundTrips.hasPendingBatchCalls() ? deps.driver.reentry() : null;
+				// replay already contains these tool results, so the old turn is
+				// cancelled below.
+				const active = results.length > 0 && plan.kind === "warm" && !options?.signal?.aborted && !deps.roundTrips.hasPendingBatchCalls()
+					? deps.driver.reentry()
+					: null;
 				if (active) {
 					sessions.parked = undefined;
 					await consumeTurn(stream, blocks, active, model, options, onCompleted, onToolCall, deps.meter);
@@ -753,7 +786,6 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 				await deps.driver.cancelActive("superseded by a new pi turn");
 				sessions.parked = undefined;
 
-				const entry = deps.entries.find((candidate) => candidate.id === model.id);
 				traceUsage("plan", plan.kind === "warm"
 					? { kind: plan.kind, sessionId: plan.sessionId, deltaMessages: plan.deltaMessages, delta: plan.input.contextBlock ? "transcript" : "user", parts: plan.input.parts?.length ?? 0 }
 					: { kind: plan.kind, reason: plan.reason, messages: context.messages.length, replayBytes: Buffer.byteLength(plan.input.prompt, "utf8") });

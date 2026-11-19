@@ -85,6 +85,11 @@ export interface AcpDriverOptions {
 	 *  Evaluated per turn: when it differs from the live process's agent, the
 	 *  process is respawned before the turn. undefined = agy's default agent. */
 	agent?: (model?: string) => string | undefined;
+	/** The name `agent` would return, without its side effects (installing
+	 *  the profile). When given, staleness checks (each turn, `outdated`)
+	 *  compare it with the name the live process was spawned for, and only a
+	 *  spawn calls `agent`. */
+	agentName?: (model?: string) => string | undefined;
 	/** agy's `brain` directory, watched for background work that finishes
 	 *  after a prompt ended. undefined disables the watcher. */
 	brainDir?: () => string | undefined;
@@ -182,6 +187,11 @@ export class AcpDriver implements TurnDriver {
 	#catalogProxy: CatalogProxy | undefined;
 	/** Whether the live `#conn` was spawned with the catalog proxy. */
 	#connNoAutoCompaction: boolean | undefined;
+	/** The system-prompt append the live `#conn` was spawned with. */
+	#connSystemPrompt: string | undefined;
+	/** `agentName` when the live `#conn` was spawned; unlike `conn.agent` it
+	 *  stays set when the profile could not be installed. */
+	#connAgentName: string | undefined;
 
 	constructor(opts: AcpDriverOptions) {
 		this.#opts = opts;
@@ -328,7 +338,7 @@ export class AcpDriver implements TurnDriver {
 		// A concurrent catalog startup may still be using another profile.
 		await Promise.allSettled([...this.#catalogRequests]);
 		if (this.#starting) await this.#starting;
-		this.#retireStaleAgent(request.model);
+		this.#retireStaleProcess(request.model);
 		const conn = await this.#ensureConnection(request.cwd, request.model);
 		if (turn.closed) return;
 		turn.conn = conn;
@@ -717,36 +727,62 @@ export class AcpDriver implements TurnDriver {
 		}
 	}
 
-	/** A turn starts on a process whose agent profile is out of date (the
-	 *  bridged tool set changed): tear it down so the turn respawns with the
-	 *  new profile. Turns are serialized, so no turn runs on it; remembered
+	#resolveAgentName(model?: string): string | undefined {
+		try {
+			return this.#opts.agentName?.(model);
+		} catch (err) {
+			this.#log("agent-failed", { message: describe(err) });
+			return undefined;
+		}
+	}
+
+	#resolveSystemPrompt(agent: string | undefined): string | undefined {
+		try {
+			return this.#opts.systemPrompt?.(agent);
+		} catch {
+			return undefined; // AcpConnection logs the failure per session.
+		}
+	}
+
+	/** A turn starts on a process that is out of date: its agent profile, the
+	 *  system-prompt append (which names the bridged tools, so it also tracks
+	 *  the MCP tool list agy froze per session), or its compaction mode
+	 *  changed. Tear it down so the turn respawns; agy re-reads both the MCP
+	 *  tools and the append when it resumes a session (verified live against
+	 *  agy 1.5.9). Turns are serialized, so no turn runs on it; remembered
 	 *  sessions resume in the new process. */
-	#retireStaleAgent(model?: string): void {
+	#retireStaleProcess(model?: string): void {
 		const conn = this.#conn;
 		if (this.#starting || !conn?.alive) return;
-		if (this.#opts.agent) {
-			const agent = this.#resolveAgent(model);
-			if (agent !== conn.agent) {
-				this.#log("agent-changed", { from: conn.agent ?? null, to: agent ?? null });
-				this.#conn = undefined;
-				this.#connNoAutoCompaction = undefined;
-				this.#liveSessions.clear();
-				this.#background?.forgetAll();
-				conn.kill();
-				return;
-			}
-		}
+		const stale = this.#staleness(conn, model);
+		if (stale) this.#retire(conn, stale.reason, stale.data);
+	}
+
+	outdated(model: string): boolean {
+		const conn = this.#conn;
+		return !this.#starting && conn?.alive === true && this.#staleness(conn, model) !== undefined;
+	}
+
+	#staleness(conn: AcpConnection, model?: string): { reason: string; data?: unknown } | undefined {
+		const [from, to] = this.#opts.agentName
+			? [this.#connAgentName, this.#resolveAgentName(model)]
+			: [conn.agent, this.#opts.agent ? this.#resolveAgent(model) : conn.agent];
+		if (to !== from) return { reason: "agent-changed", data: { from: from ?? null, to: to ?? null } };
+		if (this.#resolveSystemPrompt(conn.agent) !== this.#connSystemPrompt) return { reason: "system-prompt-changed" };
 		if (!this.#opts.binArgs && this.#connNoAutoCompaction !== undefined) {
 			const next = this.#noAutoCompaction();
-			if (next !== this.#connNoAutoCompaction) {
-				this.#log("compaction-changed", { from: this.#connNoAutoCompaction, to: next });
-				this.#conn = undefined;
-				this.#connNoAutoCompaction = undefined;
-				this.#liveSessions.clear();
-				this.#background?.forgetAll();
-				conn.kill();
-			}
+			if (next !== this.#connNoAutoCompaction) return { reason: "compaction-changed", data: { from: this.#connNoAutoCompaction, to: next } };
 		}
+		return undefined;
+	}
+
+	#retire(conn: AcpConnection, reason: string, data?: unknown): void {
+		this.#log(reason, data);
+		this.#conn = undefined;
+		this.#connNoAutoCompaction = undefined;
+		this.#liveSessions.clear();
+		this.#background?.forgetAll();
+		conn.kill();
 	}
 
 	#ensureConnection(cwd: string, model?: string): Promise<AcpConnection> {
@@ -780,6 +816,7 @@ export class AcpDriver implements TurnDriver {
 	}
 
 	async #startConnection(cwd: string, model?: string): Promise<AcpConnection> {
+		const agentName = this.#resolveAgentName(model);
 		const agent = this.#resolveAgent(model);
 		let conn: AcpConnection | undefined;
 		let bin = this.#sourceBin();
@@ -814,6 +851,8 @@ export class AcpDriver implements TurnDriver {
 			});
 			this.#conn = conn;
 			this.#connNoAutoCompaction = useCatalogProxy;
+			this.#connSystemPrompt = this.#resolveSystemPrompt(agent);
+			this.#connAgentName = agentName;
 			this.#liveSessions.clear();
 			this.#log("spawn", { bin, agent: agent ?? null, noAutoCompaction: useCatalogProxy });
 			await conn.start();

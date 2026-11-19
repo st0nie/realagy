@@ -5,10 +5,10 @@
 // it, a system-prompt policy steers the model to pi's tools, and agy's own
 // tool use stays visible.
 
-import { createProvider } from "@earendil-works/pi-ai";
+import { createProvider, getCurrentSystemMessage, getCurrentTools, type TranscriptContext } from "@earendil-works/pi-ai";
 import { BorderedLoader, type ExtensionAPI, type ExtensionCommandContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import { AcpDriver } from "../src/acp/driver.js";
-import { installAgentProfile } from "../src/agent-profile.js";
+import { agentProfile, installAgentProfile } from "../src/agent-profile.js";
 import { backgroundMessageText, defaultBrainDir } from "../src/acp/background.js";
 import { AGY_BACKGROUND_MESSAGE, renderBackgroundCard, type BackgroundCardDetails } from "../src/background-card.js";
 import { fetchCliUsage, UsageMeter } from "../src/quota.js";
@@ -63,9 +63,32 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	let stopped = false;
 	const shutdownController = new AbortController();
 
-	// Every tool an extension may activate is listed, so a mid-session
-	// activation never needs a new ACP session; only active ones run.
-	const bridgedTools = () => [...bridgedPiTools(pi.getAllTools(), pi.getActiveTools()), PARALLEL_TOOL_INFO];
+	// Active tools pi leaves out of the model's declarations (a tool's
+	// prepareLoadout, such as codemode's `only` mode), as of the latest request.
+	let hiddenTools: ReadonlySet<string> = new Set();
+	const noteDeclaredTools = (context: TranscriptContext): void => {
+		// Only a pi transcript that declares tools carries a loadout. pi's
+		// compaction and branch summaries declare none (and contexts without
+		// pi's system message carry none); updating from them would respawn agy
+		// twice and overwrite the live loadout. codemode's only mode always
+		// keeps itself declared, so a real loadout never declares zero tools.
+		const declared = new Set(getCurrentTools(context.messages).map((tool) => tool.name));
+		if (!getCurrentSystemMessage(context.messages) || declared.size === 0) return;
+		hiddenTools = new Set(pi.getActiveTools().filter((name) => !declared.has(name)));
+	};
+	const catalogOptions = () => ({ catalog: config.toolCatalog, hidden: hiddenTools });
+	// The catalog mode (config `toolCatalog`) pre-declares the tools an
+	// extension may activate, so such an activation keeps the ACP session;
+	// only active ones run.
+	const piTools = () => bridgedPiTools(pi.getAllTools(), pi.getActiveTools(), catalogOptions());
+	// `parallel` is realagy's batching tool unless pi bridges its own tool of that name.
+	const batchTool = () => !piTools().some((tool) => tool.name === PARALLEL_TOOL_NAME);
+	const bridgedTools = () => {
+		const tools = piTools();
+		return tools.some((tool) => tool.name === PARALLEL_TOOL_NAME) ? tools : [...tools, PARALLEL_TOOL_INFO];
+	};
+	const profileTools = () => [...bridgedTools().map((tool) => tool.name), POLL_TOOL_NAME];
+	const orchestrator = (model?: string) => model === "gemini-pro-orchestrator" || model === "gemini-pro-orchestrator-argon";
 	// UI of this runtime, for the live agy panel. pi replaces the runtime on
 	// /new, /resume, /fork, and /reload after session_shutdown, so `stopped`
 	// guards every use.
@@ -94,15 +117,17 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		// unmeasured messages are left to pi's own transcript estimate.
 		conversationsDir: () => defaultConversationsDir(),
 		sessionRetention,
-		systemPrompt: (agent) => toolPolicyPrompt(bridgedTools().map((tool) => tool.name), { profile: agent !== undefined }),
+		systemPrompt: (agent) => toolPolicyPrompt(piTools().map((tool) => tool.name), {
+			profile: agent !== undefined,
+			instructions: config.instructions,
+			helpers: [...(batchTool() ? [PARALLEL_TOOL_NAME] : []), POLL_TOOL_NAME],
+		}),
 		// Every bridged tool (and the poll helper) is marked eager in the
 		// profile; without the bridge, agy's default agent keeps its own tools.
+		// Staleness checks use the pure name; only a spawn installs the file.
+		agentName: (model) => bridge && config.agentProfile ? agentProfile(profileTools(), orchestrator(model)).name : undefined,
 		agent: (model) =>
-			bridge && config.agentProfile
-				? installAgentProfile([...bridgedTools().map((tool) => tool.name), POLL_TOOL_NAME], {
-					orchestrator: model === "gemini-pro-orchestrator" || model === "gemini-pro-orchestrator-argon",
-				})
-				: undefined,
+			bridge && config.agentProfile ? installAgentProfile(profileTools(), { orchestrator: orchestrator(model) }) : undefined,
 		onNativeTool: (event) => workPanel.update(event),
 		brainDir: () => defaultBrainDir(),
 		// Finished background work wakes pi's agent: an idle agent starts a
@@ -117,6 +142,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 	});
 	const roundTrips = new ToolRoundTrips(driver, {
 		preserveToolSummary: (name) => declaresToolArgument(pi.getAllTools().find((tool) => tool.name === name)?.parameters, "toolSummary"),
+		batchTool,
 	});
 	driver.onTurnEnd = (outcome) => failParkedCalls(roundTrips, outcome);
 	const started = await startMcpServer({
@@ -134,10 +160,11 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		],
 		onToolCall: (callId, name, args, signal) => {
 			const active = pi.getActiveTools();
-			if (name === PARALLEL_TOOL_NAME) {
+			const dispatchable = (tool: string) => dispatchablePiTool(pi.getAllTools(), active, tool, catalogOptions());
+			if (name === PARALLEL_TOOL_NAME && batchTool()) {
 				const parsed = parseParallelCalls(args, [POLL_TOOL_NAME]);
 				if (!parsed.ok) return Promise.resolve(parallelErrorResult(parsed.error));
-				const inactive = parsed.calls.find((call) => !dispatchablePiTool(pi.getAllTools(), active, call.name));
+				const inactive = parsed.calls.find((call) => !dispatchable(call.name));
 				if (inactive) {
 					const usable = bridgedTools().filter((tool) => active.includes(tool.name)).map((tool) => tool.name);
 					return Promise.resolve({
@@ -147,7 +174,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				}
 				return roundTrips.onToolCall(callId, name, args, signal);
 			}
-			if (name !== POLL_TOOL_NAME && !dispatchablePiTool(pi.getAllTools(), active, name)) {
+			if (name !== POLL_TOOL_NAME && !dispatchable(name)) {
 				const usable = bridgedTools().filter((tool) => active.includes(tool.name)).map((tool) => tool.name);
 				return Promise.resolve({
 					content: [{ type: "text" as const, text: `Pi tool ${name} is not active in pi right now. Active pi tools: ${usable.join(", ") || "none"}.` }],
@@ -175,6 +202,10 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		replayBudgetBytes: () => config.noAutoCompaction ? UNLOCKED_REPLAY_BUDGET_BYTES : LOCKED_REPLAY_BUDGET_BYTES,
 		inactivityMin: () => config.inactivityMin,
 	});
+	const streamDeclared: typeof streamSimple = (model, context, options) => {
+		noteDeclaredTools(context);
+		return streamSimple(model, context, options);
+	};
 	const registerModels = () => {
 		// Sign-in belongs to the agy CLI. Ambient-only auth (no `login`) means pi
 		// never prompts for or stores a key; the provider counts as configured
@@ -190,7 +221,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 				},
 			},
 			models: entries.map((entry) => toPiModel(entry, config)),
-			api: { stream: (model, context, options) => streamSimple(model, context, options), streamSimple },
+			api: { stream: streamDeclared, streamSimple: streamDeclared },
 		}));
 	};
 	registerModels();

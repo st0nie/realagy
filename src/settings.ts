@@ -24,6 +24,7 @@ import {
 	type TuiMouseEvent,
 	type TuiMouseEventResult,
 } from "@earendil-works/pi-tui";
+import { TOOL_CATALOGS, type ToolCatalog } from "./bridge-catalog.js";
 import type { ModelLimitOverrides } from "./models.js";
 
 export interface RealagyConfig extends ModelLimitOverrides {
@@ -39,6 +40,12 @@ export interface RealagyConfig extends ModelLimitOverrides {
 	/** Inactivity guard in minutes: no agy output for this long fails the
 	 * turn. 0, the default, disables the guard. */
 	inactivityMin?: number;
+	/** Which inactive pi tools the bridge declares (src/bridge-catalog.ts).
+	 *  undefined = `balanced`. File-only. */
+	toolCatalog?: ToolCatalog;
+	/** The user's own rules, appended to agy's system prompt after realagy's
+	 *  tool policy. File-only. */
+	instructions?: string;
 }
 
 export const DEFAULT_REALAGY_CONFIG: Readonly<RealagyConfig> = {
@@ -159,12 +166,16 @@ export function normalizeRealagyConfig(raw: unknown): RealagyConfig {
 	const maxOutputTokensOverrides = normalizeModelLimitOverrides(record.maxOutputTokensOverrides);
 	// 0 is a valid choice (guard off), so it bypasses parsePositiveInt.
 	const inactivityMin = record.inactivityMin === 0 ? 0 : parsePositiveInt(record.inactivityMin);
+	const toolCatalog = TOOL_CATALOGS.find((catalog) => catalog === record.toolCatalog);
+	const instructions = typeof record.instructions === "string" ? record.instructions.replace(/\r\n?/g, "\n").trim() : "";
 	const result: RealagyConfig = { noAutoCompaction, fullMcpOutput, agentProfile };
 	if (contextWindow !== undefined) result.contextWindow = contextWindow;
 	if (contextWindowOverrides !== undefined) result.contextWindowOverrides = contextWindowOverrides;
 	if (maxOutputTokens !== undefined) result.maxOutputTokens = maxOutputTokens;
 	if (maxOutputTokensOverrides !== undefined) result.maxOutputTokensOverrides = maxOutputTokensOverrides;
 	if (inactivityMin !== undefined) result.inactivityMin = inactivityMin;
+	if (toolCatalog !== undefined) result.toolCatalog = toolCatalog;
+	if (instructions) result.instructions = instructions;
 	return result;
 }
 
@@ -222,6 +233,8 @@ export function formatConfigSummary(config: RealagyConfig, file: string = realag
 		),
 		`  Pi max output tokens: ${formatConfigLimit(config.maxOutputTokens)}`,
 		`  Inactivity timeout: ${config.inactivityMin ? `${config.inactivityMin} min` : config.inactivityMin === undefined ? "disabled (default)" : "disabled"}`,
+		`  Tool catalog: ${config.toolCatalog ?? "balanced (default)"}`,
+		`  Custom instructions: ${config.instructions ? `${config.instructions.length} characters` : "none"}`,
 		...Object.entries(config.maxOutputTokensOverrides ?? {}).map(
 			([modelId, limit]) => `  Pi max output tokens (${modelId}): ${formatConfigLimit(limit)}`,
 		),
@@ -258,6 +271,8 @@ function withUpdatedSetting(current: RealagyConfig, id: string, rawValue: string
 	if (current.contextWindowOverrides !== undefined) next.contextWindowOverrides = current.contextWindowOverrides;
 	if (current.maxOutputTokensOverrides !== undefined) next.maxOutputTokensOverrides = current.maxOutputTokensOverrides;
 	if (current.inactivityMin !== undefined) next.inactivityMin = current.inactivityMin;
+	if (current.toolCatalog !== undefined) next.toolCatalog = current.toolCatalog;
+	if (current.instructions !== undefined) next.instructions = current.instructions;
 	return next;
 }
 
