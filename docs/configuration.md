@@ -12,7 +12,7 @@ User settings live in `~/.pi/agent/realagy/config.json` (under Pi's agent direct
 
 | Source | Holds | Takes effect |
 | --- | --- | --- |
-| `~/.pi/agent/realagy/config.json` | Compaction bypass (`noAutoCompaction`), full MCP output patch (`fullMcpOutput`), Pi-only agent profile (`agentProfile`), global and per-model token limits | Immediately on save in `/realagy settings` (`agy acp` restarts for process-level toggles; editing the file by hand applies on `/reload` or next Pi start) |
+| `~/.pi/agent/realagy/config.json` | Compaction bypass (`noAutoCompaction`), full MCP output patch (`fullMcpOutput`), Pi-only agent profile (`agentProfile`), global and per-model token limits, file-only `inactivityMin`, `toolCatalog`, and `instructions` | Immediately on save in `/realagy settings` (`agy acp` restarts for process-level toggles; editing the file by hand applies on `/reload` or next Pi start) |
 | Environment variables | `agy` binary path (`AGY_BIN`), data directory (`GEMINI_HOME`), usage trace log (`REALAGY_TRACE_USAGE`), upstream proxy (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`) | When Pi starts (or `/realagy setup` for `AGY_BIN` / `GEMINI_HOME`) |
 | `~/.gemini/antigravity-cli/settings.json` | Antigravity CLI's own settings (`queuedMessages`, native tool permissions) | When `agy acp` starts |
 
@@ -51,6 +51,8 @@ Every change in `/realagy settings` is normalized and written atomically to `~/.
 | `contextWindowOverrides` | `Record<string, number>` | *(none)* | Optional map of exact Pi model IDs to positive integer context windows; takes precedence over `contextWindow` |
 | `maxOutputTokens` | `number` | *(model default)* | Optional positive integer overriding the global fallback max output token limit reported to Pi |
 | `maxOutputTokensOverrides` | `Record<string, number>` | *(none)* | Optional map of exact Pi model IDs to positive integer max output limits; takes precedence over `maxOutputTokens` |
+| `toolCatalog` | `"balanced"` \| `"active"` \| `"registered"` | `"balanced"` | Which inactive pi tools the bridge pre-declares to agy (agy keeps a session's tool list, so only pre-declared tools can be activated without a respawn). `balanced`: every tool an extension may activate later, and pi's core builtins (`read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, `powershell`) only while active. `active`: only active tools, the smallest prompt; each activation then respawns agy before the next turn (the warm session resumes). `registered`: every model-facing tool, core builtins included (realagy's earlier behavior). Tools pi hides from the model (codemode's `only` mode) are never declared. File-only |
+| `instructions` | `string` | *(none)* | Your own rules for agy models, appended to agy's system prompt after realagy's tool policy as `<user-instructions>` (with or without the agent profile), for example `"Ask before starting background tasks."` or `"Batch independent tool calls with parallel."`. realagy's own prompt only states how pi's tools are reached and leaves how to work to pi's system prompt, so use this for preferences specific to agy models. Changing it respawns agy before the next turn. File-only |
 | `inactivityMin` | `number` | `0` | Inactivity guard in minutes, disabled by default (`0`). With a positive value, if `agy` streams no output for this long (and no tool call is running), the turn fails with "Antigravity produced no output…". Keep it off or high for models that generate very large single tool payloads silently. File-only: not shown in the `/realagy settings` menu, but preserved when the menu saves |
 
 ### Validation and fallback rules
@@ -59,6 +61,9 @@ Every change in `/realagy settings` is normalized and written atomically to `~/.
 - Non-boolean values for `noAutoCompaction`, `fullMcpOutput`, or `agentProfile` fall back to `true`.
 - Token limits must be positive safe integers (or numeric strings with optional commas, underscores, or spaces, such as `"1,048,576"`). Zero, negative, non-integer, or empty values are ignored and omitted when saving.
 - `inactivityMin` must be a positive safe integer (or numeric string); the literal number `0` is also accepted and disables the inactivity guard. Other values are ignored.
+- `toolCatalog` must be one of `balanced`, `active`, or `registered`; other values fall back to `balanced`.
+- `instructions` must be a string; line endings are normalized and surrounding whitespace is trimmed. An empty string is dropped.
+- File-only keys (`inactivityMin`, `toolCatalog`, `instructions`) are preserved when `/realagy settings` saves; edit them in the file and run `/reload`.
 - Unknown keys in `config.json` are ignored and stripped the next time `/realagy settings` saves the file.
 - When `noAutoCompaction` or `fullMcpOutput` is enabled, realagy must be able to derive and verify the patched `agy` binary for the current platform (Windows x64 PE, Linux x64 ELF, or macOS arm64 Mach-O). If an unsupported architecture or unrecognized binary layout is encountered, startup fails closed rather than running an unverified binary; disable the corresponding toggle only if you intentionally want the stock `agy` behavior.
 

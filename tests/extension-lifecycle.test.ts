@@ -548,7 +548,6 @@ describe("extension session lifecycle", () => {
 		expect(listed()).toEqual(["bash", "read", "pi_lens_activate_tools", "lens_symbols", "parallel", "poll"]);
 		const policy = session.driver.systemPrompt();
 		expect(policy).toMatch(/bash, read, pi_lens_activate_tools, lens_symbols/);
-		expect(policy).toMatch(/use parallel once with \{calls:/);
 
 		const inactive = await mocks.bridge!.onToolCall("c1", "lens_symbols", {}, new AbortController().signal);
 		expect(inactive).toEqual({ content: [{ type: "text", text: "Pi tool lens_symbols is not active in pi right now. Active pi tools: bash, read, pi_lens_activate_tools." }], isError: true });
@@ -575,6 +574,121 @@ describe("extension session lifecycle", () => {
 		expect(mocks.onToolCall).toHaveBeenCalledWith("batch-2", "parallel", batchArgs, signal);
 	});
 
+	it("declares pi's inactive core builtins only with toolCatalog registered, and only active tools with active", async () => {
+		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
+		const builtin = (name: string) => ({ name, sourceInfo: { source: "builtin" } });
+		const tools = {
+			all: [...["read", "bash", "ls", "powershell"].map(builtin), { name: "lens_symbols", sourceInfo: { source: "npm:pi-lens" } }],
+			active: ["read", "bash"],
+		};
+		const listed = () => mocks.bridge!.listTools().map((tool: { name: string }) => tool.name);
+		await start(tools);
+		expect(listed()).toEqual(["read", "bash", "lens_symbols", "parallel", "poll"]);
+		await start(tools, { toolCatalog: "registered" });
+		expect(listed()).toEqual(["read", "bash", "ls", "powershell", "lens_symbols", "parallel", "poll"]);
+		await start(tools, { toolCatalog: "active" });
+		expect(listed()).toEqual(["read", "bash", "parallel", "poll"]);
+	});
+
+	it("follows tool changes another extension makes after realagy's session_start, such as pi-fff replacing builtins", async () => {
+		mocks.ensure.mockReturnValue({ ok: true, bin: "agy" });
+		mocks.listModels.mockResolvedValue([]);
+		const home = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-ext-fff-"));
+		vi.stubEnv("GEMINI_HOME", home);
+		try {
+			const builtin = (name: string) => ({ name, sourceInfo: { source: "builtin" } });
+			const fff = (name: string) => ({ name, sourceInfo: { source: "npm:@ff-labs/pi-fff" } });
+			// The user's defaultTools enabled grep/find/ls; realagy's session_start runs first.
+			const session = await start({ all: [...["read", "bash", "grep", "find", "ls"].map(builtin), fff("ffgrep"), fff("fffind")], active: ["read", "bash", "grep", "find", "ls"] });
+			await vi.waitFor(() => expect(mocks.listModels).toHaveBeenCalled());
+			const listed = () => mocks.bridge!.listTools().map((tool: { name: string }) => tool.name);
+			expect(listed()).toEqual(["read", "bash", "grep", "find", "ls", "ffgrep", "fffind", "parallel", "poll"]);
+			const early = { agent: session.driver.agent(), policy: session.driver.systemPrompt("profile") };
+			// pi-fff's session_start then swaps the builtins for its own tools.
+			session.pi.setActiveTools(["read", "bash", "ffgrep", "fffind"]);
+			expect(listed()).toEqual(["read", "bash", "ffgrep", "fffind", "parallel", "poll"]);
+			const policy = session.driver.systemPrompt("profile");
+			expect(policy).toMatch(/^read, bash, ffgrep, fffind$/m);
+			expect(policy).toMatch(/The bridge's own parallel and poll are not pi tools/);
+			expect(policy).not.toBe(early.policy);
+			// A new profile name: the driver respawns agy before the first turn.
+			expect(session.driver.agent()).not.toBe(early.agent);
+			const inactive = await mocks.bridge!.onToolCall("c1", "ls", {}, new AbortController().signal);
+			expect(inactive.isError).toBe(true);
+		} finally {
+			vi.unstubAllEnvs();
+			fs.rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	it("appends the user's instructions to the policy with and without the agent profile", async () => {
+		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
+		const session = await start({ all: [{ name: "bash" }], active: ["bash"] }, { instructions: "Ask before background tasks." });
+		for (const agent of ["realagy-aaaaaaaaaaaa", undefined]) {
+			expect(session.driver.systemPrompt(agent)).toMatch(/<user-instructions>\nAsk before background tasks\.\n<\/user-instructions>$/);
+		}
+	});
+
+	it("leaves out the tools pi hides from the model's declarations, such as codemode's only mode", async () => {
+		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
+		await start({ all: [{ name: "codemode" }, { name: "read" }, { name: "bash" }], active: ["codemode", "read", "bash"] });
+		const listed = () => mocks.bridge!.listTools().map((tool: { name: string }) => tool.name);
+		expect(listed()).toEqual(["codemode", "read", "bash", "parallel", "poll"]);
+		const provider = mocks.register.mock.lastCall![0];
+		const declaring = (...names: string[]) => ({
+			messages: [
+				{ role: "system", content: "Rules", toolsAdded: names.map((name) => ({ name, description: name, parameters: {} })), timestamp: 0 },
+				{ role: "user", content: "hi", timestamp: 1 },
+			],
+		});
+		provider.streamSimple({ api: "agy-bridge" }, declaring("codemode"), {});
+		expect(mocks.streamDeps).toBeDefined();
+		expect(listed()).toEqual(["codemode", "parallel", "poll"]);
+		const hidden = await mocks.bridge!.onToolCall("c1", "read", {}, new AbortController().signal);
+		expect(hidden.isError).toBe(true);
+		expect(hidden.content[0].text).toMatch(/Active pi tools: codemode\./);
+		expect(mocks.onToolCall).not.toHaveBeenCalled();
+		// pi declares them again once codemode leaves only mode.
+		provider.stream({ api: "agy-bridge" }, declaring("codemode", "read", "bash"), {});
+		expect(listed()).toEqual(["codemode", "read", "bash", "parallel", "poll"]);
+	});
+
+	it("a context that declares no tools (a compaction summary, or no pi system message) keeps the previous loadout", async () => {
+		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
+		await start({ all: [{ name: "codemode" }, { name: "read" }, { name: "bash" }], active: ["codemode", "read", "bash"] });
+		const listed = () => mocks.bridge!.listTools().map((tool: { name: string }) => tool.name);
+		const provider = mocks.register.mock.lastCall![0];
+		const user = { role: "user", content: "hi", timestamp: 1 };
+		// codemode's only mode hides read and bash.
+		provider.streamSimple({ api: "agy-bridge" }, { messages: [
+			{ role: "system", content: "Rules", toolsAdded: [{ name: "codemode", description: "codemode", parameters: {} }], timestamp: 0 },
+			user,
+		] }, {});
+		const loadout = { tools: listed(), policy: mocks.driverOptions!.systemPrompt("profile") };
+		expect(loadout.tools).toEqual(["codemode", "parallel", "poll"]);
+		// pi's compaction and branch summaries: a system message, no tools.
+		provider.streamSimple({ api: "agy-bridge" }, { messages: [{ role: "system", content: "Summarize", timestamp: 0 }, user] }, {});
+		expect({ tools: listed(), policy: mocks.driverOptions!.systemPrompt("profile") }).toEqual(loadout);
+		provider.streamSimple({ api: "agy-bridge" }, { messages: [user] }, {});
+		expect({ tools: listed(), policy: mocks.driverOptions!.systemPrompt("profile") }).toEqual(loadout);
+	});
+
+	it("a pi tool named parallel replaces realagy's batching tool", async () => {
+		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
+		await start({ all: [{ name: "read" }, { name: "parallel", description: "pi's parallel" }], active: ["read", "parallel"] });
+		const tools = mocks.bridge!.listTools();
+		expect(tools.map((tool: { name: string }) => tool.name)).toEqual(["read", "parallel", "poll"]);
+		// pi's parallel is a pi tool; only the poll helper is the bridge's own.
+		expect(mocks.driverOptions!.systemPrompt("profile")).toMatch(/^read, parallel$/m);
+		expect(mocks.driverOptions!.systemPrompt("profile")).toMatch(/The bridge's own poll is not a pi tool/);
+		expect(tools.find((tool: { name: string }) => tool.name === "parallel").description).toBe("pi's parallel");
+		mocks.onToolCall.mockResolvedValueOnce({ content: [{ type: "text", text: "ran pi's parallel" }] });
+		const signal = new AbortController().signal;
+		const args = { jobs: ["a", "b"] };
+		expect(await mocks.bridge!.onToolCall("c1", "parallel", args, signal)).toEqual({ content: [{ type: "text", text: "ran pi's parallel" }] });
+		expect(mocks.onToolCall).toHaveBeenCalledWith("c1", "parallel", args, signal);
+	});
+
 	it("runs agy with a hidden profile that marks every bridged tool eager, unless opted out", async () => {
 		mocks.ensure.mockReturnValue({ ok: false, error: "x", manual: "y" });
 		const home = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-ext-profile-"));
@@ -583,6 +697,9 @@ describe("extension session lifecycle", () => {
 			const session = await start({ all: [{ name: "bash", exposure: "direct" }, { name: "read", exposure: "direct" }], active: ["bash", "read"] });
 			const agent = session.driver.agent();
 			expect(agent).toMatch(/^realagy-[0-9a-f]{12}$/);
+			// The driver's staleness checks use the same name without installing.
+			expect(session.driver.agentName()).toBe(agent);
+			expect(session.driver.agentName("gemini-pro-orchestrator")).toBe(session.driver.agent("gemini-pro-orchestrator"));
 			const profile = fs.readFileSync(path.join(home, "config", "agents", `${agent}.md`), "utf8");
 			for (const tool of ["bash", "read", "parallel", "poll"]) expect(profile).toContain(`"${tool}":\n        eager: true`);
 			expect(session.driver.systemPrompt(agent)).toMatch(/mcp_pi-bridge_<name>/);
@@ -598,6 +715,7 @@ describe("extension session lifecycle", () => {
 				},
 			});
 			expect(session.driver.agent()).toBeUndefined();
+			expect(session.driver.agentName()).toBeUndefined();
 			expect(mocks.restart).toHaveBeenCalledTimes(1);
 		} finally {
 			vi.unstubAllEnvs();

@@ -42,14 +42,17 @@ async function drain(handle: TurnHandle): Promise<DriverActivity[]> {
 const natives = (activities: DriverActivity[]) => activities.filter((a): a is Extract<DriverActivity, { type: "native_tool" }> => a.type === "native_tool");
 const text = (activities: DriverActivity[]) => activities.flatMap((a) => (a.type === "text" ? [a.delta] : [])).join("");
 
-test("tool policy names the active pi tools and is absent without them", () => {
+test("tool policy names the declared pi tools, steers agy's own tools to pi's, and is absent without them", () => {
 	const policy = toolPolicyPrompt(["read", "bash", "edit", "bash", ""]);
 	assert.ok(policy);
 	assert.match(policy, /^read, bash, edit$/m);
+	assert.match(policy, /<pi-tools>/);
 	assert.match(policy, /Use these pi tools for all file and shell work/);
 	assert.match(policy, /including images/);
 	assert.match(policy, /Do not use your built-in run_command, read_file, write_file, edit_file tools/);
-	assert.match(policy, /do not start subagents, the browser agent, background tasks, or scheduled tasks \(invoke_subagent, define_subagent, manage_subagents, schedule, manage_task\)/);
+	// agy's delegation tools are named; pi's own background work and delegation stay open.
+	assert.match(policy, /For delegation, background work, and scheduling, use the pi tools pi's system prompt names, not your built-in invoke_subagent, define_subagent, manage_subagents, schedule, manage_task, or the browser agent/);
+	assert.doesNotMatch(policy, /foreground|do not start/i);
 	assert.match(policy, /only for a job no pi tool can do/);
 	// agy's default prompt demands file:// links; the policy overrides it.
 	assert.match(policy, /replaces your communication_style and artifacts rules on file links/);
@@ -62,8 +65,43 @@ test("with the agent profile the policy only names the pi tools", () => {
 	assert.ok(policy);
 	assert.match(policy, /^read, bash$/m);
 	assert.match(policy, /mcp_pi-bridge_<name>/);
+	assert.match(policy, /<pi-tools>/);
+	// Declared is not callable: the catalog may hold tools pi has not activated.
+	assert.match(policy, /^pi's tools declared in this session/);
 	assert.doesNotMatch(policy, /run_command|file:\/\//);
 	assert.equal(toolPolicyPrompt([], { profile: true }), undefined);
+});
+
+test("the policy leaves batching to the parallel tool's own description and pi's rules", () => {
+	for (const profile of [true, false]) {
+		const policy = toolPolicyPrompt(["read", "parallel", "codemode"], { profile });
+		assert.ok(policy);
+		assert.doesNotMatch(policy, /use parallel|instead of issuing/i);
+	}
+});
+
+test("the bridge's own helpers are named apart from pi's tools, callable whatever <pi-tools> lists", () => {
+	for (const profile of [true, false]) {
+		const policy = toolPolicyPrompt(["read"], { profile, helpers: ["parallel", "bridge_poll_result"] });
+		assert.ok(policy);
+		assert.match(policy, /^read$/m);
+		assert.match(policy, /The bridge's own parallel and bridge_poll_result are not pi tools: <pi-tools> never lists them, and they stay callable\./);
+	}
+	assert.doesNotMatch(toolPolicyPrompt(["read"], { profile: true }) ?? "", /bridge's own/);
+	// The bridge lists its helpers even when pi offers no tools.
+	const helperRule = "The bridge's own bridge_poll_result is not a pi tool: <pi-tools> never lists it, and it stays callable.";
+	assert.equal(toolPolicyPrompt([], { profile: true, helpers: ["bridge_poll_result"] }), helperRule);
+	assert.equal(toolPolicyPrompt([], { helpers: ["bridge_poll_result"] }), `${helperRule}\n${PLAIN_PATHS_RULE}`);
+});
+
+test("the user's instructions come last in both policies, and alone when pi offers no tools", () => {
+	const instructions = "Ask before starting background tasks.";
+	for (const profile of [true, false]) {
+		const policy = toolPolicyPrompt(["read"], { profile, instructions });
+		assert.ok(policy?.endsWith(`<user-instructions>\n${instructions}\n</user-instructions>`), String(profile));
+	}
+	assert.equal(toolPolicyPrompt([], { profile: true, instructions }), `<user-instructions>\n${instructions}\n</user-instructions>`);
+	assert.equal(toolPolicyPrompt([], { instructions }), `${PLAIN_PATHS_RULE}\n<user-instructions>\n${instructions}\n</user-instructions>`);
 });
 
 test("the agent profile is passed as --agent, the policy learns it, and a changed profile respawns agy", async () => {
@@ -90,6 +128,37 @@ test("the agent profile is passed as --agent, the policy learns it, and a change
 		const appends = wire().filter((request) => request.method === "session/new").map((request) => (request.params._meta as any).antigravity.systemPrompt.append);
 		assert.deepEqual(appends, ["POLICY realagy-aaaaaaaaaaaa", "POLICY realagy-aaaaaaaaaaaa", "POLICY realagy-bbbbbbbbbbbb"]);
 		assert.ok(seen.every((value) => value !== undefined));
+	} finally {
+		await driver.close();
+	}
+});
+
+test("with a pure profile name, staleness checks never install the profile, and a failed install does not respawn every turn", async () => {
+	let name = "realagy-aaaaaaaaaaaa";
+	let installs = 0;
+	let installed: string | undefined = name;
+	const { driver, wire } = fixture({ FAKE_ACP_RECORD_ARGV: "1" }, () => ({
+		agentName: () => name,
+		agent: () => { installs++; return installed; },
+		systemPrompt: (agent) => `POLICY ${agent ?? "default"}`,
+	}));
+	try {
+		await drain(await driver.run({ ...base, prompt: "one" }));
+		assert.equal(installs, 1);
+		assert.equal(driver.outdated(base.model), false);
+		await drain(await driver.run({ ...base, prompt: "two" }));
+		assert.equal(installs, 1, "only a spawn installs the profile");
+		name = "realagy-bbbbbbbbbbbb";
+		assert.equal(driver.outdated(base.model), true);
+		assert.equal(installs, 1);
+		// The new profile cannot be written: agy runs its default agent.
+		installed = undefined;
+		await drain(await driver.run({ ...base, prompt: "three" }));
+		assert.equal(installs, 2);
+		assert.equal(driver.outdated(base.model), false, "the intended profile is unchanged");
+		await drain(await driver.run({ ...base, prompt: "four" }));
+		const argv = wire().filter((request) => request.method === "argv").map((request) => request.params.argv);
+		assert.deepEqual(argv, [["--agent", "realagy-aaaaaaaaaaaa"], []]);
 	} finally {
 		await driver.close();
 	}
@@ -219,6 +288,36 @@ test("the tool policy rides on session/new and session/resume, and turns use val
 		const modes = wire().filter((request) => request.method === "session/set_config_option" && request.params.configId === "mode").map((request) => request.params.value);
 		assert.deepEqual(modes, ["default", "default"]);
 		assert.ok(!logs.includes("mode-apply-failed"), "agy accepts the mode");
+	} finally {
+		await driver.close();
+	}
+});
+
+test("a changed policy respawns agy, which resumes the session with the new policy", async () => {
+	let policy = "POLICY one";
+	const { driver, wire, dir, logs } = fixture({ FAKE_ACP_RESUME: "1", FAKE_ACP_DB_DIR: "" }, (tmp) => ({
+		agent: () => undefined,
+		systemPrompt: () => policy,
+		conversationsDir: () => tmp,
+	}));
+	try {
+		const first = await driver.run({ ...base, prompt: "one" });
+		await drain(first);
+		const sessionId = (await first.outcome).conversationId!;
+		fs.writeFileSync(path.join(dir, `${sessionId}.db`), "");
+		const firstPid = driver.pid;
+		await drain(await driver.run({ ...base, conversationId: sessionId, prompt: "two" }));
+		assert.equal(driver.pid, firstPid, "an unchanged policy keeps the process");
+		assert.equal(driver.outdated(base.model), false);
+		policy = "POLICY two";
+		assert.equal(driver.outdated(base.model), true, "a continuation must not reenter the outdated process");
+		const third = await driver.run({ ...base, conversationId: sessionId, prompt: "three" });
+		await drain(third);
+		assert.equal((await third.outcome).conversationId, sessionId);
+		assert.notEqual(driver.pid, firstPid, "a changed policy respawns agy");
+		assert.ok(logs.includes("system-prompt-changed"));
+		const resumed = wire().filter((request) => request.method === "session/resume").map((request) => (request.params._meta as any).antigravity.systemPrompt.append);
+		assert.deepEqual(resumed, ["POLICY two"]);
 	} finally {
 		await driver.close();
 	}

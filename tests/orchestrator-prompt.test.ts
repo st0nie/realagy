@@ -49,8 +49,8 @@ test("only Orchestrator profiles include the protocol exactly once and keep pi's
 	const orchestrator = agentProfile(["read", "write", "bash"], true);
 	assert.equal(orchestrator.content.split(ORCHESTRATOR_PROMPT).length, 2);
 	assert.equal(orchestrator.content.match(/<plan_execute_protocol>/g)?.length, 1);
-	assert.doesNotMatch(orchestrator.content, /when the phase protocol requires them|Do the work yourself/);
-	assert.match(orchestrator.content, /Work in the foreground; do not start background tasks or subagents/);
+	assert.equal(orchestrator.content.split(/^---$/m)[2].trim(), `${PROFILE_PROMPT}\n\n${ORCHESTRATOR_PROMPT}`);
+	assert.doesNotMatch(orchestrator.content, /foreground|do not start background/i);
 	for (const tool of ["read", "write", "bash"]) {
 		assert.ok(orchestrator.content.includes(`      "${tool}":\n        eager: true`));
 	}

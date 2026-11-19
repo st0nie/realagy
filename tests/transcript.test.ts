@@ -49,6 +49,16 @@ test("planTurn reuses a warm session for plain user turns and falls back on dive
 	assert.equal(planTurn(ctx(turn1), "/w", warm).kind, "fresh");
 });
 
+test("a fresh session learns which pi tools are active right after pi's system prompt", () => {
+	const fresh = planTurn(ctx([system("Test system", ["read", "bash"]), user("hello")]), "/w", undefined);
+	assert.match(fresh.input.prompt, /^<pi-system>\nTest system\n<\/pi-system>\n\n<pi-tools>\nThe active pi tools are: bash, read\. Call only these pi tools\.\n<\/pi-tools>\n\nhello$/);
+	const toolless = planTurn(ctx([system("Test system", []), user("hello")]), "/w", undefined);
+	assert.match(toolless.input.prompt, /<pi-tools>\nNo pi tools are active now\.\n<\/pi-tools>/);
+	// Tools of these names are never bridged, so the model cannot call them as pi tools.
+	const unbridged = planTurn(ctx([system("Test system", ["read", "bridge_poll_result", "antigravity", "AskAntigravity"]), user("hello")]), "/w", undefined);
+	assert.match(unbridged.input.prompt, /<pi-tools>\nThe active pi tools are: read\. Call only these pi tools\.\n<\/pi-tools>/);
+});
+
 test("planTurn sends foreign replies and system updates as a transcript delta", () => {
 	const turn1 = [system(), user("hello")];
 	const warm = warmAfterTurn(ctx(turn1), assistant("hi"), "s1", "/w");

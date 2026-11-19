@@ -7,11 +7,13 @@
 // prompt prefix (provider prompt caching) instead of being re-serialized.
 // Any divergence (compaction, edits, a cwd change, or a failed turn) falls back
 // to a fresh session that receives one bounded <pi_history> replay plus the
-// newest input, keeping pi the sole source of truth. A changed active tool set
-// is announced in the delta instead: the pi-bridge lists every tool an extension
-// can activate, so the session can already call it.
+// newest input, keeping pi the sole source of truth. A fresh prompt names the
+// active pi tools (<pi-tools>); a changed active set is announced in the delta
+// (<pi-tools-update>): the pi-bridge pre-declares the tools an extension can
+// activate (src/bridge-catalog.ts), so the session can already call them.
 import { createHash } from "node:crypto";
 import { getCurrentSystemMessage, getCurrentSystemPrompt, getCurrentTools, getSystemMessageText, type AssistantMessage, type Message, type TranscriptContext } from "@earendil-works/pi-ai";
+import { UNBRIDGED_TOOLS } from "./bridge-catalog.js";
 import type { TurnPart } from "./driver-types.js";
 
 export type AcpImage = { data: string; mimeType: string };
@@ -222,15 +224,13 @@ export function formatToolResult(
 	const images = Array.isArray(result.content)
 		? result.content.flatMap((block) => block.type === "image" ? [{ data: block.data, mimeType: block.mimeType }] : [])
 		: [];
-	if (trailing.length === 0) return { text, images };
 	const notes: string[] = [];
 	const systemUpdate = renderSystemDelta(trailing);
 	if (systemUpdate) notes.push(`<pi-system-update>\n${systemUpdate}\n</pi-system-update>`);
 	const steered = serializeRange(trailing.filter((message) => message.role !== "system"), images.length);
 	if (steered.text) notes.push(steered.text);
 	if (notes.length === 0) return { text, images };
-	const fallback = images.length > 0 ? "(image result)" : "(no output)";
-	const base = text || fallback;
+	const base = text || (images.length > 0 ? "(image result)" : "(no output)");
 	const steering = `<pi-steering>\nThe user sent a steering message while this tool was running. Address it immediately:\n${notes.join("\n\n")}\n</pi-steering>`;
 	return {
 		text: `${base}\n\n${steering}`,
@@ -382,14 +382,16 @@ export function freshInput(context: TranscriptContext, maxBytes = UNLOCKED_REPLA
 	const live = texts.join("\n\n") || (trailing.length > 0 && images.length > 0 ? IMAGE_ONLY_PROMPT : EMPTY_INPUT_CONTINUATION);
 	const systemText = renderPiSystemPrompt(context.messages);
 	const system = systemText ? `<pi-system>\n${systemText}\n</pi-system>` : "";
-	const fixedBytes = Buffer.byteLength([system, live].filter(Boolean).join("\n\n"), "utf8");
+	// The bridge may declare tools pi has not activated (src/bridge-catalog.ts).
+	const tools = getCurrentSystemMessage(context.messages as Message[]) ? `<pi-tools>\n${activeToolsText(toolsKey(context), false)}\n</pi-tools>` : "";
+	const fixedBytes = Buffer.byteLength([system, tools, live].filter(Boolean).join("\n\n"), "utf8");
 	const historyBytes = Math.max(0, maxBytes - fixedBytes - Buffer.byteLength("<pi_history>\n\n</pi_history>\n\n", "utf8") - 128);
 	const replay = historyReplay(history, historyBytes);
 	const liveReferences = replay.images.length > 0 && images.length > 0
 		? `Current input images: ${images.map((_, index) => `[Attached image ${replay.images.length + index + 1}]`).join(", ")}.`
 		: "";
 	return {
-		prompt: [system, replay.text, live, liveReferences].filter(Boolean).join("\n\n"),
+		prompt: [system, tools, replay.text, live, liveReferences].filter(Boolean).join("\n\n"),
 		images: [...replay.images, ...images],
 	};
 }
@@ -696,7 +698,8 @@ function splitWarmTranscript(
 }
 
 export function toolsKey(context: TranscriptContext): string {
-	return getCurrentTools(context.messages).map((tool) => tool.name).sort((a, b) => a.localeCompare(b)).join(",");
+	// Only tools the bridge serves are callable as pi tools.
+	return getCurrentTools(context.messages).map((tool) => tool.name).filter((name) => !UNBRIDGED_TOOLS.has(name)).sort((a, b) => a.localeCompare(b)).join(",");
 }
 
 interface PersistentEntry {
@@ -811,7 +814,9 @@ function matchWarmPrefix(index: TranscriptIndex, cwd: string, warm: WarmSession 
 	if (warm.cwd !== cwd) return { reason: "cwd" };
 	// A changed active tool set (pi's `<tools>` system messages after an
 	// extension activates tools, or a `/tree` restore) is announced in the
-	// delta: the bridge already lists every tool that can be activated.
+	// delta. The bridge pre-declares the tools extensions may activate; a tool
+	// it did not declare changes the policy, and agy respawns and resumes this
+	// session with the new tool list (src/acp/driver.ts).
 	const split = splitWarmTranscript(index, warm);
 	if (!split) {
 		return { reason: index.persistent().length <= warm.count ? "history-shrank" : "history-diverged" };
@@ -867,13 +872,18 @@ function planFromMatch(index: TranscriptIndex, match: WarmMatch): TurnPlan {
 	};
 }
 
-/** The active pi tool set after it changed since the session's warm snapshot. */
-function toolsUpdate(tools: string): string {
+/** The pi tools the model may call, from a `toolsKey`. */
+function activeToolsText(tools: string, changed: boolean): string {
 	const names = tools.split(",").filter(Boolean);
-	const text = names.length > 0
-		? `The active pi tools are now: ${names.join(", ")}. Call only these pi tools.`
+	return names.length > 0
+		? `The active pi tools are${changed ? " now" : ""}: ${names.join(", ")}. Call only these pi tools.`
 		: "No pi tools are active now.";
-	return `<pi-tools-update>\n${text}\n</pi-tools-update>`;
+}
+
+/** The active pi tool set (a `toolsKey`) after it changed since the
+ *  session's warm snapshot. */
+export function toolsUpdate(tools: string): string {
+	return `<pi-tools-update>\n${activeToolsText(tools, true)}\n</pi-tools-update>`;
 }
 
 

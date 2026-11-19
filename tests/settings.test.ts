@@ -321,3 +321,34 @@ test("inactivityMin accepts positive minutes and 0 (guard off), drops invalid va
 		fs.rmSync(directory, { recursive: true, force: true });
 	}
 });
+
+test("toolCatalog and instructions are file-only keys: validated, summarized, and kept by menu saves", async () => {
+	assert.equal(normalizeRealagyConfig({ toolCatalog: "active" }).toolCatalog, "active");
+	assert.equal(normalizeRealagyConfig({ toolCatalog: "registered" }).toolCatalog, "registered");
+	assert.equal(normalizeRealagyConfig({ toolCatalog: "everything" }).toolCatalog, undefined);
+	assert.equal(normalizeRealagyConfig({ toolCatalog: 1 }).toolCatalog, undefined);
+	assert.equal(normalizeRealagyConfig({ instructions: "  Ask before\r\nbackground tasks.\n" }).instructions, "Ask before\nbackground tasks.");
+	assert.equal(normalizeRealagyConfig({ instructions: "   " }).instructions, undefined);
+	assert.equal(normalizeRealagyConfig({ instructions: ["x"] }).instructions, undefined);
+	assert.match(formatConfigSummary(DEFAULT_REALAGY_CONFIG, "/x"), /Tool catalog: balanced \(default\)$/m);
+	assert.match(formatConfigSummary(DEFAULT_REALAGY_CONFIG, "/x"), /Custom instructions: none$/m);
+	const custom: RealagyConfig = { ...DEFAULT_REALAGY_CONFIG, toolCatalog: "active", instructions: "Prefer foreground work." };
+	assert.match(formatConfigSummary(custom, "/x"), /Tool catalog: active$/m);
+	assert.match(formatConfigSummary(custom, "/x"), /Custom instructions: 23 characters$/m);
+	// Toggle noAutoCompaction, then save: the file-only keys survive.
+	const edited = await editRealagyConfigMenu(menuUi([0, 7], []), custom, []);
+	assert.equal(edited?.noAutoCompaction, false);
+	assert.equal(edited?.toolCatalog, "active");
+	assert.equal(edited?.instructions, "Prefer foreground work.");
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "realagy-file-only-"));
+	try {
+		const file = realagyConfigPath(directory);
+		saveRealagyConfig(DEFAULT_REALAGY_CONFIG, file);
+		assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), DEFAULT_REALAGY_CONFIG);
+		saveRealagyConfig(custom, file);
+		assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), custom);
+		assert.deepEqual(loadRealagyConfig(file), custom);
+	} finally {
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+});

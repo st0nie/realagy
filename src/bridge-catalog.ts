@@ -6,28 +6,58 @@ export interface BridgeToolInfo {
 	parameters?: object;
 	/** pi's ToolExposure; absent means `direct`. */
 	exposure?: string;
+	/** Where pi got the tool; `builtin` for pi's own tools and builtin extensions. */
+	sourceInfo?: { source?: string };
+}
+
+/** Which inactive tools the bridge declares (config `toolCatalog`):
+ *  - `balanced`: every model-facing tool an extension may activate later, and
+ *    pi's core builtins only while active (only the user turns those on);
+ *  - `active`: only the active tools (smallest list; a change respawns agy);
+ *  - `registered`: every model-facing tool, core builtins included. */
+export const TOOL_CATALOGS = ["balanced", "active", "registered"] as const;
+export type ToolCatalog = (typeof TOOL_CATALOGS)[number];
+
+export interface CatalogOptions {
+	catalog?: ToolCatalog;
+	/** Active tools pi leaves out of the model's declarations (a tool's
+	 *  `prepareLoadout`, such as codemode's `only` mode). */
+	hidden?: ReadonlySet<string>;
 }
 
 /** Exposures pi declares to the model whenever the tool is active. */
 const MODEL_FACING = new Set(["direct", "model-only"]);
-const INTERNAL = new Set(["bridge_poll_result", "antigravity", "AskAntigravity"]);
+/** pi tools the bridge never lists or dispatches: realagy's own poll helper
+ *  and its Antigravity tools (which would call back into agy). */
+export const UNBRIDGED_TOOLS: ReadonlySet<string> = new Set(["bridge_poll_result", "antigravity", "AskAntigravity"]);
+/** pi's core tools (pi's `allToolNames`): always registered, and active only
+ *  when the user selects them (`--tools`, `defaultTools`, `/tools`). Builtin
+ *  extensions' tools (`codemode`, `tool_search`) also come from `builtin` but
+ *  are activated on demand, so they are not listed here. */
+const CORE_BUILTINS = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "powershell"]);
 
-/** The catalog the bridge lists: every registered model-facing pi tool,
- * active or not, plus any other tool that is active now. Builtins are
- * included, so pi's read/bash/edit/write are offered next to agy's own native
- * tools and run as genuine pi tools when the model picks them. agy keeps a
- * session's tool list, so listing tools an extension may activate later
- * (pi-lens's situational tools) keeps them callable without a new session,
- * and the list stays stable for agy's prompt cache. Dispatch is limited to
- * pi's CURRENT active set (dispatchablePiTool). */
-export function bridgedPiTools(all: BridgeToolInfo[], active: readonly string[]): BridgeToolInfo[] {
+const isCoreBuiltin = (tool: BridgeToolInfo) => tool.sourceInfo?.source === "builtin" && CORE_BUILTINS.has(tool.name);
+
+/** The catalog the bridge lists: the active pi tools pi declares to the model,
+ * plus the inactive ones the catalog mode pre-declares. agy keeps a session's
+ * tool list, so pre-declaring tools an extension may activate later (pi-lens's
+ * situational tools) keeps them callable without respawning agy, and the list
+ * stays stable for agy's prompt cache. Dispatch is limited to pi's CURRENT
+ * active set (dispatchablePiTool). */
+export function bridgedPiTools(all: readonly BridgeToolInfo[], active: readonly string[], opts: CatalogOptions = {}): BridgeToolInfo[] {
+	const catalog = opts.catalog ?? "balanced";
 	const enabled = new Set(active);
-	return all.filter((tool) => !INTERNAL.has(tool.name) && (enabled.has(tool.name) || MODEL_FACING.has(tool.exposure ?? "direct")));
+	return all.filter((tool) => {
+		if (UNBRIDGED_TOOLS.has(tool.name) || opts.hidden?.has(tool.name)) return false;
+		if (enabled.has(tool.name)) return true;
+		if (catalog === "active" || !MODEL_FACING.has(tool.exposure ?? "direct")) return false;
+		return catalog === "registered" || !isCoreBuiltin(tool);
+	});
 }
 
 /** Whether a bridged call may run: pi only executes its active tools. */
-export function dispatchablePiTool(all: BridgeToolInfo[], active: readonly string[], name: string): boolean {
-	return active.includes(name) && bridgedPiTools(all, active).some((tool) => tool.name === name);
+export function dispatchablePiTool(all: readonly BridgeToolInfo[], active: readonly string[], name: string, opts: CatalogOptions = {}): boolean {
+	return active.includes(name) && bridgedPiTools(all, active, opts).some((tool) => tool.name === name);
 }
 
 /** Whether a tool explicitly declares a top-level argument in its schema. */
