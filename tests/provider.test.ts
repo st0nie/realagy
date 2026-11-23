@@ -140,7 +140,7 @@ test("provider streams native thinking/text and maps GPT to its medium ACP slug"
 	assert.equal(driver.requests[0].conversationId, null);
 });
 
-test("large thinking chunks play incrementally and flush before answer text", async () => {
+test("large thinking and answer chunks pass through while the turn is still running", async () => {
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
 	const simple = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
@@ -151,90 +151,93 @@ test("large thinking chunks play incrementally and flush before answer text", as
 	await vi.waitFor(() => assert.ok(driver.activeHandle));
 	const handle = driver.activeHandle as FakeHandle;
 	const thought = "abcdefghijk😀lmnopqrstuvwxyz and more reasoning";
+	const answer = "A complete answer 😀 that must not wait for a playback timer.";
+	const drainMicrotasks = async (): Promise<void> => {
+		// Do not advance to the timer phase: immediate means visible in this burst.
+		for (let index = 0; index < 20; index++) await Promise.resolve();
+	};
+
 	handle.pushExternal({ type: "thought", delta: thought });
-	await vi.waitFor(() => assert.ok(events.filter((event) => event.type === "thinking_delta").length >= 2));
-	const before = events.filter((event) => event.type === "thinking_delta").map((event) => event.type === "thinking_delta" ? event.delta : "").join("");
-	assert.ok(before.length < thought.length, "thinking should be displayed while the turn is still running");
-	assert.ok(events.every((event) => event.type !== "thinking_delta" || !/[\uD800-\uDBFF]$/.test(event.delta)), "a slice must not end in an unpaired surrogate");
-	handle.pushExternal({ type: "text", delta: "answer" });
-	await vi.waitFor(() => assert.ok(events.some((event) => event.type === "text_delta")));
-	handle.complete();
-	await collecting;
-	const textIndex = events.findIndex((event) => event.type === "text_start");
-	assert.equal(events.slice(0, textIndex).filter((event) => event.type === "thinking_delta").map((event) => event.type === "thinking_delta" ? event.delta : "").join(""), thought);
-	assert.ok(!events.slice(textIndex).some((event) => event.type === "thinking_delta"));
-});
+	await drainMicrotasks();
+	assert.deepEqual(events.filter((event) => event.type === "thinking_delta").map((event) => event.type === "thinking_delta" ? event.delta : ""), [thought]);
+	assert.ok(!events.some((event) => event.type === "text_delta"));
 
-test("pending thinking flushes on abort and before tool dispatch", async () => {
-	for (const boundary of ["abort", "tool"] as const) {
-		const driver = new FakeDriver();
-		driver.autoFinish = false;
-		const simple = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
-		const events: AssistantMessageEvent[] = [];
-		const collecting = (async () => {
-			for await (const event of simple(toPiModel(TEST_MODELS[0]), context([system(), user("Reply")]))) events.push(event);
-		})();
-		await vi.waitFor(() => assert.ok(driver.activeHandle));
-		const handle = driver.activeHandle as FakeHandle;
-		const thought = "A long reasoning paragraph that must survive the boundary.";
-		handle.pushExternal({ type: "thought", delta: thought });
-		await vi.waitFor(() => assert.ok(events.some((event) => event.type === "thinking_delta")));
-		if (boundary === "abort") handle.complete({ status: "OK", response: "", aborted: true });
-		else handle.pushExternal({ type: "bridge_call", callId: "call", name: "read", args: {} });
-		await collecting;
-		assert.equal(events.filter((event) => event.type === "thinking_delta").map((event) => event.type === "thinking_delta" ? event.delta : "").join(""), thought);
-		const end = events.findIndex((event) => event.type === "thinking_end");
-		const boundaryIndex = events.findIndex((event) => event.type === (boundary === "abort" ? "error" : "toolcall_start"));
-		assert.ok(end >= 0 && boundaryIndex > end);
-	}
-});
-
-test("large answer chunks play incrementally and flush before thinking", async () => {
-	const driver = new FakeDriver();
-	driver.autoFinish = false;
-	const simple = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
-	const events: AssistantMessageEvent[] = [];
-	const collecting = (async () => {
-		for await (const event of simple(toPiModel(TEST_MODELS[0]), context([system(), user("Reply")]))) events.push(event);
-	})();
-	await vi.waitFor(() => assert.ok(driver.activeHandle));
-	const handle = driver.activeHandle as FakeHandle;
-	const answer = "abcdefghijk😀lmnopqrstuvwxyz and a longer answer";
 	handle.pushExternal({ type: "text", delta: answer });
-	await vi.waitFor(() => assert.ok(events.filter((event) => event.type === "text_delta").length >= 2));
-	const before = events.filter((event) => event.type === "text_delta").map((event) => event.type === "text_delta" ? event.delta : "").join("");
-	assert.ok(before.length < answer.length);
+	await drainMicrotasks();
+	assert.deepEqual(events.filter((event) => event.type === "text_delta").map((event) => event.type === "text_delta" ? event.delta : ""), [answer]);
+	assert.ok(events.every((event) => event.type !== "thinking_delta" || !/[\uD800-\uDBFF]$/.test(event.delta)));
 	assert.ok(events.every((event) => event.type !== "text_delta" || !/[\uD800-\uDBFF]$/.test(event.delta)));
-	handle.pushExternal({ type: "thought", delta: "next" });
-	await vi.waitFor(() => assert.ok(events.some((event) => event.type === "thinking_delta")));
+
 	handle.complete();
 	await collecting;
-	const thoughtIndex = events.findIndex((event) => event.type === "thinking_start");
-	assert.equal(events.slice(0, thoughtIndex).filter((event) => event.type === "text_delta").map((event) => event.type === "text_delta" ? event.delta : "").join(""), answer);
-	assert.ok(!events.slice(thoughtIndex).some((event) => event.type === "text_delta"));
+	assert.equal(events.filter((event) => event.type === "thinking_delta").length, 1);
+	assert.equal(events.filter((event) => event.type === "text_delta").length, 1);
+	assert.equal(events.at(-1)?.type, "done");
 });
 
-test("pending answer text flushes on completion, abort and tool dispatch", async () => {
-	for (const boundary of ["complete", "abort", "tool"] as const) {
-		const driver = new FakeDriver();
-		driver.autoFinish = false;
-		const simple = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
-		const events: AssistantMessageEvent[] = [];
-		const collecting = (async () => {
-			for await (const event of simple(toPiModel(TEST_MODELS[0]), context([system(), user("Reply")]))) events.push(event);
-		})();
-		await vi.waitFor(() => assert.ok(driver.activeHandle));
-		const handle = driver.activeHandle as FakeHandle;
-		const answer = "A long answer paragraph that must survive the boundary.";
-		handle.pushExternal({ type: "text", delta: answer });
-		await vi.waitFor(() => assert.ok(events.some((event) => event.type === "text_delta")));
-		if (boundary === "tool") handle.pushExternal({ type: "bridge_call", callId: "call", name: "read", args: {} });
-		else handle.complete({ status: "OK", response: answer, aborted: boundary === "abort" });
-		await collecting;
-		assert.equal(events.filter((event) => event.type === "text_delta").map((event) => event.type === "text_delta" ? event.delta : "").join(""), answer);
-		const end = events.findIndex((event) => event.type === "text_end");
-		const boundaryIndex = events.findIndex((event) => event.type === (boundary === "tool" ? "toolcall_start" : boundary === "abort" ? "error" : "done"));
-		assert.ok(end >= 0 && boundaryIndex > end);
+test("burst thinking and text activities preserve exact deltas and block order", async () => {
+	const driver = new FakeDriver();
+	const thoughts = ["First complete reasoning paragraph 😀.", "Second complete reasoning paragraph."];
+	const answers = ["First complete answer paragraph.", "Second complete answer paragraph 😀."];
+	driver.script = [
+		{ type: "thought", delta: thoughts[0] },
+		{ type: "text", delta: answers[0] },
+		{ type: "thought", delta: thoughts[1] },
+		{ type: "text", delta: answers[1] },
+	];
+	const simple = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
+	const events = await collect(simple(toPiModel(TEST_MODELS[0]), context([system(), user("Reply")])));
+
+	assert.deepEqual(events.flatMap((event) => {
+		if (event.type === "thinking_delta" || event.type === "text_delta") return [[event.type, event.delta]];
+		return [];
+	}), [
+		["thinking_delta", thoughts[0]],
+		["text_delta", answers[0]],
+		["thinking_delta", thoughts[1]],
+		["text_delta", answers[1]],
+	]);
+	assert.deepEqual(events.map((event) => event.type), [
+		"start",
+		"thinking_start", "thinking_delta", "thinking_end",
+		"text_start", "text_delta", "text_end",
+		"thinking_start", "thinking_delta", "thinking_end",
+		"text_start", "text_delta", "text_end",
+		"done",
+	]);
+});
+
+test("completion, abort and tool dispatch never reveal buffered thinking or answer text", async () => {
+	for (const kind of ["thought", "text"] as const) {
+		for (const boundary of ["complete", "abort", "tool"] as const) {
+			const driver = new FakeDriver();
+			driver.autoFinish = false;
+			const simple = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips: new ToolRoundTrips(driver) });
+			const events: AssistantMessageEvent[] = [];
+			const collecting = (async () => {
+				for await (const event of simple(toPiModel(TEST_MODELS[0]), context([system(), user("Reply")]))) events.push(event);
+			})();
+			await vi.waitFor(() => assert.ok(driver.activeHandle));
+			const handle = driver.activeHandle as FakeHandle;
+			const delta = `A complete ${kind} paragraph that is visible before ${boundary}. 😀`;
+			handle.pushExternal({ type: kind, delta });
+			for (let index = 0; index < 20; index++) await Promise.resolve();
+
+			const deltaType = kind === "thought" ? "thinking_delta" : "text_delta";
+			const deltas = () => events.filter((event) => event.type === deltaType).map((event) => event.type === deltaType ? event.delta : "");
+			assert.deepEqual(deltas(), [delta]);
+
+			if (boundary === "tool") handle.pushExternal({ type: "bridge_call", callId: "call", name: "read", args: {} });
+			else handle.complete({ status: "OK", response: kind === "text" ? delta : "", aborted: boundary === "abort" });
+			await collecting;
+			assert.deepEqual(deltas(), [delta], `${kind} must not gain a delta at ${boundary}`);
+
+			const endType = kind === "thought" ? "thinking_end" : "text_end";
+			const end = events.findIndex((event) => event.type === endType);
+			const terminalType = boundary === "tool" ? "toolcall_start" : boundary === "abort" ? "error" : "done";
+			const terminal = events.findIndex((event) => event.type === terminalType);
+			assert.ok(end >= 0 && terminal > end);
+		}
 	}
 });
 

@@ -47,7 +47,7 @@ An aborted turn keeps its progress. The session holds everything agy recorded be
 
 ### Thinking and answer display
 
-ACP thinking and sanitized answer chunks become Pi `thinking_delta` and `text_delta` events. Some models send small increments, while others send whole paragraphs at once. Realagy smooths large chunks of either kind into short timed display increments without waiting for more upstream output. Pending content is flushed immediately on a switch between thinking and answer text, before native-tool lines or Pi tool calls, and at turn completion, preserving event order and avoiding delays to tool execution. Cancellation also flushes already received content; the animation does not represent earlier access to model output.
+ACP thinking and sanitized answer chunks become Pi `thinking_delta` and `text_delta` events immediately, without a playback timer or secondary display buffer. Some models send small increments, while others send whole paragraphs or same-tick bursts; the visible granularity therefore follows the upstream activity stream rather than an artificial typewriter animation. Switching between thinking and answer text closes the current block before opening the next, and native-tool lines or Pi tool calls preserve the same event order. Turn completion and cancellation close open blocks without replaying or adding content: every activity received before the boundary has already been emitted, and realagy has no pending playback buffer to flush. If agy itself delivers additional activities while settling a cancellation, those activities are likewise forwarded as they arrive.
 
 ## Tools
 
