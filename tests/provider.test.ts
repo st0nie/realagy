@@ -523,7 +523,7 @@ test("aborting a parallel Pi turn settles the outer request and every inner call
 	assert.equal((driver.activeHandle as FakeHandle).closed, true);
 });
 
-test("incomplete parallel results fail the batch without re-entering or starting ACP", async () => {
+test.each([{ stale: false }, { stale: true }])("incomplete parallel results fail the batch without re-entering or starting ACP (stale=$stale)", async ({ stale }) => {
 	const driver = new FakeDriver();
 	driver.autoFinish = false;
 	const roundTrips = new ToolRoundTrips(driver);
@@ -554,6 +554,7 @@ test("incomplete parallel results fail the batch without re-entering or starting
 		isError: false,
 		timestamp: Date.now(),
 	};
+	driver.stale = stale;
 	const second = await collect(stream(model, context([system(), user("parallel"), done.message, partial])));
 	await rejection;
 	const last = second.at(-1);
@@ -753,6 +754,49 @@ test("a parallel batch that activates tools announces them ahead of its aggregat
 		assert.deepEqual(payload.results.map((entry: { content: Array<{ text: string }> }) => entry.content[0].text), ["file text", "activated"]);
 		(driver.activeHandle as FakeHandle).complete();
 		await step2;
+	} finally { roundTrips.failAll("test done"); }
+});
+
+test("a complete parallel batch replays its results once when activation makes ACP stale", async () => {
+	const driver = new FakeDriver();
+	driver.autoFinish = false;
+	const roundTrips = new ToolRoundTrips(driver);
+	driver.onTurnEnd = (outcome) => failParkedCalls(roundTrips, outcome);
+	const model = toPiModel(TEST_MODELS[0]);
+	const stream = createStreamSimple({ entries: [...TEST_MODELS], driver, roundTrips });
+	const declare = (...names: string[]): Message => ({
+		role: "system", content: "", timestamp: Date.now(), toolsAdded: names.map((name) => ({ name, description: name, parameters: {} })),
+	}) as unknown as Message;
+	try {
+		const turnStart = [system(), declare("read", "lens_activate"), user("Find the symbol")];
+		const first = collect(stream(model, context(turnStart)));
+		await vi.waitFor(() => assert.equal(driver.requests.length, 1));
+		const parked = roundTrips.onToolCall("batch", PARALLEL_TOOL_NAME, {
+			calls: [{ name: "read", arguments: {} }, { name: "lens_activate", arguments: {} }],
+		}, new AbortController().signal);
+		const rejection = assert.rejects(parked);
+		const done = (await first).find((event) => event.type === "done");
+		if (done?.type !== "done") throw new Error("missing parallel toolUse");
+		const calls = done.message.content.filter((block) => block.type === "toolCall");
+		assert.deepEqual(calls.map((call) => call.name), ["read", "lens_activate"]);
+		const outputs = ["read-result-marker", "activation-result-marker"];
+		const results: Message[] = calls.map((call, index) => ({
+			role: "toolResult", toolCallId: call.id, toolName: call.name,
+			content: [{ type: "text", text: outputs[index] }], isError: false, timestamp: Date.now(),
+		}));
+		driver.stale = true;
+		driver.autoFinish = true;
+		const second = await collect(stream(model, context([...turnStart, done.message, ...results, declare("lens_symbols")])));
+		await rejection; // The cancelled native batch must not receive the results as well.
+		assert.equal(second.at(-1)?.type, "done");
+		assert.deepEqual(driver.cancels, ["superseded by a new pi turn"]);
+		assert.equal(driver.requests.length, 2);
+		const fresh = driver.requests[1]!;
+		assert.equal(fresh.conversationId, null);
+		assert.match(fresh.prompt, /<pi_history>[\s\S]*read-result-marker[\s\S]*activation-result-marker[\s\S]*<\/pi_history>/);
+		for (const output of outputs) assert.equal(fresh.prompt.split(output).length - 1, 1);
+		assert.equal(roundTrips.hasPendingBatchCalls(), false);
+		assert.equal(roundTrips.isPending("batch"), false);
 	} finally { roundTrips.failAll("test done"); }
 });
 

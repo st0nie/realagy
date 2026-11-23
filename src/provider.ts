@@ -235,9 +235,11 @@ export class ToolRoundTrips {
 		return outer;
 	}
 
-	/** A native Pi parallel batch must not re-enter ACP with partial results. */
-	hasPendingBatchCalls(): boolean {
-		for (const pending of this.#pending.values()) if (pending.batchId !== undefined) return true;
+	/** Check for an inner batch call with no result, excluding IDs covered by fresh replay. */
+	hasPendingBatchCalls(replayedResultIds?: ReadonlySet<string>): boolean {
+		for (const [id, pending] of this.#pending) {
+			if (pending.batchId !== undefined && !replayedResultIds?.has(id)) return true;
+		}
 		return false;
 	}
 
@@ -718,7 +720,10 @@ export function createStreamSimple(deps: StreamSimpleDeps) {
 					finish(stream, blocks, "aborted", "Operation aborted");
 					return;
 				}
-				if (results.length > 0 && deps.roundTrips.hasPendingBatchCalls()) {
+				// With a respawn, available results stay parked on purpose. Check
+				// for missing IDs, not whether the old ACP calls are still parked.
+				const replayedResultIds = respawn ? new Set(results.map((result) => result.toolCallId)) : undefined;
+				if (results.length > 0 && deps.roundTrips.hasPendingBatchCalls(replayedResultIds)) {
 					const reason = "parallel tool results are incomplete; the batch was aborted";
 					deps.roundTrips.failAll(reason, { includeEscalated: true });
 					await deps.driver.cancelActive(reason);
